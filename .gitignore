@@ -1,2 +1,10 @@
+# Build Artifacts
 /bin
 /build-*
+
+# LSP Artifacts
+/compile_commands.json
+
+# Dependency Artifacts
+/flanterm/
+src/include/limine.h

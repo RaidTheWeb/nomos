@@ -21,7 +21,7 @@ ARCH ?= x86_64
 HEADERS = $(shell cd $(SOURCE_DIR) && find include -type f -name '*.h') $(shell cd $(SOURCE_DIR) && find include -type f -name '*.hpp')
 
 # Assemble list of sources.
-CSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.c')
+CSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.c') $(shell find flanterm -type f -name '*.c')
 CXXSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.cpp')
 ASSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.S')
 ASMSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.asm')
@@ -35,14 +35,16 @@ CC ?= cc
 # C++ Compiler
 CXX ?= cxx
 
+NASM ?= nasm
+
 # C Flags
 CFLAGS ?= -g -O2 -pipe
 
 # C++ Flags
-CXXFLAGS ?= $(CFLAGS)
+CXXFLAGS ?= -g -O2 -pipe
 
 # C Preprocesssor Flags
-CPPFLAGS ?=
+CPPFLAGS ?= -I $(SOURCE_DIR)/include -I$(SOURCE_DIR)/include/std -Iflanterm/ -DLIMINE_API_REVISION=3 -MMD -MP
 
 # Linker Flags
 LDFLAGS ?= -Wl,--build-id=none -nostdlib -static -z max-page-size=0x1000 -Wl,--gc-sections -T linker-$(ARCH).ld
@@ -63,7 +65,7 @@ ifeq ($(ARCH),x86_64)
 		-Wl,-m,elf_x86_64
 
 	NASMFLAGS += \
-		-f elf64
+		-Wall -f elf64
 endif
 
 CFLAGS += -std=gnu11 $(SHAREDFLAGS)
@@ -79,11 +81,15 @@ $(BIN_DIR)/$(OUT)-$(ARCH): linker-$(ARCH).ld $(OBJECTS)
 	mkdir -p "$$(dirname $@)"
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(OBJECTS) -o $@
 
-$(BUILD_DIR)-$(ARCH)/%.c.o: $(SOURCE_DIR)/%.c $(HEADERS)
+$(BUILD_DIR)-$(ARCH)/%.c.o: $(SOURCE_DIR)/%.c
 	mkdir -p "$$(dirname $@)"
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-$(BUILD_DIR)-$(ARCH)/%.cpp.o: $(SOURCE_DIR)/%.cpp $(HEADERS)
+$(BUILD_DIR)-$(ARCH)/flanterm/%.c.o: flanterm/%.c
+	mkdir -p "$$(dirname $@)"
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD_DIR)-$(ARCH)/%.cpp.o: $(SOURCE_DIR)/%.cpp
 	mkdir -p "$$(dirname $@)"
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c $< -o $@
 
