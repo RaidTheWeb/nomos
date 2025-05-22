@@ -1,3 +1,4 @@
+#include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <util/kprint.hpp>
@@ -69,7 +70,7 @@ namespace NArch {
     }
 
     bool SerialPort::poll(void) {
-        return inb(this->port + LINESTAT) & LINESTAT_DR;
+        return inb(this->port + LINESTAT) & 0x01;
     }
 
     uint8_t SerialPort::read(void) {
@@ -79,10 +80,15 @@ namespace NArch {
     }
 
     bool SerialPort::writeable(void) {
-        return inb(this->port + LINESTAT) & 0x20;
+        return inb(this->port + LINESTAT) & LINESTAT_THRE;
     }
 
     void SerialPort::write(uint8_t data) {
+        // If the hypervisor is disabled, and we've confirmed that we've checked it, make NO further attempts to write to the backbuffer.
+        if (!NArch::hypervisor_enabled && NArch::hypervisor_checked) {
+            return;
+        }
+
         if (!this->initialised) {
             this->backbuffer[this->backbufferidx++] = data;
             return;

@@ -33,7 +33,7 @@ namespace NArch {
 
     static inline uint32_t inl(uint16_t port) {
         uint8_t ret = 0;
-        asm volatile("inl %w1, %w0" : "=a"(ret) : "Nd"(port) : "memory");
+        asm volatile("inl %l1, %w0" : "=a"(ret) : "Nd"(port) : "memory");
         return ret;
     }
 }
