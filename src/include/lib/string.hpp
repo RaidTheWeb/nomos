@@ -14,10 +14,13 @@ extern "C" {
     size_t strlen(const char *str);
     char *strcpy(char *dest, char *src);
     char *strncpy(char *dest, char *src, size_t n);
-    int strcmp(char *s1, char *s2);
-    int strncmp(char *s1, char *s2, size_t n);
+    int strcmp(const char *s1, const char *s2);
+    int strncmp(const char *s1, const char *s2, size_t n);
     char *strchr(char *str, int c);
     char *strstr(const char *haystack, const char *needle);
+
+    // Non-standard.
+    char *strtrim(char *str);
 }
 
 }

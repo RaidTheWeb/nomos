@@ -21,7 +21,15 @@ extern void (*__init_array[])();
 extern void (*__init_array_end[])();
 
 extern "C" void kernel_main(void) {
-    NUtil::printf("Nomos 0dev\n");
+    NUtil::printf("Nomos %s, built %s\n", VERSION, BUILDDATE);
+
+    // Initialise global constructors.
+    // Required to let us initialise classes outside of stack-based scopes like functions.
+    for (size_t i = 0; &__init_array[i] != __init_array_end; i++) {
+        // Call the constructor for every globally defined class variable.
+        __init_array[i]();
+    }
+
     // Initialise architecture-specific.
     NArch::init();
 

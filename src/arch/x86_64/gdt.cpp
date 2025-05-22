@@ -43,5 +43,6 @@ namespace NArch {
 
     void GDT::reload(void) {
         gdt_flush(&this->gdtr);
+        NUtil::printf("[gdt]: GDT Reloaded.\n");
     }
 }

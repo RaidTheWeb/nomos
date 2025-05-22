@@ -15,6 +15,7 @@ namespace NLimine {
         assert(fbreq.response && fbreq.response->framebuffer_count >= 1, "Limine framebuffer request did not respond with a framebuffer.\n");
 
         assert(bireq.response, "Limine bootloader info request did not respond with bootloader info.\n");
+        assert(mmreq.response, "Limine bootloader memory map request did not respond with memory map info.\n");
 
         NUtil::printf("[limine]: %s %s init()\n", bireq.response->name, bireq.response->version);
         NUtil::printf("[limine]: Command Line: \"%s\"\n", ecreq.response->cmdline);

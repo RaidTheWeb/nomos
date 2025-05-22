@@ -98,13 +98,13 @@ namespace NLib {
         return dest;
     }
 
-    int strcmp(char *s1, char *s2) {
-        return memcmp(s1, s2, strlen(s1));
+    int strcmp(const char *s1, const char *s2) {
+        return memcmp((void *)s1, (void *)s2, strlen(s1));
     }
 
-    int strncmp(char *s1, char *s2, size_t n) {
+    int strncmp(const char *s1, const char *s2, size_t n) {
         size_t len = strlen(s2);
-        int ret = memcmp(s1, s2, n);
+        int ret = memcmp((void *)s1, (void *)s2, n);
         return ((n - len) <= 0) || ret != 0 ? ret : 0; // Assume perfect match if we got here before we reached the end of s2.
     }
 
@@ -147,5 +147,25 @@ namespace NLib {
         }
 
         return NULL; // No match.
+    }
+
+    char *strtrim(char *str) {
+        if (!str) {
+            return NULL;
+        }
+
+        char *end = str + strlen(str) - 1; // Get reference to last character.
+        while (end >= str && *end == ' ') { // For as long as we still have whitespace.
+            end--; // Trailing end removal.
+        }
+        *(end + 1) = '\0'; // NULL terminate.
+
+        char *start = str;
+        while (start && *start == ' ') { // For as long as we still have whitespace.
+            start++; // Leading end removal.
+        }
+        memmove(str, start, strlen(start) + 1); // Move start backwards in memory, this will have included our previous trailing edits, so it'll apply them too.
+
+        return str;
     }
 }

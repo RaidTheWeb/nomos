@@ -8,6 +8,8 @@ WORK_DIR ?= .
 DEST_DIR ?= ./
 PREFIX ?=
 
+DEBUG ?= 0
+
 SOURCE_DIR = src
 BIN_DIR = $(WORK_DIR)/bin
 BUILD_DIR = $(WORK_DIR)/build
@@ -43,8 +45,13 @@ CFLAGS ?= -g -O2 -pipe
 # C++ Flags
 CXXFLAGS ?= -g -O2 -pipe
 
+GITVER=$(shell git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD)
+BUILDDATE = $(shell date +'%Y-%m-%d %H:%M:%S')
+
 # C Preprocesssor Flags
-CPPFLAGS ?= -I $(SOURCE_DIR)/include -I$(SOURCE_DIR)/include/std -Iflanterm/ -DLIMINE_API_REVISION=3 -MMD -MP
+CPPFLAGS ?= -I $(SOURCE_DIR)/include -I$(SOURCE_DIR)/include/std -Iflanterm/ -DLIMINE_API_REVISION=3 -MMD -MP \
+	-DVERSION="\"$(GITVER)\"" \
+	-DBUILDDATE="\"$(BUILDDATE)\""
 
 # Linker Flags
 LDFLAGS ?= -Wl,--build-id=none -nostdlib -static -z max-page-size=0x1000 -Wl,--gc-sections -T linker-$(ARCH).ld
@@ -55,6 +62,10 @@ NASMFLAGS ?= -F dwarf -g
 SHAREDFLAGS ?= \
 	-Wall -Wextra -nostdinc -ffreestanding -fno-stack-protector \
 	-fno-stack-check -fno-PIC -ffunction-sections -fdata-sections
+
+ifeq ($(DEBUG),1)
+	SHAREDFLAGS += -fsanitize=undefined
+endif
 
 # Architecture specific.
 ifeq ($(ARCH),x86_64)

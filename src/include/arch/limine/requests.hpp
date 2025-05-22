@@ -13,6 +13,7 @@ namespace NLimine {
     extern volatile struct limine_hhdm_request hhdmreq;
     extern volatile struct limine_mp_request mpreq;
     extern volatile struct limine_rsdp_request rsdpreq;
+    extern volatile struct limine_memmap_request mmreq;
 }
 
 #endif
