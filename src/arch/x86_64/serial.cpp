@@ -1,6 +1,7 @@
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/serial.hpp>
+#include <lib/assert.hpp>
 #include <util/kprint.hpp>
 
 namespace NArch {
@@ -48,11 +49,7 @@ namespace NArch {
         outb(this->port + WRITE, 0xae);
 
         // Test for test byte.
-        if (inb(this->port + READ) != 0xae) {
-            for (;;) {
-                asm ("hlt");
-            }
-        }
+        assert(inb(this->port + READ) == 0xae, "UART loopback test failed.\n");
 
         // Disable loopback.
         outb(this->port + MODEMCTL,

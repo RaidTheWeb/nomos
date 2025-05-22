@@ -5,6 +5,7 @@
 #include <arch/x86_64/serial.hpp>
 #include <flanterm.h>
 #include <backends/fb.h>
+#include <lib/assert.hpp>
 #include <util/kprint.hpp>
 #include <limine.h>
 #include <stddef.h>

@@ -44,7 +44,8 @@ namespace NArch {
     extern "C" void isr_handle(uint64_t vec, void *ctx) {
         if (vec < 32) { // Exceptions.
             NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: CPU Exception: %s.\n", exceptions[vec]);
-            for (;;) {
+            for (;;) { // "Unrecoverable"
+                asm("cli");
                 asm("hlt");
             }
         }
