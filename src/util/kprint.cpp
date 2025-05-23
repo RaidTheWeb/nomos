@@ -100,7 +100,7 @@ namespace NUtil {
         }
 
         if (!(flags & LEFTJUST) && width > idx) {
-            for (int i = 0; i < width; i++) {
+            for (int i = idx; i < width; i++) {
                 putchar(buf, flags & ZEROPAD ? '0' : ' ', counter, max);
             }
         }
