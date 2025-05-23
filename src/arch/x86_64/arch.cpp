@@ -5,6 +5,7 @@
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/vmm.hpp>
+#include <lib/assert.hpp>
 #include <lib/string.hpp>
 #include <util/kprint.hpp>
 

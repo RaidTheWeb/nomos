@@ -32,6 +32,12 @@ namespace NLimine {
         .response = NULL
     };
 
+    volatile struct limine_hhdm_request hhdmreq = {
+        .id = LIMINE_HHDM_REQUEST,
+        .revision = 0,
+        .response = NULL
+    };
+
     __attribute__((unused))
     static volatile LIMINE_REQUESTS_END_MARKER;
 }

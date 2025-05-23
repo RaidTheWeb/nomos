@@ -16,6 +16,7 @@ namespace NLimine {
 
         assert(bireq.response, "Limine bootloader info request did not respond with bootloader info.\n");
         assert(mmreq.response, "Limine bootloader memory map request did not respond with memory map info.\n");
+        assert(hhdmreq.response, "Limine bootloader HHDM request did not respond with HHDM info.\n");
 
         NUtil::printf("[limine]: %s %s init()\n", bireq.response->name, bireq.response->version);
         NUtil::printf("[limine]: Command Line: \"%s\"\n", ecreq.response->cmdline);

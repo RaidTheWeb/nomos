@@ -21,14 +21,11 @@ namespace NLib {
         }
     }
 
-    #define GET_MACRO(_1, _2, _3, NAME, ...) NAME
-    #define assert(...) GET_MACRO(__VA_ARGS__, __assert_fmt, __assert_no_fmt)(__VA_ARGS__)
-
-    #define __assert_fmt(condition, msg, ...) ({ \
+    #define assertarg(condition, msg, ...) ({ \
         NLib::__assert((condition), #condition, __FUNCTION__, __FILE__, __LINE__, msg, __VA_ARGS__); \
     })
 
-    #define __assert_no_fmt(condition, msg) ({ \
+    #define assert(condition, msg) ({ \
         NLib::__assert((condition), #condition, __FUNCTION__, __FILE__, __LINE__, msg); \
     })
 }
