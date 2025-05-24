@@ -15,8 +15,8 @@ namespace NArch {
 
     static GDT gdt = GDT();
     static InterruptTable idt = InterruptTable();
-    static PMM pmm = PMM();
-    static VMM vmm = VMM();
+    PMM pmm = PMM();
+    VMM vmm = VMM();
 
     void init(void) {
         NUtil::printf("[arch/x86_64]: x86_64 init()\n");

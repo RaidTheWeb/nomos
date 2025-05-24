@@ -10,6 +10,8 @@
 #include <limine.h>
 #include <stddef.h>
 
+#include <mm/slab.hpp>
+
 static void hcf(void) {
     for (;;) {
         asm ("hlt");
@@ -32,6 +34,18 @@ extern "C" void kernel_main(void) {
 
     // Initialise architecture-specific.
     NArch::init();
+
+    NMem::allocator.setup();
+
+
+    void *test = NMem::allocator.alloc(48);
+    //  NMem::allocator.free(test);
+    void *test2 = NMem::allocator.alloc(64);
+    //    NMem::allocator.free(test2);
+
+    // assert(test == test2, "Sanity check failed.\n");
+
+    NUtil::printf("Allocated 0x%016lx.\n", (uintptr_t)test);
 
     hcf();
 }

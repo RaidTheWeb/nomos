@@ -57,7 +57,7 @@ namespace NArch {
         }
 
         NUtil::printf("[pmm]: Usable Pages: %lu (%luMiB).\n", usablepages, (usablepages * PAGESIZE) / 1024 / 1024);
-        NUtil::printf("[pmm]: Using largest region of usable memory: size %luMiB, at 0x%016x.\n", (largestsize) / 1024 / 1024, largestaddr);
+        NUtil::printf("[pmm]: Using largest region of usable memory: size %luMiB, at 0x%016lx.\n", (largestsize) / 1024 / 1024, largestaddr);
 
         // Align to block size.
         largestaddr = (largestaddr + (SMALLESTBLOCK - 1)) & ~(SMALLESTBLOCK - 1);
@@ -115,6 +115,8 @@ namespace NArch {
     void *PMM::alloc(size_t size) {
         NLib::ScopeSpinlock(&this->buddylock);
 
+        // NOTE: Due to the behaviour of a freelist (last block is first in free list), the PMM buddy allocator will grow downwards towards the allocatable region base.
+
         // Round up to nearest block size that fits this allocation.
         size_t actual = SMALLESTBLOCK;
 
@@ -164,6 +166,7 @@ namespace NArch {
     }
 
     void PMM::free(void *ptr) {
+        // TODO: Defer the merging!
         NLib::ScopeSpinlock(&this->buddylock);
 
         uintptr_t addr = (uintptr_t)ptr;

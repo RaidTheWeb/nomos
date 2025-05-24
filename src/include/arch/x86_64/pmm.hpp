@@ -35,9 +35,13 @@ namespace NArch {
             Spinlock buddylock;
         public:
             void setup(void);
+
+            // NOTE: Returns with HHDM offset! For stuff that does NOT support higher halves, we need to subtract the HHDM offset.
             void *alloc(size_t size);
             void free(void *ptr);
     };
+
+    extern PMM pmm;
 }
 
 #endif
