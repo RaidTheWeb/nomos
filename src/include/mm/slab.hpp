@@ -8,10 +8,17 @@ namespace NMem {
     __attribute__((unused))
     static const size_t numslabs = 9;
 
+    __attribute__((unused))
     static const size_t slabsizes[numslabs] = {
         // Allocate slabs up to the exact size of a traditional "page".
         16, 32, 64, 128, 256, 512, 1024, 2048, 4096
     };
+
+    __attribute__((unused))
+    static const uint32_t ALLOCMAGIC = 0xab2113f4; // Indicates allocated.
+
+    __attribute__((unused))
+    static const uint32_t CANARY = 0x3fce23a2; // Memory corruption canary.
 
     class SlabAllocator {
         private:
@@ -25,7 +32,10 @@ namespace NMem {
 
                     // Metadata header.
                     struct metadata {
+                        uint32_t startcanary;
                         size_t size;
+                        uint32_t magic;
+                        uint32_t endcanary;
                     };
 
                     struct header *freelist;

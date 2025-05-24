@@ -1,6 +1,7 @@
 #include <arch/x86_64/pmm.hpp>
-#include <mm/slab.hpp>
 #include <lib/assert.hpp>
+#include <lib/string.hpp>
+#include <mm/slab.hpp>
 
 namespace NMem {
     // Get index of slab associated with allocation size.
@@ -32,7 +33,8 @@ namespace NMem {
         assert(size, "Zero size allocation.\n");
 
         // Align the size to 16 bytes (smallest slab size, and also multiplies to make every other size).
-        size_t aligned = (((size) + (16 - 1)) & ~(16 - 1));
+        // Needs to include enough space for the metadata.
+        size_t aligned = (((size + sizeof(struct SubAllocator::metadata)) + (16 - 1)) & ~(16 - 1));
 
         // Get slab index.
         size_t idx = getslabidx(aligned);
@@ -44,7 +46,7 @@ namespace NMem {
             SubAllocator *sub = &this->slabs[idx];
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
                 NUtil::printf("[slab]: Grow.\n");
-                void *ptr = NArch::pmm.alloc(1); // Allocate a single page (this works because all slabs are smaller than a page).
+                void *ptr = NArch::pmm.alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
                     return NULL;
                 }
@@ -74,6 +76,11 @@ namespace NMem {
             struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)block;
             meta->size = aligned; // Set metadata.
 
+            // Memory corruption meta.
+            meta->startcanary = CANARY;
+            meta->magic = ALLOCMAGIC;
+            meta->endcanary = CANARY;
+
             NUtil::printf("[slab]: Returning allocation of 0x%016lx+0x0%016lx->0x%016lx.\n", meta, sizeof(struct SubAllocator::metadata), (uintptr_t)meta + sizeof(struct SubAllocator::metadata));
 
             // Return pointer to the memory *after* the metadata.
@@ -92,16 +99,25 @@ namespace NMem {
             struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)ptr;
             meta->size = aligned; // Set metadata.
 
+            // Memory corruption meta.
+            meta->startcanary = CANARY;
+            meta->magic = ALLOCMAGIC;
+            meta->endcanary = CANARY;
+
             // Return pointer to data *after* metadata.
             return (void *)((uintptr_t)ptr + sizeof(struct SubAllocator::metadata));
         }
     }
+
+    extern bool sanitisefreed;
 
     void SlabAllocator::free(void *ptr) {
         assert(ptr != NULL, "Invalid pointer to free.\n");
 
         // Get the header from the allocation meta data.
         struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)((uintptr_t)ptr - sizeof(struct SubAllocator::metadata));
+        assert(meta->magic == ALLOCMAGIC, "Invalid free on potentially non-allocated block.\n");
+        assert(meta->startcanary == CANARY && meta->endcanary == CANARY, "Slab memory corruption detected.\n");
 
         size_t size = meta->size;
 
@@ -111,12 +127,25 @@ namespace NMem {
             NUtil::printf("[slab]: Freeing on slab.\n");
             // Release slabbed
             SubAllocator *sub = &this->slabs[idx];
+
+            if (sanitisefreed) {
+                // Clear freed memory (sanitisation).
+                NUtil::printf("[slab]: Sanitising memory on free.\n");
+                NLib::memset(meta, 0xaa, size);
+            }
+
             struct SubAllocator::header *block = (struct SubAllocator::header *)meta; // Reinterpret pointer as free block.
             block->next = sub->freelist; // This metadata'd allocation (indicating that it's allocated) is now free, so we need to point it somewhere.
 
             sub->freelist = block; // Add to freelist.
         } else { // Outside of slab, this means that it was allocated from pages directly.
             NUtil::printf("[slab]: Outside of slab, page free.\n");
+
+            if (sanitisefreed) {
+                // Clear freed memory (sanitisation).
+                NLib::memset(meta, 0xaa, size);
+            }
+
             // Metadata start is the start of the page, therefore, we can just shove the location of the metadata into the PMM to free it.
             NArch::pmm.free(meta);
         }

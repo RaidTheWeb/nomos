@@ -22,6 +22,10 @@ static void hcf(void) {
 extern void (*__init_array[])();
 extern void (*__init_array_end[])();
 
+namespace NMem {
+    bool sanitisefreed = true;
+}
+
 extern "C" void kernel_main(void) {
     NUtil::printf("Nomos %s, built %s\n", VERSION, BUILDDATE);
 
@@ -38,10 +42,10 @@ extern "C" void kernel_main(void) {
     NMem::allocator.setup();
 
 
-    void *test = NMem::allocator.alloc(48);
-    //  NMem::allocator.free(test);
-    void *test2 = NMem::allocator.alloc(64);
-    //    NMem::allocator.free(test2);
+    void *test = NMem::allocator.alloc(32);
+    // NMem::allocator.free(test);
+    void *test2 = NMem::allocator.alloc(32);
+    NMem::allocator.free(test2);
 
     // assert(test == test2, "Sanity check failed.\n");
 
