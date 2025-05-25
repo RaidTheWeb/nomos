@@ -6,12 +6,13 @@
 
 namespace NMem {
     __attribute__((unused))
-    static const size_t numslabs = 9;
+    static const size_t numslabs = 17;
 
     __attribute__((unused))
     static const size_t slabsizes[numslabs] = {
         // Allocate slabs up to the exact size of a traditional "page".
-        16, 32, 64, 128, 256, 512, 1024, 2048, 4096
+        16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536,
+        2048, 3072, 4096
     };
 
     __attribute__((unused))
@@ -33,7 +34,7 @@ namespace NMem {
                     // Metadata header.
                     struct metadata {
                         uint32_t startcanary;
-                        size_t size;
+                        uint32_t size; // This means we can only have a maximum size of a 4G allocation.
                         uint32_t magic;
                         uint32_t endcanary;
                     };
@@ -49,6 +50,8 @@ namespace NMem {
             void setup(void);
 
             void *alloc(size_t size);
+            void *calloc(size_t num, size_t size);
+            void *realloc(void *ptr, size_t newsize);
             void free(void *ptr);
     };
 

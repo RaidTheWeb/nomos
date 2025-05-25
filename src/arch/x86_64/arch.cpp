@@ -1,4 +1,5 @@
 #include <arch/limine/arch.hpp>
+#include <arch/limine/requests.hpp>
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/gdt.hpp>
 #include <arch/x86_64/interrupts.hpp>
@@ -6,12 +7,18 @@
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
+#include <lib/cmdline.hpp>
 #include <lib/string.hpp>
+#include <mm/slab.hpp>
 #include <util/kprint.hpp>
+
+#define EARLYSERIAL 0
 
 namespace NArch {
     bool hypervisor_enabled = false;
     bool hypervisor_checked = false;
+
+    NLib::CmdlineParser cmdline;
 
     static GDT gdt = GDT();
     static InterruptTable idt = InterruptTable();
@@ -19,7 +26,7 @@ namespace NArch {
     VMM vmm = VMM();
 
     void init(void) {
-        NUtil::printf("[arch/x86_64]: x86_64 init()\n");
+        NUtil::printf("[arch/x86_64]: x86_64 init().\n");
 
         char vendor[13] = { 0 };
         uint32_t *vcpu1 = (uint32_t *)vendor;
@@ -89,8 +96,10 @@ namespace NArch {
             NUtil::printf("[arch/x86_64]: Hypervisor %s Detected.\n", vendorfn);
             hypervisor_enabled = true;
 
+#if EARLYSERIAL == 1
             NUtil::printf("[arch/x86_64]: Enable UART in Hypervisor.\n");
             NArch::serial_init();
+#endif
         } else {
             NUtil::printf("[arch/x86_64]: No Hypervisor Detected. Assuming real hardware.\n");
         }
@@ -108,6 +117,16 @@ namespace NArch {
 
         // pmm = PMM();
         pmm.setup();
+
+        NMem::allocator.setup();
+
+        // Setup command line.
+        cmdline.setup(NLimine::ecreq.response->cmdline);
+
+        if (cmdline.get("serialcom1") != NULL) {
+            NUtil::printf("[arch/x86_64]: Serial enabled via serialcom1 command line argument.\n");
+            NArch::serial_init();
+        }
 
         // vmm = VMM();
         vmm.setup();

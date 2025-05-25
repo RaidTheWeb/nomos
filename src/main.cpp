@@ -1,13 +1,19 @@
+#ifdef __x86_64__
 #include <arch/limine/arch.hpp>
 #include <arch/limine/console.hpp>
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/serial.hpp>
-#include <flanterm.h>
 #include <backends/fb.h>
-#include <lib/assert.hpp>
-#include <util/kprint.hpp>
+#include <flanterm.h>
 #include <limine.h>
+#endif
+
+#include <cxxruntime.hpp>
+
+#include <lib/assert.hpp>
+#include <lib/cmdline.hpp>
+#include <util/kprint.hpp>
 #include <stddef.h>
 
 #include <mm/slab.hpp>
@@ -18,38 +24,41 @@ static void hcf(void) {
     }
 }
 
-// C++ Global Constructors.
-extern void (*__init_array[])();
-extern void (*__init_array_end[])();
-
 namespace NMem {
-    bool sanitisefreed = true;
+    bool sanitisefreed = false;
+}
+
+// These operators must be defined here, or else they won't apply everywhere.
+
+void *operator new(size_t size) {
+    return NMem::allocator.alloc(size);
+}
+
+void operator delete(void *ptr) {
+    NMem::allocator.free(ptr);
+}
+
+void *operator new[](size_t size) {
+    return operator new(size);
+}
+
+void operator delete[](void *ptr) {
+    operator delete(ptr);
 }
 
 extern "C" void kernel_main(void) {
     NUtil::printf("Nomos %s, built %s\n", VERSION, BUILDDATE);
 
-    // Initialise global constructors.
-    // Required to let us initialise classes outside of stack-based scopes like functions.
-    for (size_t i = 0; &__init_array[i] != __init_array_end; i++) {
-        // Call the constructor for every globally defined class variable.
-        __init_array[i]();
-    }
+    // Initialise freestanding C++ "runtime" support.
+    NCxx::init();
 
     // Initialise architecture-specific.
     NArch::init();
 
-    NMem::allocator.setup();
-
-
-    void *test = NMem::allocator.alloc(32);
-    // NMem::allocator.free(test);
-    void *test2 = NMem::allocator.alloc(32);
-    NMem::allocator.free(test2);
-
-    // assert(test == test2, "Sanity check failed.\n");
-
-    NUtil::printf("Allocated 0x%016lx.\n", (uintptr_t)test);
+    // Command line argument enables memory sanitisation upon slab allocator free.
+    if (NArch::cmdline.get("mmsan")) {
+        NMem::sanitisefreed = true;
+    }
 
     hcf();
 }

@@ -24,13 +24,16 @@ namespace NMem {
             this->slabs[i].freelist = NULL;
             this->slabs[i].blksize = slabsizes[i];
             this->slabs[i].blkpp = NArch::PAGESIZE / slabsizes[i];
-            NUtil::printf("initialise slab allocator for size %lu with %lu blocks per page.\n", slabsizes[i], this->slabs[i].blkpp);
         }
 
+        void *test = NMem::allocator.alloc(32);
+        assert(test != NULL, "Failed to allocate bytes during slab allocator setup.\n");
+        NMem::allocator.free(test);
     }
 
     void *SlabAllocator::alloc(size_t size) {
         assert(size, "Zero size allocation.\n");
+        NUtil::printf("alloc.\n");
 
         // Align the size to 16 bytes (smallest slab size, and also multiplies to make every other size).
         // Needs to include enough space for the metadata.
@@ -40,12 +43,10 @@ namespace NMem {
         size_t idx = getslabidx(aligned);
 
         if (idx != __SIZE_MAX__) {
-            NUtil::printf("valid allocation on slab size %lu.\n", slabsizes[idx]);
             // We found an allocator, allocate with it:
 
             SubAllocator *sub = &this->slabs[idx];
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
-                NUtil::printf("[slab]: Grow.\n");
                 void *ptr = NArch::pmm.alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
                     return NULL;
@@ -62,7 +63,6 @@ namespace NMem {
 
                 struct SubAllocator::header *last = (struct SubAllocator::header *)current;
                 last->next = NULL;
-                NUtil::printf("[slab]: Grew slab size of %lu by %lu.\n", sub->blksize, sub->blkpp);
 
                 // Dump our new blocks onto the freelist.
                 sub->freelist = (struct SubAllocator::header *)ptr;
@@ -81,12 +81,9 @@ namespace NMem {
             meta->magic = ALLOCMAGIC;
             meta->endcanary = CANARY;
 
-            NUtil::printf("[slab]: Returning allocation of 0x%016lx+0x0%016lx->0x%016lx.\n", meta, sizeof(struct SubAllocator::metadata), (uintptr_t)meta + sizeof(struct SubAllocator::metadata));
-
             // Return pointer to the memory *after* the metadata.
             return (void *)((uintptr_t)block + sizeof(struct SubAllocator::metadata));
         } else {
-            NUtil::printf("[slab]: Too big, page allocate.\n");
             // Unable to find slab (too big). Try to allocate this as a page.
 
             size_t needed = (aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
@@ -124,13 +121,11 @@ namespace NMem {
         size_t idx = getslabidx(size);
 
         if (idx != __SIZE_MAX__ && size <= this->slabs[idx].blksize) { // Fits within a slab.
-            NUtil::printf("[slab]: Freeing on slab.\n");
             // Release slabbed
             SubAllocator *sub = &this->slabs[idx];
 
             if (sanitisefreed) {
                 // Clear freed memory (sanitisation).
-                NUtil::printf("[slab]: Sanitising memory on free.\n");
                 NLib::memset(meta, 0xaa, size);
             }
 
@@ -139,7 +134,6 @@ namespace NMem {
 
             sub->freelist = block; // Add to freelist.
         } else { // Outside of slab, this means that it was allocated from pages directly.
-            NUtil::printf("[slab]: Outside of slab, page free.\n");
 
             if (sanitisefreed) {
                 // Clear freed memory (sanitisation).
@@ -149,5 +143,45 @@ namespace NMem {
             // Metadata start is the start of the page, therefore, we can just shove the location of the metadata into the PMM to free it.
             NArch::pmm.free(meta);
         }
+    }
+
+    void *SlabAllocator::calloc(size_t num, size_t size) {
+        size_t total = num * size;
+        void *ptr = this->alloc(total); // Allocate enough for the entire section.
+        if (ptr != NULL) {
+            NLib::memset(ptr, 0, total); // Calloc demands whole region be zeroed.
+        }
+        return ptr;
+    }
+
+    void *SlabAllocator::realloc(void *ptr, size_t newsize) {
+        if (ptr == NULL) {
+            return this->alloc(newsize); // If the pointer we pass in is NULL, we must allocate a new pointer.
+        }
+
+        if (!newsize) {
+            this->free(ptr); // Zero size means free.
+            return NULL;
+        }
+
+        struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)((uintptr_t)ptr - sizeof(struct SubAllocator::metadata));
+        size_t old = meta->size; // Find old size, so we can figure out how much to copy.
+
+        if (getslabidx(newsize) == getslabidx(old)) {
+            return ptr;
+        }
+
+        void *newptr = this->alloc(newsize);
+        if (newptr == NULL) {
+            return NULL;
+        }
+
+        // Pick if we should be copying all the data from the old one, or up until the new size.
+        size_t copysize = old < newsize ? old : newsize;
+        NLib::memcpy(newptr, ptr, copysize); // Copy across the old data.
+
+        // Free old pointer.
+        free(ptr);
+        return newptr;
     }
 }

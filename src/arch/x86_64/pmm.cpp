@@ -128,12 +128,12 @@ namespace NArch {
 
         size_t found = level;
         // While we haven't exceeded the maximum number of levels, and there are empty freelists (not yet split).
-        while (found < ALLOCLEVEL && this->zone.freelist[found] == NULL) {
-            found++;
+        while (found < ALLOCLEVEL && this->zone.freelist[found] == NULL) { // For as long as we're working with real levels that are empty.
+            found++; // If the ideal size has no free blocks, we'll have to go upwards to a larger size.
         }
 
         if (found == ALLOCLEVEL) { // If we have actually reached the maximum allocation level, then we couldn't find anything.
-            NUtil::printf("[pmm]: Buddy allocator OOM.\n");
+            NUtil::printf("[pmm]: Buddy allocator OOM when trying to find for size %lu.\n", size);
             return NULL; // OOM.
         }
 
