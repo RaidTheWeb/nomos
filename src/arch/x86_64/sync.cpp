@@ -1,13 +1,27 @@
 #include <arch/x86_64/sync.hpp>
 #include <lib/assert.hpp>
+#include <mm/slab.hpp>
 
 namespace NArch {
-    static thread_local struct MCSSpinlock::state mcsstate;
+    // XXX: This needs to be made thread local!
+    static struct MCSSpinlock::state mcsstate;
+
+    void MCSSpinlock::initstate(struct state *state) {
+        state->depth = 0;
+        state->node = (struct mcsnode *)NMem::allocator.alloc(sizeof(struct mcsnode));
+        state->node->next = NULL;
+        state->node->locked = 0;
+        state->inited = true;
+    }
 
     void MCSSpinlock::acquire(void) {
         assert(mcsstate.depth < 16, "Maximum MCS lock depth exceeded.\n");
 
-        struct mcsnode *node = mcsstate.nodes[mcsstate.depth++];
+        if (!mcsstate.inited) {
+            this->initstate(&mcsstate);
+        }
+
+        struct mcsnode *node = mcsstate.node;
         node->next = NULL;
         node->locked = 1;
 
@@ -23,14 +37,17 @@ namespace NArch {
                 asm volatile("pause" : : : "memory");
             }
         }
+
+        mcsstate.depth++;
     }
 
     void MCSSpinlock::release(void) {
-        struct mcsnode *node = mcsstate.nodes[mcsstate.depth];
+        struct mcsnode *node = mcsstate.node;
 
         // If there is no next node in the queue (we are the last node), we can immediately release if this is the case, but this can change later:
         if (!__atomic_load_n(&node->next, memory_order_acquire)) {
             struct mcsnode *expected = node;
+            // NUtil::printf("expecting 0x%0llx.\n", expected);
             // Attempt to set the tail to nothing (proper release)
             // But, if the tail is somehow not us, this indicates that someone else just came along and entered the line, in which case, we need to hand off to them.
             if (__atomic_compare_exchange_n(&this->tail, &expected, NULL, false, memory_order_release, memory_order_relaxed)) {

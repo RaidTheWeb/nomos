@@ -46,6 +46,17 @@ void operator delete[](void *ptr) {
     operator delete(ptr);
 }
 
+void operator delete(void *ptr, size_t size) {
+    (void)size;
+    NMem::allocator.free(ptr);
+}
+
+void operator delete[](void *ptr, size_t size) {
+    (void)size;
+    operator delete(ptr);
+}
+
+
 extern "C" void kernel_main(void) {
     NUtil::printf("Nomos %s, built %s\n", VERSION, BUILDDATE);
 

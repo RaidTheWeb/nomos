@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 namespace NArch {
+    extern bool serialenabled;
+    extern bool serialchecked;
 
     // Offsets:
     enum {

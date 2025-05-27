@@ -94,6 +94,8 @@ namespace NArch {
                 this->zone.freelist[ALLOCLEVEL - 1] = block; // Point the head of the freelist to this current entry, this will consequently append all free entries.
             }
 
+            prev = block; // Update this for the next block, so that it knows to add itself.
+
             i++; // Increment counter.
             size -= biggestblock; // Decrement available size by block size.
         }
@@ -113,9 +115,11 @@ namespace NArch {
     }
 
     void *PMM::alloc(size_t size) {
-        NLib::ScopeSpinlock(&this->buddylock);
+        NLib::ScopeSpinlock guard(&this->buddylock);
 
-        // NOTE: Due to the behaviour of a freelist (last block is first in free list), the PMM buddy allocator will grow downwards towards the allocatable region base.
+        this->alloci++;
+
+        // NOTE: Due to the behaviour of a freelist (last block is first in free list), the PMM buddy allocator will grow upwards from the allocatable region base.
 
         // Round up to nearest block size that fits this allocation.
         size_t actual = SMALLESTBLOCK;
@@ -162,14 +166,16 @@ namespace NArch {
         struct block *alloc = this->zone.freelist[level];
         this->zone.freelist[level] = alloc->next; // We're consuming this block now.
         alloc->canary = 0; // Remove canary.
-        return (void *)alloc; // Return block allocation.
+        return (void *)((uintptr_t)alloc - NLimine::hhdmreq.response->offset); // Return block allocation.
     }
 
     void PMM::free(void *ptr) {
         // TODO: Defer the merging!
-        NLib::ScopeSpinlock(&this->buddylock);
+        NLib::ScopeSpinlock guard(&this->buddylock);
 
-        uintptr_t addr = (uintptr_t)ptr;
+        this->alloci--;
+
+        uintptr_t addr = (uintptr_t)ptr + NLimine::hhdmreq.response->offset;
 
         // Check if the pointer actually exists in the allocator zone, if it's not, it's an invalid pointer.
         assert(addr >= this->zone.addr && addr < this->zone.addr + this->zone.size, "Free on invalid pointer.\n");

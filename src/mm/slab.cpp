@@ -1,3 +1,4 @@
+#include <arch/limine/requests.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
@@ -33,7 +34,6 @@ namespace NMem {
 
     void *SlabAllocator::alloc(size_t size) {
         assert(size, "Zero size allocation.\n");
-        NUtil::printf("alloc.\n");
 
         // Align the size to 16 bytes (smallest slab size, and also multiplies to make every other size).
         // Needs to include enough space for the metadata.
@@ -47,7 +47,7 @@ namespace NMem {
 
             SubAllocator *sub = &this->slabs[idx];
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
-                void *ptr = NArch::pmm.alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
+                void *ptr = ((void *)((uintptr_t)NArch::pmm.alloc(NArch::PAGESIZE) + NLimine::hhdmreq.response->offset)); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
                     return NULL;
                 }
@@ -87,7 +87,7 @@ namespace NMem {
             // Unable to find slab (too big). Try to allocate this as a page.
 
             size_t needed = (aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
-            void *ptr = NArch::pmm.alloc(needed);
+            void *ptr = ((void *)((uintptr_t)NArch::pmm.alloc(needed) + NLimine::hhdmreq.response->offset));
             if (ptr == NULL) {
                 return NULL;
             }

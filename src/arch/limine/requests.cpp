@@ -38,6 +38,12 @@ namespace NLimine {
         .response = NULL
     };
 
+    volatile struct limine_executable_address_request eareq = {
+        .id = LIMINE_EXECUTABLE_ADDRESS_REQUEST,
+        .revision = 0,
+        .response = NULL
+    };
+
     __attribute__((unused))
     static volatile LIMINE_REQUESTS_END_MARKER;
 }

@@ -14,14 +14,14 @@ SECTIONS
 {
     . = 0xffffffff80000000; /* Start at the upper region. */
 
-    text_start = .;
+    _text_start = .;
     .text : {
         *(.text .text.*)
     } :text
     . = ALIGN(CONSTANT(MAXPAGESIZE));
-    text_end = .;
+    _text_end = .;
 
-    rodata_start = .;
+    _rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
@@ -34,9 +34,9 @@ SECTIONS
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
-    rodata_end = .;
+    _rodata_end = .;
 
-    data_start = .;
+    _data_start = .;
     .data : {
         *(.data .data.*)
     } :data
@@ -46,7 +46,7 @@ SECTIONS
         *(COMMON)
     } :data
     . = ALIGN(CONSTANT(MAXPAGESIZE));
-    data_end = .;
+    _data_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

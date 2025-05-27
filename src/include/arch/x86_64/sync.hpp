@@ -68,13 +68,16 @@ namespace NArch {
                 volatile uint32_t locked;
             };
 
-            struct mcsnode *tail;
+            struct mcsnode *tail = NULL;
         public:
             struct state {
-                struct mcsnode *nodes[16];
-                uint8_t depth;
+                struct mcsnode *node;
+                uint8_t depth = 0;
+                uint8_t inited = false;
             };
-            MCSSpinlock(void);
+            MCSSpinlock(void) { };
+
+            static void initstate(struct state *state);
 
             void acquire(void);
             void release(void);

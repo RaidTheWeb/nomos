@@ -1,4 +1,5 @@
 #include <lib/string.hpp>
+#include <util/kprint.hpp>
 
 namespace NLib {
     void *memcpy(void *dest, void *src, size_t n) {
@@ -28,13 +29,23 @@ namespace NLib {
             size_t word = 0;
             // Try to fill a big bit of data with c.
             for (size_t i = 0; i < sizeof(size_t); i++) {
-                word |= (uint8_t)c << (i * sizeof(size_t));
+                word = (word << 8) | (uint8_t)c;
             }
+
+            while ((uintptr_t)pdest % sizeof(size_t) != 0 && n) {
+                *pdest = (uint8_t)c;
+                n--;
+                pdest++;
+            }
+
+            size_t *sdest = (size_t *)pdest;
             while (n >= sizeof(size_t)) {
-                *(size_t *)pdest = word;
-                pdest += sizeof(size_t);
+                *sdest = word;
                 n -= sizeof(size_t);
+                sdest++;
             }
+
+            pdest = (uint8_t *)sdest;
         }
 
         // Copy in bytes for the rest.

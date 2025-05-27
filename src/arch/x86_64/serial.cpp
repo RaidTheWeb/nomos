@@ -6,6 +6,8 @@
 
 namespace NArch {
     SerialPort serial[8] = { };
+    bool serialenabled = false;
+    bool serialchecked = false;
 
     void serial_init(void) {
         serial[0].init(SerialPort::COM1);
@@ -81,8 +83,7 @@ namespace NArch {
     }
 
     void SerialPort::write(uint8_t data) {
-        // If the hypervisor is disabled, and we've confirmed that we've checked it, make NO further attempts to write to the backbuffer.
-        if (!NArch::hypervisor_enabled && NArch::hypervisor_checked) {
+        if (!serialenabled && serialchecked) {
             return;
         }
 

@@ -126,7 +126,9 @@ namespace NArch {
         if (cmdline.get("serialcom1") != NULL) {
             NUtil::printf("[arch/x86_64]: Serial enabled via serialcom1 command line argument.\n");
             NArch::serial_init();
+            serialenabled = true;
         }
+        serialchecked = true;
 
         // vmm = VMM();
         vmm.setup();

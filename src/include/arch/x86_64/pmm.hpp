@@ -34,6 +34,8 @@ namespace NArch {
             struct zone zone;
             Spinlock buddylock;
         public:
+
+            size_t alloci = 0;
             void setup(void);
 
             // NOTE: Returns with HHDM offset! For stuff that does NOT support higher halves, we need to subtract the HHDM offset.
