@@ -13,6 +13,7 @@ extern void *_rodata_end;
 
 namespace NArch {
 
+
     static inline void *hhdmoff(void *ptr) {
         return (void *)((uintptr_t)ptr + NLimine::hhdmreq.response->offset);
     }
@@ -32,8 +33,7 @@ namespace NArch {
         return (struct pagetable *)(hhdmoff((void *)(entry & ADDRMASK)));
     }
 
-    uintptr_t VMM::virt2phys(struct addrspace *space, uintptr_t virt) {
-        // NLib::ScopeMCSSpinlock guard(&space->lock);
+    uint64_t *VMM::_resolvepte(struct addrspace *space, uintptr_t virt) {
 
         // Decode virtual address:
         uint64_t pml4idx = (virt & PML4MASK) >> 39;
@@ -46,53 +46,67 @@ namespace NArch {
         // Get reference to PML4 table.
         uint64_t pml4e = space->pml4->entries[pml4idx];
         if (!(pml4e & PRESENT)) {
-            return 0;
+            return NULL;
         }
 
         // Get reference to PDP table.
         struct pagetable *pdp = this->walk(pml4e);
         if (!pdp) {
-            return 0;
+            return NULL;
         }
         uint64_t pdpe = pdp->entries[pdpidx];
         if (!(pdpe & PRESENT)) {
-            return 0;
+            return NULL;
         }
 
         if (pdpe & HUGE) {
-            return (pdpe & ADDRMASK1GB) | (virt & OFFMASK1GB);
+            return &pdp->entries[pdpidx];
         }
 
         // Get reference to PD table.
         struct pagetable *pd = this->walk(pdpe);
         if (!pd) {
-            return 0;
+            return NULL;
         }
         uint64_t pde = pd->entries[pdidx];
         if (!(pde & PRESENT)) {
-            return 0;
+            return NULL;
         }
 
         if (pde & HUGE) {
-            return (pde & ADDRMASK2MB) | (virt & OFFMASK2MB);
+            return &pd->entries[pdidx];
         }
 
         // Get reference to PT table.
         struct pagetable *pt = this->walk(pde);
         if (!pt) {
-            return 0;
+            return NULL;
         }
         uint64_t pte = pt->entries[ptidx];
         if (!(pte & PRESENT)) {
+            return NULL;
+        }
+
+        return &pt->entries[ptidx];
+    }
+
+    uintptr_t VMM::_virt2phys(struct addrspace *space, uintptr_t virt) {
+        uint64_t *pte = this->_resolvepte(space, virt);
+        if (!pte) {
             return 0;
         }
 
         // Construct physical address from address mask with offset.
-        return (pte & ADDRMASK) | (virt & OFFMASK);
+        return (*pte & ADDRMASK) | (virt & OFFMASK);
     }
 
-    bool VMM::mappage(struct addrspace *space, uintptr_t virt, uint64_t entry, bool user) {
-        NLib::ScopeMCSSpinlock guard(&space->lock);
+    bool VMM::_mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool user) {
+
+        // Align down to base of the page the address exists in.
+        // phys = ((phys) + ~(PAGESIZE - 1));
+        // virt = ((virt) + ~(PAGESIZE - 1));
+        phys = pagealign(phys);
+        virt = pagealign(virt);
 
         // Decode virtual address:
         uint64_t pml4idx = (virt & PML4MASK) >> 39;
@@ -139,9 +153,43 @@ namespace NArch {
         }
 
         // At the end of all the indirection:
-        pt->entries[ptidx] = entry;
+        pt->entries[ptidx] = (phys & ADDRMASK) | flags;
 
         return true;
+    }
+
+    void VMM::_unmappage(struct addrspace *space, uintptr_t virt) {
+        uint64_t *pte = this->_resolvepte(space, virt);
+        if (pte) {
+            *pte = 0; // Blank page table entry, so that it now points NOWHERE.
+            invlpg(virt); // Invalidate, so that the CPU will know that it's lost this page.
+        }
+    }
+
+    bool VMM::_maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
+        size_t len = pagealign((virt) + size); // Align length to page.
+        // Align down to base.
+        phys = pagealign(phys);
+        virt = pagealign(virt);
+        size = len - virt; // Overwrite size of range to represent page alignmentment.
+
+        for (size_t i = 0; i < size; i += PAGESIZE) {
+            assertarg(this->_mappage(space, virt + i, phys + i, flags, false), "Failed to map page in range 0x%016llx->0x%016llx.\n", virt, virt + size);
+
+            // this->_unmaprange(space, virt, i); // Recovery to unmap current progress.
+            // return false;
+        }
+        return true;
+    }
+
+    void VMM::_unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
+        size_t len = pagealign(pagealign(virt) + size); // Align length to page.
+        virt = pagealign(virt);
+        len = len - virt;
+
+        for (size_t i = 0; i < size; i += PAGESIZE) {
+            this->_unmappage(space, virt + i);
+        }
     }
 
     void VMM::mapkernel(void *start, void *end, uint64_t flags) {
@@ -149,12 +197,7 @@ namespace NArch {
         uintptr_t base = (uintptr_t)start;
         uintptr_t phyaddr = (uintptr_t)start - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base;
 
-        for (size_t i = 0; i < len; i += PAGESIZE) {
-            uint64_t entry = ((phyaddr + i) & ADDRMASK) | flags;
-
-            assert(this->mappage(&this->kspace, (uintptr_t)(base + i), entry, false), "Failed to map page of kernel.\n");
-        }
-
+        this->maprange(&this->kspace, base, phyaddr, flags, len);
     }
 
     void VMM::setup(void) {
@@ -181,12 +224,8 @@ namespace NArch {
                 entry->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE ||
                 entry->type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES) {
 
-                // Map entire memory map.
-                for (size_t i = 0; i < entry->length; i+= PAGESIZE) {
-                    // Set up page table entry.
-                    uint64_t page = ((entry->base + i) & ADDRMASK) | NOEXEC | WRITEABLE | PRESENT;
-                    assert(this->mappage(&this->kspace, (uintptr_t)hhdmoff((void *)(entry->base + i)), page, false), "Failed to map page.\n");
-                }
+                // Map entire region.
+                this->maprange(&this->kspace, (uintptr_t)hhdmoff((void *)(entry->base)), entry->base, NOEXEC | WRITEABLE | PRESENT, entry->length);
             }
         }
 
