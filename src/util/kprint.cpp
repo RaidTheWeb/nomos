@@ -36,8 +36,9 @@ namespace NUtil {
         }
     }
 
-    static void putstr(char **buf, const char *str, int *counter, int max) {
-        while (*str && *counter < max) {
+    static void putstr(char **buf, const char *str, int *counter, int max, int precision) {
+        int prec = precision;
+        while (*str && *counter < max && (precision >= 0 ? prec-- : true)) {
             *(*buf)++ = *str++;
             (*counter)++;
         }
@@ -71,7 +72,7 @@ namespace NUtil {
         }
 
         if (flags & HASH && base == 16) {
-            putstr(buf, flags & UPPER ? "0X" : "0x", counter, max);
+            putstr(buf, flags & UPPER ? "0X" : "0x", counter, max, -1);
             width = width > 2 ? width - 2 : 0;
         } else if (flags & HASH && base == 8 && num != 0) {
             putchar(buf, '0', counter, max);
@@ -167,6 +168,19 @@ flagbreak:
                 ADVANCE(format); // Next token.
             }
 
+            int precision = -1;
+            if (*format == '.') {
+                ADVANCE(format);
+                if (isdigit(*format)) {
+                    precision = atoi(&format, 10); // Precision baked into format string.
+                } else if (*format == '*') {
+                    precision = va_arg(ap, int); // Variable precision.
+                    ADVANCE(format);
+                } else {
+                    precision = 0; // Default to zero.
+                }
+            }
+
             // Integer length processing:
             switch (*format) {
                 case 'l':
@@ -252,9 +266,9 @@ flagbreak:
                 case 's': {
                     const char *p = va_arg(ap, char *);
                     if (p == NULL) {
-                        putstr(buf, "(null)", counter, max);
+                        putstr(buf, "(null)", counter, max, precision);
                     } else {
-                        putstr(buf, p, counter, max);
+                        putstr(buf, p, counter, max, precision);
                     }
                     break;
                 }
@@ -306,7 +320,7 @@ flagbreak:
         NLimine::console_write(buffer, len);
 
         for (size_t i = 0; i < len; i++) {
-            NArch::serial[0].write(buffer[i]);
+            NArch::Serial::ports[0].write(buffer[i]);
         }
         return len;
     }

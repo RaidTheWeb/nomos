@@ -23,7 +23,7 @@ ARCH ?= x86_64
 HEADERS = $(shell cd $(SOURCE_DIR) && find include -type f -name '*.h') $(shell cd $(SOURCE_DIR) && find include -type f -name '*.hpp')
 
 # Assemble list of sources.
-CSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.c') $(shell find flanterm -type f -name '*.c')
+CSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.c') $(shell find flanterm -type f -name '*.c') $(shell cd uACPI/ && find source -type f -name '*.c')
 CXXSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.cpp')
 ASSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.S')
 ASMSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.asm')
@@ -49,9 +49,12 @@ GITVER=$(shell git describe --tags --abbrev=0 2>/dev/null || git rev-parse --sho
 BUILDDATE = $(shell date +'%Y-%m-%d %H:%M:%S')
 
 # C Preprocesssor Flags
-CPPFLAGS ?= -I $(SOURCE_DIR)/include -I$(SOURCE_DIR)/include/std -Iflanterm/ -DLIMINE_API_REVISION=3 -MMD -MP \
+CPPFLAGS ?= -I $(SOURCE_DIR)/include -I$(SOURCE_DIR)/include/std -Iflanterm/ -IuACPI/include/ -DLIMINE_API_REVISION=3 -MMD -MP \
 	-DVERSION="\"$(GITVER)\"" \
-	-DBUILDDATE="\"$(BUILDDATE)\""
+	-DBUILDDATE="\"$(BUILDDATE)\"" \
+	-DUACPI_KERNEL_INITIALIZATION \
+	-DUACPI_BAREBONES_MODE \
+	-DUACPI_FORMATTED_LOGGING
 
 # Linker Flags
 LDFLAGS ?= -Wl,--build-id=none -nostdlib -static -z max-page-size=0x1000 -Wl,--gc-sections -T linker-$(ARCH).ld
@@ -97,6 +100,10 @@ $(BUILD_DIR)-$(ARCH)/%.c.o: $(SOURCE_DIR)/%.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)-$(ARCH)/flanterm/%.c.o: flanterm/%.c
+	mkdir -p "$$(dirname $@)"
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD_DIR)-$(ARCH)/source/%.c.o: uACPI/source/%.c
 	mkdir -p "$$(dirname $@)"
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 

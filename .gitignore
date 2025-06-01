@@ -7,4 +7,5 @@
 
 # Dependency Artifacts
 /flanterm/
+/uACPI/
 src/include/limine.h

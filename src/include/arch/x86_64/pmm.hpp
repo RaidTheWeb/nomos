@@ -18,32 +18,28 @@ namespace NArch {
     __attribute__((unused))
     static const uint64_t CANARY = 0x4fc0ffee2dead9f5; // Magic "canary" to be stored at the start of free entries, to check for UAF errors.
 
-    class PMM {
-        private:
-            struct block {
-                uint64_t canary; // Canary for UAF checks.
-                struct block *next; // Reference next block in linked list.
-            };
+    namespace PMM {
+        struct block {
+            uint64_t canary; // Canary for UAF checks.
+            struct block *next; // Reference next block in linked list.
+        };
 
-            struct zone {
-                uintptr_t addr; // Base address for allocation region.
-                size_t size; // Size of allocation region.
-                struct block *freelist[ALLOCLEVEL]; // References to linked list that reference blocks, for each buddy allocation level.
-            };
+        struct zone {
+            uintptr_t addr; // Base address for allocation region.
+            size_t size; // Size of allocation region.
+            struct block *freelist[ALLOCLEVEL]; // References to linked list that reference blocks, for each buddy allocation level.
+        };
 
-            struct zone zone;
-            Spinlock buddylock;
-        public:
+        extern struct zone zone;
+        extern Spinlock buddylock;
 
-            size_t alloci = 0;
-            void setup(void);
+        extern size_t alloci;
+        void setup(void);
 
-            // NOTE: Returns with HHDM offset! For stuff that does NOT support higher halves, we need to subtract the HHDM offset.
-            void *alloc(size_t size);
-            void free(void *ptr);
-    };
-
-    extern PMM pmm;
+        // NOTE: Returns with HHDM offset! For stuff that does NOT support higher halves, we need to subtract the HHDM offset.
+        void *alloc(size_t size);
+        void free(void *ptr);
+    }
 }
 
 #endif

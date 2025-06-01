@@ -47,7 +47,7 @@ namespace NMem {
 
             SubAllocator *sub = &this->slabs[idx];
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
-                void *ptr = ((void *)((uintptr_t)NArch::pmm.alloc(NArch::PAGESIZE) + NLimine::hhdmreq.response->offset)); // Allocate a single page (this works because all slabs are smaller than a page).
+                void *ptr = ((void *)((uintptr_t)NArch::PMM::alloc(NArch::PAGESIZE) + NLimine::hhdmreq.response->offset)); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
                     return NULL;
                 }
@@ -87,7 +87,7 @@ namespace NMem {
             // Unable to find slab (too big). Try to allocate this as a page.
 
             size_t needed = (aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
-            void *ptr = ((void *)((uintptr_t)NArch::pmm.alloc(needed) + NLimine::hhdmreq.response->offset));
+            void *ptr = ((void *)((uintptr_t)NArch::PMM::alloc(needed) + NLimine::hhdmreq.response->offset));
             if (ptr == NULL) {
                 return NULL;
             }
@@ -141,7 +141,7 @@ namespace NMem {
             }
 
             // Metadata start is the start of the page, therefore, we can just shove the location of the metadata into the PMM to free it.
-            NArch::pmm.free(meta);
+            NArch::PMM::free(meta);
         }
     }
 

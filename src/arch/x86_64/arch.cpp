@@ -1,8 +1,11 @@
 #include <arch/limine/arch.hpp>
 #include <arch/limine/requests.hpp>
+#include <arch/x86_64/acpi.hpp>
+#include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/gdt.hpp>
 #include <arch/x86_64/interrupts.hpp>
+#include <arch/x86_64/io.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/vmm.hpp>
@@ -19,11 +22,6 @@ namespace NArch {
     bool hypervisor_checked = false;
 
     NLib::CmdlineParser cmdline;
-
-    static GDT gdt = GDT();
-    static InterruptTable idt = InterruptTable();
-    PMM pmm = PMM();
-    VMM vmm = VMM();
 
     void init(void) {
         NUtil::printf("[arch/x86_64]: x86_64 init().\n");
@@ -98,7 +96,7 @@ namespace NArch {
 
 #if EARLYSERIAL == 1
             NUtil::printf("[arch/x86_64]: Enable UART in Hypervisor.\n");
-            NArch::serial_init();
+            NArch::Serial::setup();
 #endif
         } else {
             NUtil::printf("[arch/x86_64]: No Hypervisor Detected. Assuming real hardware.\n");
@@ -108,15 +106,15 @@ namespace NArch {
         NLimine::init();
 
         // gdt = GDT();
-        gdt.setup();
-        gdt.reload();
+        GDT::setup();
+        GDT::reload();
 
         // idt = InterruptTable();
-        idt.setup();
-        idt.reload();
+        Interrupts::setup();
+        Interrupts::reload();
 
         // pmm = PMM();
-        pmm.setup();
+        PMM::setup();
 
         NMem::allocator.setup();
 
@@ -125,13 +123,17 @@ namespace NArch {
 
         if (cmdline.get("serialcom1") != NULL) {
             NUtil::printf("[arch/x86_64]: Serial enabled via serialcom1 command line argument.\n");
-            NArch::serial_init();
-            serialenabled = true;
+            NArch::Serial::setup();
+            NArch::Serial::serialenabled = true;
         }
-        serialchecked = true;
+        NArch::Serial::serialchecked = true;
 
-        // vmm = VMM();
-        vmm.setup();
+        VMM::setup();
 
+        ACPI::setup();
+
+        APIC::setup();
+
+        APIC::lapicinit();
     }
 }

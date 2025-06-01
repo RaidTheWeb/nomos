@@ -75,7 +75,7 @@ isr_common:
     mov ds, rdi ; Data segment.
     mov es, rdi ; Extra segment.
 
-    mov rdi, rbp ; Move it in here, so that it's the first argument.
+    mov rdi, rbp ; Move vector in here, so that it's the first argument.
     mov rsi, rsp ; Context is currently stored here in the stack. Second argument.
 
     cld

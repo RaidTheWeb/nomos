@@ -115,5 +115,10 @@ namespace NDebug {
             (void)value;
             handleviolation("Invalid value load", &info->loc);
         }
+
+        extern "C" void __ubsan_handle_nonnull_arg(struct nonnullarg *info, intptr_t idx) {
+            (void)idx;
+            handleviolation("Null argument", &info->loc);
+        }
     }
 }

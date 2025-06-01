@@ -57,6 +57,12 @@ namespace NDebug {
             struct sourceloc loc;
             struct typedesc *type;
         };
+
+        struct nonnullarg {
+            struct sourceloc loc;
+            struct sourceloc attrloc;
+            int argidx;
+        };
     }
 }
 
