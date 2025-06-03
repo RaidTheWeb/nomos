@@ -87,7 +87,7 @@ namespace NArch {
                 enum port port;
                 bool initialised;
                 // Pre-serial init backbuffer.
-                uint8_t backbuffer[4096]; // 4KiB backbuffer.
+                uint8_t backbuffer[1024 * 16]; // 16KiB backbuffer.
                 size_t backbufferidx = 0;
             public:
 

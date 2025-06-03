@@ -104,8 +104,8 @@ namespace NArch {
         bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool user) {
 
             // Align down to base of the page the address exists in.
-            phys = pagealigndown(phys);
-            virt = pagealigndown(virt);
+            phys = pagealigndown(phys, PAGESIZE);
+            virt = pagealigndown(virt, PAGESIZE);
 
             // Decode virtual address:
             uint64_t pml4idx = (virt & PML4MASK) >> 39;
@@ -154,6 +154,7 @@ namespace NArch {
             // At the end of all the indirection:
             pt->entries[ptidx] = (phys & ADDRMASK) | flags;
 
+            invlpg(virt);
             return true;
         }
 
@@ -166,25 +167,22 @@ namespace NArch {
         }
 
         bool _maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
-            size_t len = pagealign(virt + size); // Align length to page.
+            size_t end = pagealign(virt + size, PAGESIZE); // Align length to page.
             // Align down to base.
-            phys = pagealigndown(phys);
-            virt = pagealigndown(virt);
-            size = len - virt; // Overwrite size of range to represent page alignmentment.
+            phys = pagealigndown(phys, PAGESIZE);
+            virt = pagealigndown(virt, PAGESIZE);
+            size = end - virt; // Overwrite size of range to represent page alignmentment.
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
                 assertarg(_mappage(space, virt + i, phys + i, flags, false), "Failed to map page in range 0x%016llx->0x%016llx.\n", virt, virt + size);
-
-                // this->_unmaprange(space, virt, i); // Recovery to unmap current progress.
-                // return false;
             }
             return true;
         }
 
         void _unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
-            size_t len = pagealign(virt + size); // Align length to page.
-            virt = pagealigndown(virt);
-            len = len - virt;
+            size_t end = pagealign(virt + size, PAGESIZE); // Align length to page.
+            virt = pagealigndown(virt, PAGESIZE);
+            size = end - virt;
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
                 _unmappage(space, virt + i);
@@ -196,6 +194,7 @@ namespace NArch {
             uintptr_t base = (uintptr_t)start;
             uintptr_t phyaddr = (uintptr_t)start - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base;
 
+            kspace.vmaspace->reserve((uintptr_t)start, (uintptr_t)end); // Reserve kernel sections in VMA space.
             maprange(&kspace, base, phyaddr, flags, len);
         }
 
@@ -206,6 +205,10 @@ namespace NArch {
 
             kspace.pml4 = (struct pagetable *)hhdmoff(kspace.pml4);
             NLib::memset(kspace.pml4, 0, PAGESIZE); // Blank page.
+
+            kspace.vmaspace = new NMem::Virt::VMASpace(0xffff800000000000, 0xffffffffffffffff);
+            kspace.vmaspace->reserve(0xffff800000000000, 0xffff800000001000); // Reserve NULL page.
+
 
             for (size_t i = 256; i < 512; i++) {
                 uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
@@ -224,7 +227,10 @@ namespace NArch {
                     entry->type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES) {
 
                     // Map entire region.
-                    maprange(&kspace, (uintptr_t)hhdmoff((void *)(entry->base)), entry->base, NOEXEC | WRITEABLE | PRESENT, entry->length);
+                    uintptr_t virt = (uintptr_t)hhdmoff((void *)entry->base);
+                    // Reserve the region, so the VMA doesn't try to allocate over the HHDM (only reserved/completely unused regions will be available!).
+                    kspace.vmaspace->reserve(virt, virt + entry->length); // Reserve this range.
+                    maprange(&kspace, virt, entry->base, NOEXEC | WRITEABLE | PRESENT, entry->length);
                 }
             }
 

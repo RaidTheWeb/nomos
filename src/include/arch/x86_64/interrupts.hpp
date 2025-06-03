@@ -31,7 +31,7 @@ namespace NArch {
         };
 
         // Register an ISR.
-        void regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi);
+        struct isr *regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi);
 
         // Allocate a free vector for interrupt handler usage.
         uint8_t allocvec(void);

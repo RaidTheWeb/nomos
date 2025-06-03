@@ -88,7 +88,7 @@ namespace NArch {
                 return;
             }
 
-            if (!this->initialised) {
+            if (!this->initialised && this->backbufferidx < sizeof(backbuffer) / sizeof(backbuffer[0])) {
                 this->backbuffer[this->backbufferidx++] = data;
                 return;
             }

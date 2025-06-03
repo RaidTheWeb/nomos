@@ -24,13 +24,17 @@ void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *str, ...) {
 }
 
 void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
-    // Identity maps range.
-    NArch::VMM::maprange(&NArch::VMM::kspace, phys + NLimine::hhdmreq.response->offset, phys, NArch::VMM::PRESENT | NArch::VMM::WRITEABLE | NArch::VMM::NOEXEC, length);
-    return (void *)(phys + NLimine::hhdmreq.response->offset);
+    using namespace NArch::VMM;
+    uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, NArch::PAGESIZE);
+    NArch::VMM::maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NArch::pagealign(length, NArch::PAGESIZE));
+    size_t offset = phys - NArch::pagealigndown(phys, NArch::PAGESIZE);
+    return (void *)(virt + offset);
 }
 
 void uacpi_kernel_unmap(void *ptr, uacpi_size length) {
-    // NArch::VMM::unmaprange(&NArch::VMM::kspace, (uintptr_t)ptr, length);
+    using namespace NArch::VMM;
+    NArch::VMM::unmaprange(&NArch::VMM::kspace, (uintptr_t)ptr, NArch::pagealign(length, NArch::PAGESIZE));
+    kspace.vmaspace->free(ptr, length);
 }
 
 namespace NArch {
@@ -78,16 +82,21 @@ namespace NArch {
         }
 
         void setup(void) {
-            uacpi_setup_early_table_access(PMM::alloc(32 * PAGESIZE), 32 * PAGESIZE);
+            uacpi_setup_early_table_access((void *)((uintptr_t)PMM::alloc(32 * PAGESIZE) + NLimine::hhdmreq.response->offset), 32 * PAGESIZE);
+            NUtil::printf("[acpi]: Initialised uACPI.\n");
 
             uacpi_table apic;
             assert(uacpi_table_find_by_signature(ACPI_MADT_SIGNATURE, &apic) == UACPI_STATUS_OK, "Failed to find APIC table from ACPI.\n");
+            NUtil::printf("[acpi]: Found MADT table.\n");
 
             struct acpi_madt *madtptr = (struct acpi_madt *)apic.ptr;
 
             // Initialise MADT start and end.
             madt.start = (struct acpi_entry_hdr *)((uintptr_t)madtptr + sizeof(struct acpi_madt));
+
+            NUtil::printf("[acpi]: Start of MADT pointer.\n");
             madt.end = (struct acpi_entry_hdr *)((uintptr_t)madtptr + madtptr->hdr.length);
+            NUtil::printf("[acpi]: End of MADT pointer.\n");
             madt.initialised = true; // Mark as initialised.
             NUtil::printf("[acpi]: MADT initialised.\n");
         }

@@ -1,6 +1,7 @@
 #include <arch/x86_64/acpi.hpp>
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
@@ -62,6 +63,13 @@ namespace NArch {
             writelapic(LAPICEOI, 0);
         }
 
+        static void nmi(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+            (void)isr;
+            (void)ctx;
+
+            assert(false, "NMI Triggered.\n");
+        }
+
         void lapicinit(void) {
             // Mask entire local vector table.
             writelapic(LAPICLVTTS, 1 << 16);
@@ -77,9 +85,8 @@ namespace NArch {
             // ACPI processor UID.
             size_t cpuid = readlapic(LAPICID) >> 24; // Read processor ID from LAPIC.
 
-
-            // XXX: Allocate a vector for usage:
-
+            // Create an ISR to handle the NMI.
+            struct Interrupts::isr *isr = Interrupts::regisr(Interrupts::allocvec(), nmi, false);
 
             size_t i = 0;
             struct acpi_madt_lapic_nmi *entry = (struct acpi_madt_lapic_nmi *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_NMI, 0);
@@ -102,7 +109,9 @@ namespace NArch {
                             break;
                     }
                     // XXX: Initialise NMI interrupt handler (in accordance with the datasheet).
-                    writelapic(reg, (0) | 0 | entry->flags << 12);
+
+                    // Allocated Vector | NMI Delivery Mode | Flags (polarity and trigger mode).
+                    writelapic(reg, (isr->id & 0xff) | (0b100 << 8) | entry->flags << 12);
                 }
 
                 entry = (struct acpi_madt_lapic_nmi *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_NMI, ++i);
@@ -116,7 +125,7 @@ namespace NArch {
             numioapic = ACPI::countentries(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_IOAPIC);
 
             // Address where LAPIC registers are mapped into memory (since this is per-processor, it'll end up being mapped for the current unit).
-            lapicaddr = CPU::rdmsr(0x1b) & 0xfffff000; // Read in 32-bit LAPIC base address.
+            lapicaddr = CPU::rdmsr(0x1b) & 0xfffff000; // Read in LAPIC base address.
             NUtil::printf("[acpi]: 32-bit LAPIC address: %p.\n", lapicaddr);
 
             // Obtain address override (if it exists).

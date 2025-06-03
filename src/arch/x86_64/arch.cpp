@@ -96,6 +96,8 @@ namespace NArch {
 
 #if EARLYSERIAL == 1
             NUtil::printf("[arch/x86_64]: Enable UART in Hypervisor.\n");
+            NArch::Serial::serialchecked = true;
+            NArch::Serial::serialenabled = true;
             NArch::Serial::setup();
 #endif
         } else {
@@ -123,12 +125,27 @@ namespace NArch {
 
         if (cmdline.get("serialcom1") != NULL) {
             NUtil::printf("[arch/x86_64]: Serial enabled via serialcom1 command line argument.\n");
-            NArch::Serial::setup();
+
+            NArch::Serial::serialchecked = true;
             NArch::Serial::serialenabled = true;
+            NArch::Serial::setup();
         }
         NArch::Serial::serialchecked = true;
 
         VMM::setup();
+
+        uintptr_t test = (uintptr_t)VMM::kspace.vmaspace->alloc(4096, 4096);
+        NUtil::printf("Virt allocated: %p.\n", test);
+
+        void *p = PMM::alloc(4096);
+        *((uint8_t *)((uintptr_t)p + NLimine::hhdmreq.response->offset)) = 0xab;
+
+        VMM::mappage(&VMM::kspace, test, (uintptr_t)p, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC, false);
+        void *virtptr = (void *)test;
+        assert(*((uint8_t *)virtptr) == 0xab, "VMA allocator + VMM mapping self-test failed.\n");
+        VMM::unmappage(&VMM::kspace, test);
+        VMM::kspace.vmaspace->free(virtptr, 4096);
+
 
         ACPI::setup();
 

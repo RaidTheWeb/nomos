@@ -67,7 +67,7 @@ namespace NArch {
 
         struct isr isrtable[256];
 
-        void regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi) {
+        struct isr *regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi) {
             asm volatile("cli"); // Clear. XXX: Should be only clearing if not already cleared (record interrupt state for current CPU).
 
             struct isr *isr = &isrtable[vec];
@@ -76,6 +76,7 @@ namespace NArch {
             isr->id = ((uint64_t)0 << 32) | vec; // XXX: Encode ISR ID.
 
             asm volatile("sti"); // Reenable.
+            return isr;
         }
 
         uint8_t allocvec(void) {
@@ -107,6 +108,15 @@ namespace NArch {
         void exception_handler(struct isr *isr, struct CPU::context *ctx) {
             (void)ctx;
             NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: CPU Exception: %s.\n", exceptions[isr->id & 0xffffffff]);
+
+            if ((isr->id & 0xffffffff) == 14) {
+                uintptr_t addr = 0;
+                asm volatile(
+                    "mov %%cr2, %0"
+                    : "=r"(addr) : : "memory"
+                );
+                NUtil::printf("Page fault at %p occurred due to %s %s in %p during %s.\n", ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation");
+            }
 
             for (;;) { // "Unrecoverable"
                 asm("cli");

@@ -3,6 +3,7 @@
 
 #include <arch/x86_64/pmm.hpp>
 #include <lib/sync.hpp>
+#include <mm/virt.hpp>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -21,12 +22,12 @@ namespace NArch {
         asm volatile("mfence" : : : "memory");
     }
 
-    static inline uintptr_t pagealigndown(uintptr_t addr) {
-        return addr - (addr % PAGESIZE);
+    static inline uintptr_t pagealigndown(uintptr_t addr, size_t size) {
+        return (addr & ~(size - 1));
     }
 
-    static inline uintptr_t pagealign(uintptr_t addr) {
-        return pagealigndown(addr + PAGESIZE - 1);
+    static inline uintptr_t pagealign(uintptr_t addr, size_t size) {
+        return (addr + size - 1) & ~(size - 1);
     }
 
     // Invalidate an entire range of pages.
@@ -96,6 +97,9 @@ namespace NArch {
         struct pagetable *walk(uint64_t entry);
 
         struct addrspace {
+            // Virtual address space allocation:
+            NMem::Virt::VMASpace *vmaspace;
+
             struct pagetable *pml4; // Top level page table for this address space.
             MCSSpinlock lock; // Queued spinlocking, to prevent race conditions on page table modifications. XXX: Fast enough to consider normal spinlocking?
         };
