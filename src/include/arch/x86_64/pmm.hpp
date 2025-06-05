@@ -6,16 +6,16 @@
 #include <stdint.h>
 
 namespace NArch {
-    __attribute__((unused))
+    __attribute__((used))
     static const size_t PAGESIZE = 4096; // Page size.
 
-    __attribute__((unused))
+    __attribute__((used))
     static const size_t SMALLESTBLOCK = PAGESIZE; // Smallest size of a buddy allocated block.
 
-    __attribute__((unused))
+    __attribute__((used))
     static const size_t ALLOCLEVEL = 8; // SMALLESTBLOCK * (2 ^ 7) pages.
 
-    __attribute__((unused))
+    __attribute__((used))
     static const uint64_t CANARY = 0x4fc0ffee2dead9f5; // Magic "canary" to be stored at the start of free entries, to check for UAF errors.
 
     namespace PMM {

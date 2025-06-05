@@ -1,6 +1,7 @@
 #ifndef _ARCH__X86_64__VMM_HPP
 #define _ARCH__X86_64__VMM_HPP
 
+#include <arch/limine/requests.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <lib/sync.hpp>
 #include <mm/virt.hpp>
@@ -20,6 +21,23 @@ namespace NArch {
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
         asm volatile("mov %0, %%cr3" : : "r"(cr3));
         asm volatile("mfence" : : : "memory");
+    }
+
+    static inline void swaptopml4(uintptr_t table) {
+        // Includes TLB flush logic.
+
+        uint64_t cr3;
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        asm volatile("mov %0, %%cr3" : : "r"(table));
+        asm volatile("mfence" : : : "memory");
+    }
+
+    static inline void *hhdmoff(void *ptr) {
+        return (void *)((uintptr_t)ptr + NLimine::hhdmreq.response->offset);
+    }
+
+    static inline void *hhdmsub(void *ptr) {
+        return (void *)((uintptr_t)ptr - NLimine::hhdmreq.response->offset);
     }
 
     static inline uintptr_t pagealigndown(uintptr_t addr, size_t size) {
@@ -172,6 +190,8 @@ namespace NArch {
             NLib::ScopeMCSSpinlock guard(&space->lock);
             _unmaprange(space, virt, size);
         }
+
+        void swapcontext(struct addrspace *space);
 
         // Maps kernel regions according to start and end of individual sections.
         void mapkernel(void *start, void *end, uint64_t flags);

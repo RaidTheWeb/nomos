@@ -1,5 +1,7 @@
 
+#ifdef __x86_64__
 #include <arch/x86_64/vmm.hpp>
+#endif
 
 #include <mm/slab.hpp>
 #include <mm/virt.hpp>

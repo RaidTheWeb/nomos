@@ -13,6 +13,19 @@ namespace NArch {
         static size_t numioapic;
         uintptr_t lapicaddr = 0;
 
+        void sendipi(uint8_t cpu, uint8_t vec, uint8_t delivery, uint8_t mode, uint8_t dest) {
+            writelapic(LAPICICRHI, (uint32_t)cpu << 24); // Load in the target CPU.
+
+            // Write out specifics for the IPI.
+            // Assert IPI, edge triggered.
+            writelapic(LAPICICRLO, vec | (delivery << 8) | (mode << 11) | (1 << 14) | (0 << 15) | (dest << 18));
+
+            // Wait for idle.
+            while (readlapic(LAPICICRLO) & (1 << 12)) {
+                asm volatile("pause" : : : "memory");
+            }
+        }
+
         void setirq(uint8_t irq, uint8_t vec, bool mask, uint8_t proc) {
             size_t i = 0;
             struct acpi_madt_interrupt_source_override *entry = (struct acpi_madt_interrupt_source_override *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_INTERRUPT_SOURCE_OVERRIDE, 0);
@@ -108,7 +121,6 @@ namespace NArch {
                             reg = LAPICLVTINT1;
                             break;
                     }
-                    // XXX: Initialise NMI interrupt handler (in accordance with the datasheet).
 
                     // Allocated Vector | NMI Delivery Mode | Flags (polarity and trigger mode).
                     writelapic(reg, (isr->id & 0xff) | (0b100 << 8) | entry->flags << 12);
@@ -125,8 +137,8 @@ namespace NArch {
             numioapic = ACPI::countentries(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_IOAPIC);
 
             // Address where LAPIC registers are mapped into memory (since this is per-processor, it'll end up being mapped for the current unit).
-            lapicaddr = CPU::rdmsr(0x1b) & 0xfffff000; // Read in LAPIC base address.
-            NUtil::printf("[acpi]: 32-bit LAPIC address: %p.\n", lapicaddr);
+            lapicaddr = CPU::rdmsr(CPU::MSRAPICBASE) & 0xfffff000; // Read in LAPIC base address.
+            NUtil::printf("[apic]: 32-bit LAPIC address: %p.\n", lapicaddr);
 
             // Obtain address override (if it exists).
             struct acpi_madt_lapic_address_override *addroverride = (struct acpi_madt_lapic_address_override *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_ADDRESS_OVERRIDE, 0);

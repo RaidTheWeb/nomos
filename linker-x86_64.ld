@@ -26,6 +26,12 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    .drivers : {
+        __drivers_start = .;
+        KEEP(*(.drivers*))
+        __drivers_end = .;
+    } :rodata
+
     .init_array : {
         __init_array = .;
         KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))

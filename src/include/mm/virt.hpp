@@ -1,7 +1,9 @@
 #ifndef _MM__VIRT_HPP
 #define _MM__VIRT_HPP
 
+#ifdef __x86_64__
 #include <arch/x86_64/sync.hpp>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 

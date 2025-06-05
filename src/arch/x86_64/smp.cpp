@@ -1,0 +1,116 @@
+#include <arch/limine/requests.hpp>
+#include <arch/x86_64/apic.hpp>
+#include <arch/x86_64/arch.hpp>
+#include <arch/x86_64/gdt.hpp>
+#include <arch/x86_64/interrupts.hpp>
+#include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/vmm.hpp>
+#include <lib/assert.hpp>
+#include <lib/string.hpp>
+#include <stdatomic.h>
+#include <util/kprint.hpp>
+
+namespace NArch {
+    namespace SMP {
+
+        static CPU::CPUInst **cpulist = NULL;
+        static size_t awakecpus = 1; // Start at 1, to include BSP.
+
+        // End of the road interrupt hanbdler for panic IPI.
+        static void halt(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+            (void)isr;
+            (void)ctx;
+
+            CPU::get()->setint(false);
+            for (;;) {
+                asm volatile("hlt");
+            }
+        }
+
+        static void wakeup(struct limine_mp_info *info) {
+            CPU::set((CPU::CPUInst *)info->extra_argument); // Set from initial argument.
+
+            uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
+            CPU::get()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack);
+
+            GDT::reload(); // "Reload" GDT -> Initialise it on this CPU.
+            Interrupts::reload(); // "Reload" IDT -> Initialise it on this CPU.
+
+            // Swap to page table.
+            VMM::swapcontext(&VMM::kspace); // Swap to kernel space.
+
+            // Initialise LAPIC.
+            APIC::lapicinit();
+
+            // Register an interrupt handler for a panic vector.
+            Interrupts::regisr(0xfd, halt, false);
+
+            CPU::init(); // Initialise CPU (Specifics).
+
+            NUtil::printf("[smp]: Non-BSP CPU%lu initialised.\n", info->processor_id);
+            __atomic_add_fetch(&awakecpus, 1, memory_order_seq_cst); // Increment counter, so that we can tell if all CPUs have been initialised.
+
+            // XXX: Scheduler entry.
+
+
+            // Hang:
+            for (;;) {
+                asm volatile("hlt"); // Idle, but we're okay with being woken up to do stuff.
+            }
+        }
+
+        void setup(void) {
+            // Interrupts::regisr(0xfd, halt, false);
+            struct limine_mp_response *mpresp = NLimine::mpreq.response;
+
+            CPU::CPUInst *phycpus = (CPU::CPUInst *)PMM::alloc(pagealign(sizeof(CPU::CPUInst) * mpresp->cpu_count, PAGESIZE)); // We'll never free this.
+
+            assert(phycpus, "Failed to allocate memory for CPU instances.\n");
+
+            phycpus = (CPU::CPUInst *)NArch::hhdmoff((void *)phycpus);
+            NLib::memset(phycpus, 0, pagealign(sizeof(CPU::CPUInst) * mpresp->cpu_count, PAGESIZE));
+
+            cpulist = new CPU::CPUInst *[mpresp->cpu_count]; // Slab allocate for pointers to pointers, this'll be used for looping on every CPU (for stuff like sending IPIs).
+            assert(cpulist, "Failed to allocate memory for list of CPU instances.\n");
+
+            bool nosmp = false;
+            if (NArch::cmdline.get("nosmp")) {
+                nosmp = true;
+                NUtil::printf("[smp]: Skipping SMP initialisation due to `nosmp` command line argument.\n");
+            } else {
+                NUtil::printf("[smp]: Initialising SMP on %lu logical processors...\n", mpresp->cpu_count);
+            }
+
+            for (size_t i = 0; i < mpresp->cpu_count; i++) {
+                if (mpresp->cpus[i]->lapic_id == mpresp->bsp_lapic_id) {
+                    cpulist[i] = CPU::getbsp();
+
+                    cpulist[i]->id = mpresp->cpus[i]->processor_id;
+                    cpulist[i]->lapicid = mpresp->cpus[i]->lapic_id;
+
+                    if (nosmp) {
+                        return; // We're done here. Exit.
+                    }
+
+                    continue; // Skip BSP initialisation.
+                }
+
+                if (!nosmp) {
+                    mpresp->cpus[i]->extra_argument = (uint64_t)&phycpus[i];
+                    cpulist[i] = &phycpus[i]; // Update cpu list with physical instance.
+
+                    cpulist[i]->id = mpresp->cpus[i]->processor_id;
+                    cpulist[i]->lapicid = mpresp->cpus[i]->lapic_id;
+
+                    __atomic_store_n(&mpresp->cpus[i]->goto_address, (void (*)(struct limine_mp_info *))wakeup, memory_order_seq_cst); // Atomic write to goto address, calls
+                }
+            }
+
+            NUtil::printf("[smp]: Awaiting on SMP wakeup of non-BSP CPUs.\n");
+            while (__atomic_load_n(&awakecpus, memory_order_seq_cst) != mpresp->cpu_count) { // Wait until all cpus are awake. After the CPU has been awoken, it will increment this counter (atomically).
+                asm volatile("pause" : : : "memory");
+            }
+            NUtil::printf("[smp]: SMP initialised.\n");
+        }
+    }
+}

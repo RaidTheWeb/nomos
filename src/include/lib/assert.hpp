@@ -1,7 +1,11 @@
 #ifndef _LIB__ASSERT_HPP
 #define _LIB__ASSERT_HPP
 
+#ifdef __x86_64__
+#include <arch/x86_64/panic.hpp>
+#endif
 #include <stdarg.h>
+#include <lib/string.hpp>
 #include <util/kprint.hpp>
 
 namespace NLib {
@@ -9,14 +13,12 @@ namespace NLib {
         if (!statement) {
             va_list ap;
             va_start(ap, msg);
-            NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: Assertion (%s) in %s() at %s:%d failed:\n\t", expr, func, file, line);
-            NUtil::vprintf(msg, ap);
+            char buffer[2048];
+            NUtil::snprintf(buffer, sizeof(buffer), "Assertion (%s) in %s() at %s:%d failed:\n\t", expr, func, file, line);
+            NUtil::vsnprintf(buffer + (NLib::strlen(buffer)), sizeof(buffer) - NLib::strlen(buffer), msg, ap);
 
-            for (;;) {
-                // Halt and catch fire (accept no interrupts).
-                asm volatile ("cli");
-                asm volatile ("hlt");
-            }
+            NArch::panic(buffer); // Dump buffer, and halt all CPUs.
+
             va_end(ap);
         }
     }

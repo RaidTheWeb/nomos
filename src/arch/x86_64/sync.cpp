@@ -1,11 +1,10 @@
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/sync.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 
 namespace NArch {
     // XXX: This needs to be made thread local!
-    static struct MCSSpinlock::state mcsstate;
-
     void MCSSpinlock::initstate(struct state *state) {
         state->depth = 0;
         state->node = (struct mcsnode *)NMem::allocator.alloc(sizeof(struct mcsnode));
@@ -15,13 +14,15 @@ namespace NArch {
     }
 
     void MCSSpinlock::acquire(void) {
-        assert(mcsstate.depth < 16, "Maximum MCS lock depth exceeded.\n");
+        struct MCSSpinlock::state *mcsstate = &CPU::get()->mcsstate;
 
-        if (!mcsstate.inited) {
-            this->initstate(&mcsstate);
+        assert(mcsstate->depth < 16, "Maximum MCS lock depth exceeded.\n");
+
+        if (!mcsstate->inited) {
+            this->initstate(mcsstate);
         }
 
-        struct mcsnode *node = mcsstate.node;
+        struct mcsnode *node = mcsstate->node;
         node->next = NULL;
         node->locked = 1;
 
@@ -38,11 +39,13 @@ namespace NArch {
             }
         }
 
-        mcsstate.depth++;
+        mcsstate->depth++;
     }
 
     void MCSSpinlock::release(void) {
-        struct mcsnode *node = mcsstate.node;
+        struct MCSSpinlock::state *mcsstate = &CPU::get()->mcsstate;
+
+        struct mcsnode *node = mcsstate->node;
 
         // If there is no next node in the queue (we are the last node), we can immediately release if this is the case, but this can change later:
         if (!__atomic_load_n(&node->next, memory_order_acquire)) {
@@ -65,6 +68,6 @@ namespace NArch {
         // Release our lock state.
         __atomic_store_n(&node->next->locked, 0, memory_order_release);
 release:
-        mcsstate.depth--;
+        mcsstate->depth--;
     }
 }

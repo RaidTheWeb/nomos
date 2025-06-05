@@ -48,43 +48,24 @@ namespace NArch {
             "???"
         };
 
-        static const char scancode_to_ascii[256] = {
-            '\0', '\0',
-            '1', '2', '3', '4', '5',
-            '6', '7', '8', '9', '0',
-            '\0', '\0', '\b', '\0',
-            'q', 'w', 'e', 'r', 't',
-            'y', 'u', 'i', 'o', 'p',
-            '\0', '\0', '\n', '\0',
-            'a', 's', 'd', 'f', 'g',
-            'h', 'j', 'k', 'l',
-            '\0', '\0', '\0', '\0', '\0',
-            'z', 'x', 'c', 'v', 'b',
-            'n', 'm', ',', '.', '/',
-            '\0', '\0', '\0',
-            ' '
-        };
-
-        struct isr isrtable[256];
-
         struct isr *regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi) {
-            asm volatile("cli"); // Clear. XXX: Should be only clearing if not already cleared (record interrupt state for current CPU).
+            bool old = CPU::get()->setint(false); // Clear. XXX: Should be only clearing if not already cleared (record interrupt state for current CPU).
 
-            struct isr *isr = &isrtable[vec];
+            struct isr *isr = &CPU::get()->isrtable[vec];
             isr->eoi = eoi;
             isr->func = func;
-            isr->id = ((uint64_t)0 << 32) | vec; // XXX: Encode ISR ID.
+            isr->id = ((uint64_t)CPU::get()->lapicid << 32) | vec; // XXX: Encode ISR ID.
 
-            asm volatile("sti"); // Reenable.
+            CPU::get()->setint(old); // Restore.
             return isr;
         }
 
         uint8_t allocvec(void) {
-            asm volatile("cli"); // Clear.
+            bool old = CPU::get()->setint(false); // Clear.
 
             for (size_t i = 0; i < 256; i++) {
-                if (!isrtable[i].func) {
-                    asm volatile("sti");
+                if (!CPU::get()->isrtable[i].func) {
+                    CPU::get()->setint(old);
                     return i;
                 }
             }
@@ -93,7 +74,14 @@ namespace NArch {
         }
 
         extern "C" void isr_handle(uint64_t vec, struct CPU::context *ctx) {
-            struct isr *isr = &isrtable[vec];
+            NUtil::printf("ISR.\n");
+            for (;;) {
+                asm volatile("cli");
+                asm volatile("hlt");
+            }
+            return;
+            struct isr *isr = &CPU::get()->isrtable[vec];
+            CPU::get()->intstatus = false;
 
             if (isr->func != NULL) { // If this ISR has been allocated.
 
@@ -103,11 +91,14 @@ namespace NArch {
                     APIC::eoi();
                 }
             }
+
+            CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false;
         }
 
         void exception_handler(struct isr *isr, struct CPU::context *ctx) {
             (void)ctx;
             NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: CPU Exception: %s.\n", exceptions[isr->id & 0xffffffff]);
+
 
             if ((isr->id & 0xffffffff) == 14) {
                 uintptr_t addr = 0;
@@ -116,6 +107,8 @@ namespace NArch {
                     : "=r"(addr) : : "memory"
                 );
                 NUtil::printf("Page fault at %p occurred due to %s %s in %p during %s.\n", ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation");
+            } else if ((isr->id & 0xffffffff) == 13) {
+                NUtil::printf("General Protection Fault occurred at %p.\n", ctx->rip);
             }
 
             for (;;) { // "Unrecoverable"
@@ -141,17 +134,16 @@ namespace NArch {
                 idt[i].cs = 0x08; // Kernel code segment -> We want the kernel to be handling all interrupts.
                 idt[i].rsvd = 0;
             }
-
-            for (size_t i = 0; i < 32; i++) { // Register ISRs for exceptions.
-                regisr(i, exception_handler, false);
-            }
         }
 
         void reload(void) {
             asm volatile("lidt (%%rax)" : : "a"(&idtr));
 
-            asm volatile("sti");
-            NUtil::printf("[idt]: Interrupts Reloaded.\n");
+            for (size_t i = 0; i < 32; i++) { // Register ISRs for exceptions.
+                regisr(i, exception_handler, false);
+            }
+
+            CPU::get()->setint(true);
         }
     }
 }

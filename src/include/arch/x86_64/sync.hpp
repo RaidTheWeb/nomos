@@ -6,10 +6,10 @@
 #include <stdint.h>
 
 namespace NArch {
-    __attribute__((unused))
+    __attribute__((used))
     static const size_t BACKOFFMIN = 4;
 
-    __attribute__((unused))
+    __attribute__((used))
     static const size_t BACKOFFMAX = 1024;
 
     // Bog-standard spinlock implementation, with included "backoff" to reduce load, while still consuming busy wait time.

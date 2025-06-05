@@ -5,7 +5,7 @@ namespace NLimine {
 
     volatile LIMINE_BASE_REVISION(3);
 
-    __attribute__((unused))
+    __attribute__((used))
     static volatile LIMINE_REQUESTS_START_MARKER;
 
     volatile struct limine_framebuffer_request fbreq = {
@@ -50,6 +50,13 @@ namespace NLimine {
         .response = NULL
     };
 
-    __attribute__((unused))
+    volatile struct limine_mp_request mpreq = {
+        .id = LIMINE_MP_REQUEST,
+        .revision = 0,
+        .response = NULL,
+        .flags = 0
+    };
+
+    __attribute__((used))
     static volatile LIMINE_REQUESTS_END_MARKER;
 }

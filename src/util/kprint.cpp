@@ -1,9 +1,15 @@
+#ifdef __x86_64__
 #include <arch/limine/console.hpp>
 #include <arch/x86_64/serial.hpp>
+#include <arch/x86_64/sync.hpp>
+#endif
 #include <ctype.h>
+#include <lib/sync.hpp>
 #include <util/kprint.hpp>
 
 namespace NUtil {
+    NArch::Spinlock printlock = NArch::Spinlock();
+
     // Advance one character, while also ensuring an early exit can be done on NULL.
     #define ADVANCE(PTR) \
         { \
@@ -314,14 +320,19 @@ flagbreak:
     }
 
     int vprintf(const char *format, va_list ap) {
+        NLib::ScopeSpinlock guard(&printlock);
+
         char buffer[1024];
         size_t len = vsnprintf(buffer, sizeof(buffer), format, ap);
         len -= 1; // Back out on null termination for this.
+
+#ifdef __x86_64__
         NLimine::console_write(buffer, len);
 
         for (size_t i = 0; i < len; i++) {
             NArch::Serial::ports[0].write(buffer[i]);
         }
+#endif
         return len;
     }
 }

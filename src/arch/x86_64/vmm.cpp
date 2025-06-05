@@ -1,4 +1,5 @@
 #include <arch/limine/requests.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
@@ -15,14 +16,6 @@ namespace NArch {
     namespace VMM {
         struct addrspace kspace;
 
-        static inline void *hhdmoff(void *ptr) {
-            return (void *)((uintptr_t)ptr + NLimine::hhdmreq.response->offset);
-        }
-
-        static inline void *hhdmsub(void *ptr) {
-            return (void *)((uintptr_t)ptr - NLimine::hhdmreq.response->offset);
-        }
-
         struct pagetable *walk(uint64_t entry) {
             // Walk down into the next entry.
 
@@ -32,6 +25,10 @@ namespace NArch {
 
             // Adds HHDM offset to allow access in a higher half kernel.
             return (struct pagetable *)(hhdmoff((void *)(entry & ADDRMASK)));
+        }
+
+        void swapcontext(struct addrspace *space) {
+            swaptopml4((uintptr_t)hhdmsub(space->pml4));
         }
 
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt) {
@@ -198,6 +195,8 @@ namespace NArch {
             maprange(&kspace, base, phyaddr, flags, len);
         }
 
+
+
         void setup(void) {
 
             kspace.pml4 = (struct pagetable *)PMM::alloc(PAGESIZE);
@@ -207,7 +206,7 @@ namespace NArch {
             NLib::memset(kspace.pml4, 0, PAGESIZE); // Blank page.
 
             kspace.vmaspace = new NMem::Virt::VMASpace(0xffff800000000000, 0xffffffffffffffff);
-            kspace.vmaspace->reserve(0xffff800000000000, 0xffff800000001000); // Reserve NULL page.
+            kspace.vmaspace->reserve(0xffff800000000000, 0xffff800000001000); // Reserve NULL page, otherwise, this region will end up being allocated at some point.
 
 
             for (size_t i = 256; i < 512; i++) {
@@ -240,13 +239,13 @@ namespace NArch {
             mapkernel(&_rodata_start, &_rodata_end, 0 | NOEXEC | PRESENT); // Read-only + Not executable.
 
             uint64_t efer = 0;
-            // Read EFER CPU register from 0xC0000080.
-            asm volatile("rdmsr" : "=A"(efer) : "c"(0xC0000080));
+            // Read EFER CPU register from 0xc0000080.
+            asm volatile("rdmsr" : "=A"(efer) : "c"(CPU::MSREFER));
 
             efer |= (1 << 11); // Flip the Execute Disable Bit Enable bit, to allow NOEXEC pages.
 
-            // Write EFER CPU register into 0xC0000080.
-            asm volatile("wrmsr" : : "A"(efer), "c"(0xC0000080));
+            // Write EFER CPU register into 0xc0000080.
+            asm volatile("wrmsr" : : "A"(efer), "c"(CPU::MSREFER));
 
             uint64_t cr3;
             asm volatile("mov %%cr3, %0" : "=r"(cr3));

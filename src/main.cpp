@@ -9,6 +9,8 @@
 #include <limine.h>
 #endif
 
+#include <dev/dev.hpp>
+
 #include <cxxruntime.hpp>
 
 #include <lib/assert.hpp>
@@ -69,6 +71,12 @@ extern "C" void kernel_main(void) {
     // Command line argument enables memory sanitisation upon slab allocator free.
     if (NArch::cmdline.get("mmsan")) {
         NMem::sanitisefreed = true;
+    }
+
+    for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
+        if (entry->magic == NDev::MAGIC) {
+            NUtil::printf("Discovered driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
+        }
     }
 
     hcf();

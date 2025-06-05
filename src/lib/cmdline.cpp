@@ -60,6 +60,7 @@ namespace NLib {
                             NUtil::sprintf(valuebuf, "true");
                             namebuf[writeidx] = '\0';
                             this->addpair(namebuf, valuebuf);
+                            writeidx = 0; // Reset write index, so we can start on the next argument.
                         }
                         break; // In both cases, move on.
                     }
@@ -88,12 +89,13 @@ namespace NLib {
         struct pair *pair = this->pairlist;
 
         while (pair) {
+            // Simply just loop through every key/value pair, until we find the matching pair.
             if (!strncmp(key, pair->key, sizeof(pair->key) - 1)) {
                 return pair->value;
             }
             pair = pair->next;
         }
 
-        return NULL;
+        return NULL; // If we never found a matching pair, we return NULL.
     }
 }

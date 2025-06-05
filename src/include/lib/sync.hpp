@@ -1,7 +1,9 @@
 #ifndef _LIB__SYNC_HPP
 #define _LIB__SYNC_HPP
 
+#ifdef __x86_64__
 #include <arch/x86_64/sync.hpp>
+#endif
 #include <util/kprint.hpp>
 
 namespace NLib {

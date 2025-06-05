@@ -1,7 +1,7 @@
 #ifndef _ARCH__X86_64__INTERRUPTS_HPP
 #define _ARCH__X86_64__INTERRUPTS_HPP
 
-#include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/context.hpp>
 #include <stdint.h>
 
 namespace NArch {

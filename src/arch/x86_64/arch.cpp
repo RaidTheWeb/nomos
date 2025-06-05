@@ -8,6 +8,7 @@
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/serial.hpp>
+#include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <lib/cmdline.hpp>
@@ -25,6 +26,8 @@ namespace NArch {
 
     void init(void) {
         NUtil::printf("[arch/x86_64]: x86_64 init().\n");
+
+        CPU::set(CPU::getbsp()); // Set BSP's instance.
 
         char vendor[13] = { 0 };
         uint32_t *vcpu1 = (uint32_t *)vendor;
@@ -107,20 +110,23 @@ namespace NArch {
 
         NLimine::init();
 
-        // gdt = GDT();
+        PMM::setup();
+
+        uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
+        CPU::getbsp()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack);
+
+        // GDT needs to be initialised and loaded before the IDT.
         GDT::setup();
         GDT::reload();
+        NUtil::printf("[gdt]: GDT Reloaded.\n");
 
-        // idt = InterruptTable();
         Interrupts::setup();
         Interrupts::reload();
-
-        // pmm = PMM();
-        PMM::setup();
+        NUtil::printf("[idt]: Interrupts Reloaded.\n");
 
         NMem::allocator.setup();
 
-        // Setup command line.
+        // Setup command line, must happen after slab allocator is set up.
         cmdline.setup(NLimine::ecreq.response->cmdline);
 
         if (cmdline.get("serialcom1") != NULL) {
@@ -134,9 +140,8 @@ namespace NArch {
 
         VMM::setup();
 
+        // Test VMA.
         uintptr_t test = (uintptr_t)VMM::kspace.vmaspace->alloc(4096, 4096);
-        NUtil::printf("Virt allocated: %p.\n", test);
-
         void *p = PMM::alloc(4096);
         *((uint8_t *)((uintptr_t)p + NLimine::hhdmreq.response->offset)) = 0xab;
 
@@ -146,11 +151,13 @@ namespace NArch {
         VMM::unmappage(&VMM::kspace, test);
         VMM::kspace.vmaspace->free(virtptr, 4096);
 
+        ACPI::setup(); // Initialise uACPI and load relevant tables.
 
-        ACPI::setup();
+        APIC::setup(); // Set up IOAPIC using ACPI tables.
 
-        APIC::setup();
+        APIC::lapicinit(); // Initialise BSP using LAPIC init.
 
-        APIC::lapicinit();
+        SMP::setup();
+
     }
 }

@@ -87,16 +87,13 @@ namespace NArch {
 
             uacpi_table apic;
             assert(uacpi_table_find_by_signature(ACPI_MADT_SIGNATURE, &apic) == UACPI_STATUS_OK, "Failed to find APIC table from ACPI.\n");
-            NUtil::printf("[acpi]: Found MADT table.\n");
 
             struct acpi_madt *madtptr = (struct acpi_madt *)apic.ptr;
 
             // Initialise MADT start and end.
             madt.start = (struct acpi_entry_hdr *)((uintptr_t)madtptr + sizeof(struct acpi_madt));
 
-            NUtil::printf("[acpi]: Start of MADT pointer.\n");
             madt.end = (struct acpi_entry_hdr *)((uintptr_t)madtptr + madtptr->hdr.length);
-            NUtil::printf("[acpi]: End of MADT pointer.\n");
             madt.initialised = true; // Mark as initialised.
             NUtil::printf("[acpi]: MADT initialised.\n");
         }

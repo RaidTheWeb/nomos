@@ -20,6 +20,9 @@ namespace NArch {
         static const uint32_t LAPICDFR      = 0xe0; // Destination Format Register.
         static const uint32_t LAPICSIV      = 0xf0; // Spurious Interrupt Vector Register.
 
+        static const uint32_t LAPICICRLO    = 0x300; // Interrupt Command Register Low.
+        static const uint32_t LAPICICRHI    = 0x310; // Interrupt Command Register High.
+
         static const uint32_t LAPICLVTT     = 0x320; // LVT Timer Register.
         static const uint32_t LAPICLVTTS    = 0x330; // LVT Thermal Sensor Register.
         static const uint32_t LAPICLVTPMC   = 0x340; // LVT Performance Monitoring Counters Register.
@@ -29,6 +32,18 @@ namespace NArch {
         static const uint32_t LAPICICR      = 0x380; // Initial Count Register.
         static const uint32_t LAPICCCR      = 0x390; // Current Count Register.
         static const uint32_t LAPICDCR      = 0x3e0; // Divide Configuration Register.
+
+        static const uint32_t IPIFIXED      = 0b000; // Normal IPI delivery mode.
+        static const uint32_t IPINMI        = 0b100; // IPI delivery mode, as a non-maskable interrupt.
+
+        static const uint32_t IPIPHYS       = 0; // Physical IPI destination mode.
+        static const uint32_t IPILOGI       = 1; // Logical IPI destination mode.
+
+        static const uint32_t IPINONE       = 0b00; // IPI targets noone.
+        static const uint32_t IPISELF       = 0b01; // IPI targets the LAPIC it was sent from.
+        static const uint32_t IPIALL        = 0b10; // IPI targets all LAPICs (inclusive of sender).
+        static const uint32_t IPIOTHER      = 0b11; // IPI targets all LAPICs (excluding the sender).
+
 
         class IoApic {
             public:
@@ -123,6 +138,9 @@ namespace NArch {
         void eoi(void);
         // Initialise Local APIC.
         void lapicinit(void);
+
+        // Send an inter-processor interrupt to another CPU.
+        void sendipi(uint8_t cpu, uint8_t vec, uint8_t delivery, uint8_t mode, uint8_t dest);
 
         void setirq(uint8_t irq, uint8_t vec, bool mask, uint8_t proc);
         void setup(void);
