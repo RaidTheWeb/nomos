@@ -4,6 +4,7 @@
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/sync.hpp>
 #include <lib/string.hpp>
+#include <sched/sched.hpp>
 #include <stdint.h>
 
 
@@ -63,7 +64,16 @@ namespace NArch {
                 struct Interrupts::isr isrtable[256];
                 uint32_t id;
                 uint32_t lapicid;
+                uint64_t lapicfreq = 0;
+                uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU.
                 bool intstatus = false; // Interrupts enabled?
+
+                NSched::Thread *currthread = NULL; // Currently running thread, if any.
+                NSched::Thread *idlethread = NULL; // Fallback idle thread, for when there's no work.
+
+                uint64_t loadweight; // (oldweight * 3 + rqsize * 1024) / 4
+                NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.
+                size_t schedintr; //Incremented every scheduler interrupt. Used for time-based calculations, as we can approximate a scheduled * NSched::QUANTUMMS = milliseconds conversion.
 
                 CPUInst(void) {
 
@@ -92,7 +102,6 @@ namespace NArch {
 
         // Get current CPU from GS.
         static inline CPUInst *get(void) {
-
             return (CPUInst *)rdmsr(MSRGSBASE);
         }
 

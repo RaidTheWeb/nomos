@@ -40,6 +40,11 @@ void operator delete(void *ptr) {
     NMem::allocator.free(ptr);
 }
 
+void *operator new(size_t size, size_t align) {
+    (void)align;
+    return NMem::allocator.alloc(size);
+}
+
 void *operator new[](size_t size) {
     return operator new(size);
 }
@@ -48,8 +53,8 @@ void operator delete[](void *ptr) {
     operator delete(ptr);
 }
 
-void operator delete(void *ptr, size_t size) {
-    (void)size;
+void operator delete(void *ptr, size_t align) {
+    (void)align;
     NMem::allocator.free(ptr);
 }
 

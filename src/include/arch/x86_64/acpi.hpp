@@ -14,6 +14,7 @@ namespace NArch {
         };
 
         extern struct table madt;
+        extern struct acpi_hpet *hpet;
 
         // Count the number of entries of a specific type, that exist in an ACPI table.
         size_t countentries(struct table *table, uint8_t type);

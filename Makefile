@@ -23,10 +23,17 @@ ARCH ?= x86_64
 HEADERS = $(shell cd $(SOURCE_DIR) && find include -type f -name '*.h') $(shell cd $(SOURCE_DIR) && find include -type f -name '*.hpp')
 
 # Assemble list of sources.
-CSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.c') $(shell find flanterm -type f -name '*.c') $(shell cd uACPI/ && find source -type f -name '*.c')
-CXXSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.cpp')
-ASSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.S')
-ASMSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f -name '*.asm')
+CSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f ! -wholename './arch/*' -type f -name '*.c') $(shell find flanterm -type f -name '*.c') $(shell cd uACPI/ && find source -type f -name '*.c')
+CXXSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f ! -wholename './arch/*' -type f -name '*.cpp')
+ASSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f ! -wholename './arch/*' -type f -name '*.S')
+ASMSOURCES = $(shell cd $(SOURCE_DIR) && find . -type f ! -wholename './arch/*' -type f -name '*.asm')
+
+ifeq ($(ARCH),x86_64)
+CSOURCES += $(shell cd $(SOURCE_DIR) && find ./arch/x86_64 -type f -name '*.c')
+CXXSOURCES += $(shell cd $(SOURCE_DIR) && find ./arch/x86_64 -type f -name '*.cpp') $(shell cd $(SOURCE_DIR) && find ./arch/limine -type f -name '*.cpp')
+ASSOURCES += $(shell cd $(SOURCE_DIR) && find ./arch/x86_64 -type f -name '*.S')
+ASMSOURCES += $(shell cd $(SOURCE_DIR) && find ./arch/x86_64 -type f -name '*.asm')
+endif
 
 # Assemble list of objects, but with extensions included to aid in specific compile steps later down the line.
 OBJECTS = $(addprefix $(BUILD_DIR)-$(ARCH)/,$(CSOURCES:.c=.c.o) $(CXXSOURCES:.cpp=.cpp.o) $(ASSOURCES:.S=.S.o) $(ASMSOURCES:.asm=.asm.o))
@@ -90,6 +97,9 @@ CXXFLAGS += -std=gnu++17 -fno-rtti -fno-exceptions $(SHAREDFLAGS)
 .PHONY: all
 
 all: $(BIN_DIR)/$(OUT)-$(ARCH)
+
+sources:
+	echo $(CXXSOURCES)
 
 $(BIN_DIR)/$(OUT)-$(ARCH): linker-$(ARCH).ld $(OBJECTS)
 	mkdir -p "$$(dirname $@)"

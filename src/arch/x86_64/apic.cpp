@@ -3,6 +3,7 @@
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
+#include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
@@ -83,6 +84,62 @@ namespace NArch {
             assert(false, "NMI Triggered.\n");
         }
 
+        static void timerint(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+
+        }
+
+        void lapictimerinit(void) {
+
+            writelapic(LAPICDCR, 0b1011); // Divide by 1.
+            writelapic(LAPICICR, 0xffffffff); // Start at theoretical maximum, immediately starts the timer countdown.
+
+            // Wait 50000us. The idea here is that we can approximate how many ticks the LAPIC timer will tick when it runs for this time, and then we can calculate how much it SHOULD run, in the future.
+            uint64_t start = TSC::query();
+
+            uint64_t ttl = (50000 * TSC::hz) / 1000000; // Wait 50ms (arbitrary calibration delay).
+
+            uint64_t target = start + ttl;
+
+            while (TSC::query() < target) {
+                asm volatile("pause");
+            }
+
+            uint64_t ticks = (0xffffffff - readlapic(LAPICCCR)); // How many LAPIC timer ticks elapsed?
+
+            uint64_t perus = ticks / 50000; // Difference between initial count, and current is how long it's taken. Divide by 50000us to convert from ticks to microseconds.
+
+            writelapic(LAPICICR, 0); // Reset initial count (disable timer).
+
+            CPU::get()->lapicfreq = perus * 1000000;
+        }
+
+        void lapicstop(void) {
+            writelapic(LAPICLVTT, 1 << 16); // Mask timer interrupt.
+            writelapic(LAPICICR, 0); // Stop timer.
+        }
+
+        void lapiconeshot(uint64_t us, uint8_t vec) {
+            bool intstate = CPU::get()->setint(false);
+            lapicstop(); // Stop current timer (if any).
+
+            uint64_t ticks = us * (CPU::get()->lapicfreq / 1000000); // Calculate number of ticks to wait for.
+
+            writelapic(LAPICLVTT, vec);
+            writelapic(LAPICDCR, 0b1011); // Divide by 1.
+            writelapic(LAPICICR, ticks); // Start countdown. When this reaches zero, it'll trigger the interrupt passed in as `vec`.
+
+
+            CPU::get()->setint(intstate); // Restore.
+        }
+
+        static void spurious(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+            (void)isr;
+            (void)ctx;
+
+            // Runaway IRQ:
+            assert(false, "Spurious Triggered.\n");
+        }
+
         void lapicinit(void) {
             // Mask entire local vector table.
             writelapic(LAPICLVTTS, 1 << 16);
@@ -93,7 +150,9 @@ namespace NArch {
             writelapic(LAPICLVTT, 1 << 16);
 
             // Enable interrupt on the LAPIC.
-            writelapic(LAPICSIV, readlapic(LAPICSIV) | 0x100);
+            writelapic(LAPICSIV, readlapic(LAPICSIV) | 0x1ff);
+
+            Interrupts::regisr(0xff, spurious, false);
 
             // ACPI processor UID.
             size_t cpuid = readlapic(LAPICID) >> 24; // Read processor ID from LAPIC.
@@ -129,7 +188,7 @@ namespace NArch {
                 entry = (struct acpi_madt_lapic_nmi *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_NMI, ++i);
             }
 
-            NUtil::printf("[apic]: LAPIC initialisation completed on CPU%lu.\n", cpuid);
+            lapictimerinit();
         }
 
         void setup(void) {
@@ -144,6 +203,7 @@ namespace NArch {
             struct acpi_madt_lapic_address_override *addroverride = (struct acpi_madt_lapic_address_override *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_ADDRESS_OVERRIDE, 0);
             if (addroverride != NULL) {
                 lapicaddr = addroverride->address; // If the ACPI tables specify an override for the base address, we should use it instead.
+                NUtil::printf("[apic]: 64-bit LAPIC address override: %p.\n", lapicaddr);
             }
 
             // Memory map whatever address we're going to be using, or else it won't let us!

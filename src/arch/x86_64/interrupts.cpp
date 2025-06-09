@@ -74,22 +74,15 @@ namespace NArch {
         }
 
         extern "C" void isr_handle(uint64_t vec, struct CPU::context *ctx) {
-            NUtil::printf("ISR.\n");
-            for (;;) {
-                asm volatile("cli");
-                asm volatile("hlt");
-            }
-            return;
             struct isr *isr = &CPU::get()->isrtable[vec];
             CPU::get()->intstatus = false;
 
             if (isr->func != NULL) { // If this ISR has been allocated.
 
-                isr->func(isr, ctx); // Call ISR function.
-
                 if (isr->eoi) { // Should this ISR trigger an EOI?
                     APIC::eoi();
                 }
+                isr->func(isr, ctx); // Call ISR function.
             }
 
             CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false;

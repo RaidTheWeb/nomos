@@ -136,6 +136,9 @@ namespace NArch {
 
         // Acknowledge end of interrupt. MUST be called at the end of redirected IOAPIC IRQ handlers.
         void eoi(void);
+
+        // Trigger oneshot interrupt on timeout.
+        void lapiconeshot(uint64_t us, uint8_t vec);
         // Initialise Local APIC.
         void lapicinit(void);
 

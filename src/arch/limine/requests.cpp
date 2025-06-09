@@ -57,6 +57,12 @@ namespace NLimine {
         .flags = 0
     };
 
+    volatile struct limine_date_at_boot_request btreq = {
+        .id = LIMINE_DATE_AT_BOOT_REQUEST,
+        .revision = 0,
+        .response = NULL
+    };
+
     __attribute__((used))
     static volatile LIMINE_REQUESTS_END_MARKER;
 }

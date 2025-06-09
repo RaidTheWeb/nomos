@@ -4,16 +4,19 @@
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/gdt.hpp>
+#include <arch/x86_64/hpet.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <lib/cmdline.hpp>
 #include <lib/string.hpp>
 #include <mm/slab.hpp>
+#include <sched/sched.hpp>
 #include <util/kprint.hpp>
 
 #define EARLYSERIAL 0
@@ -23,6 +26,15 @@ namespace NArch {
     bool hypervisor_checked = false;
 
     NLib::CmdlineParser cmdline;
+
+    void kthreadinit(void) {
+
+        NUtil::printf("Hello kernel thread!\n");
+
+        for (;;) {
+            asm volatile("hlt");
+        }
+    }
 
     void init(void) {
         NUtil::printf("[arch/x86_64]: x86_64 init().\n");
@@ -113,7 +125,7 @@ namespace NArch {
         PMM::setup();
 
         uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
-        CPU::getbsp()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack);
+        CPU::getbsp()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack) + (64 * 1024 * 1024);
 
         // GDT needs to be initialised and loaded before the IDT.
         GDT::setup();
@@ -132,11 +144,11 @@ namespace NArch {
         if (cmdline.get("serialcom1") != NULL) {
             NUtil::printf("[arch/x86_64]: Serial enabled via serialcom1 command line argument.\n");
 
-            NArch::Serial::serialchecked = true;
-            NArch::Serial::serialenabled = true;
-            NArch::Serial::setup();
+            Serial::serialchecked = true;
+            Serial::serialenabled = true;
+            Serial::setup();
         }
-        NArch::Serial::serialchecked = true;
+        Serial::serialchecked = true;
 
         VMM::setup();
 
@@ -153,11 +165,22 @@ namespace NArch {
 
         ACPI::setup(); // Initialise uACPI and load relevant tables.
 
+        HPET::setup(); // Initialise timer, needed for later calibrations.
+
+        TSC::setup(); // Initialise lower overhead timer, useful for calibrations, but also for logging.
+
         APIC::setup(); // Set up IOAPIC using ACPI tables.
 
         APIC::lapicinit(); // Initialise BSP using LAPIC init.
 
+        NSched::setup();
+
         SMP::setup();
 
+        NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)kthreadinit);
+        NSched::schedulethread(kthread);
+
+        NUtil::printf("[arch/x86_64]: Jump into scheduler on kernel main.\n");
+        NSched::await(); // End here. Any work afterwards occurs within the kernel thread.
     }
 }

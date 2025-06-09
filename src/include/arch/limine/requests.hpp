@@ -15,6 +15,7 @@ namespace NLimine {
     extern volatile struct limine_rsdp_request rsdpreq;
     extern volatile struct limine_memmap_request mmreq;
     extern volatile struct limine_executable_address_request eareq;
+    extern volatile struct limine_date_at_boot_request btreq;
 }
 
 #endif

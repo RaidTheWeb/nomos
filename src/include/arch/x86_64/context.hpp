@@ -35,6 +35,8 @@ namespace NArch {
             uint64_t rsp;
             uint64_t ss;
         } __attribute__((packed));
+
+        extern "C" void ctx_swap(struct context *ctx);
     }
 }
 

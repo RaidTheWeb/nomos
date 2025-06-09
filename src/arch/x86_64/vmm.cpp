@@ -199,6 +199,7 @@ namespace NArch {
 
         void setup(void) {
 
+            kspace.ref = 1; // Initial reference set.
             kspace.pml4 = (struct pagetable *)PMM::alloc(PAGESIZE);
             assert(kspace.pml4 != NULL, "Failed to allocate top level page for kernel address space.\n");
 

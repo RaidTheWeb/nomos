@@ -40,6 +40,7 @@ void uacpi_kernel_unmap(void *ptr, uacpi_size length) {
 namespace NArch {
     namespace ACPI {
         struct table madt = { NULL, NULL, false };
+        struct acpi_hpet *hpet = NULL;
 
         size_t countentries(struct table *table, uint8_t type) {
             assert(table->initialised, "Call before ACPI table initialised.\n");
@@ -96,6 +97,12 @@ namespace NArch {
             madt.end = (struct acpi_entry_hdr *)((uintptr_t)madtptr + madtptr->hdr.length);
             madt.initialised = true; // Mark as initialised.
             NUtil::printf("[acpi]: MADT initialised.\n");
+
+            uacpi_table timer;
+            assert(uacpi_table_find_by_signature(ACPI_HPET_SIGNATURE, &timer) == UACPI_STATUS_OK, "Failed to find HPET table from ACPI.\n");
+
+            hpet = (struct acpi_hpet *)timer.ptr;
+            NUtil::printf("[acpi]: HPET initialised.\n");
         }
     }
 }

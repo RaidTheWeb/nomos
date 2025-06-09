@@ -7,14 +7,16 @@
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
+#include <sched/sched.hpp>
 #include <stdatomic.h>
 #include <util/kprint.hpp>
 
 namespace NArch {
     namespace SMP {
 
-        static CPU::CPUInst **cpulist = NULL;
-        static size_t awakecpus = 1; // Start at 1, to include BSP.
+        CPU::CPUInst **cpulist = NULL;
+        size_t awakecpus = 1; // Start at 1, to include BSP.
+        bool initialised = false;
 
         // End of the road interrupt hanbdler for panic IPI.
         static void halt(struct Interrupts::isr *isr, struct CPU::context *ctx) {
@@ -31,7 +33,7 @@ namespace NArch {
             CPU::set((CPU::CPUInst *)info->extra_argument); // Set from initial argument.
 
             uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
-            CPU::get()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack);
+            CPU::get()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack) + (64 * 1024 * 1024);
 
             GDT::reload(); // "Reload" GDT -> Initialise it on this CPU.
             Interrupts::reload(); // "Reload" IDT -> Initialise it on this CPU.
@@ -48,15 +50,10 @@ namespace NArch {
             CPU::init(); // Initialise CPU (Specifics).
 
             NUtil::printf("[smp]: Non-BSP CPU%lu initialised.\n", info->processor_id);
+
+
             __atomic_add_fetch(&awakecpus, 1, memory_order_seq_cst); // Increment counter, so that we can tell if all CPUs have been initialised.
-
-            // XXX: Scheduler entry.
-
-
-            // Hang:
-            for (;;) {
-                asm volatile("hlt"); // Idle, but we're okay with being woken up to do stuff.
-            }
+            NSched::entry();
         }
 
         void setup(void) {
@@ -107,9 +104,11 @@ namespace NArch {
             }
 
             NUtil::printf("[smp]: Awaiting on SMP wakeup of non-BSP CPUs.\n");
-            while (__atomic_load_n(&awakecpus, memory_order_seq_cst) != mpresp->cpu_count) { // Wait until all cpus are awake. After the CPU has been awoken, it will increment this counter (atomically).
+            while (__atomic_load_n(&awakecpus, memory_order_seq_cst) != mpresp->cpu_count) { // Wait until all cpus are awake. After the CPU is awoken, it will increment this counter (atomically).
                 asm volatile("pause" : : : "memory");
             }
+
+            initialised = true; // Mark for other kernel subsystems.
             NUtil::printf("[smp]: SMP initialised.\n");
         }
     }

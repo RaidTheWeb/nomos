@@ -118,6 +118,8 @@ namespace NArch {
             // Virtual address space allocation:
             NMem::Virt::VMASpace *vmaspace;
 
+            size_t ref;
+
             struct pagetable *pml4; // Top level page table for this address space.
             MCSSpinlock lock; // Queued spinlocking, to prevent race conditions on page table modifications. XXX: Fast enough to consider normal spinlocking?
         };
