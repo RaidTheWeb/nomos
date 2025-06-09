@@ -551,7 +551,6 @@ decrement:
     // Scheduler interrupt entry, handles save.
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
-        NArch::outb(0xe9, 'S');
 
         CPU::CPUInst *cpu = CPU::get(); // Get an easy local reference to our current CPU.
 
@@ -597,8 +596,6 @@ decrement:
             cpu->runqueue.erase(&next->node); // Remove what we're scheduling from the run queue, so that it doesn't get load balanced onto something else (which can happen, if it's the only node in the run queue and last() is called), or stolen by another CPU.
 
 
-            const char *digits = "0123456789";
-            NArch::outb(0xe9, digits[next->id % 10]);
             APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
             switchthread(next); // Swap to context.
         }
@@ -684,9 +681,7 @@ decrement:
 
     static void idlework(void) {
         for (;;) {
-            MARKER;
-            asm volatile("int $0xfe");
-            // asm volatile("hlt");
+            asm volatile("pause");
         }
     }
 
