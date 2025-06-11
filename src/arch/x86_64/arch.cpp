@@ -21,19 +21,23 @@
 
 #define EARLYSERIAL 0
 
+extern void kinit1(void);
+
 namespace NArch {
     bool hypervisor_enabled = false;
     bool hypervisor_checked = false;
 
     NLib::CmdlineParser cmdline;
 
-    void kthreadinit(void) {
-
+    // This function runs as a thread, post scheduler initialisation.
+    void archthreadinit(void) {
         NUtil::printf("Hello kernel thread!\n");
 
-        for (;;) {
-            asm volatile("hlt");
-        }
+        NSched::yield();
+
+        kinit1();
+
+        NSched::exit();
     }
 
     void init(void) {
@@ -177,10 +181,11 @@ namespace NArch {
 
         SMP::setup();
 
-        NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)kthreadinit);
+        NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)archthreadinit);
         NSched::schedulethread(kthread);
 
         NUtil::printf("[arch/x86_64]: Jump into scheduler on kernel main.\n");
+
         NSched::await(); // End here. Any work afterwards occurs within the kernel thread.
     }
 }

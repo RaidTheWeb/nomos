@@ -125,7 +125,7 @@ namespace NMem {
             SubAllocator *sub = &this->slabs[idx];
 
             if (sanitisefreed) {
-                // Clear freed memory (sanitisation).
+                // Overwrite freed memory with nonsense (sanitisation).
                 NLib::memset(meta, 0xaa, size);
             }
 
@@ -136,7 +136,7 @@ namespace NMem {
         } else { // Outside of slab, this means that it was allocated from pages directly.
 
             if (sanitisefreed) {
-                // Clear freed memory (sanitisation).
+                // Overwrite freed memory with nonsense (sanitisation).
                 NLib::memset(meta, 0xaa, size);
             }
 

@@ -1,5 +1,6 @@
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/tsc.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 #include <sched/sched.hpp>
@@ -477,12 +478,9 @@ decrement:
     void updateload(CPU::CPUInst *cpu) {
         size_t num = cpu->runqueue.count();
         // Weighted load balancing calculation, considering the number of active tasks.
-        // __atomic_store_n(&cpu->loadweight,
-            // (__atomic_load_n(&cpu->loadweight, memory_order_seq_cst)
-            // * 3 + num * 1024) / 4,
-        // memory_order_seq_cst);
         __atomic_store_n(&cpu->loadweight,
-            num,
+            (__atomic_load_n(&cpu->loadweight, memory_order_seq_cst)
+            * 3 + num * 1024) / 4,
         memory_order_seq_cst);
     }
 
@@ -546,11 +544,10 @@ decrement:
         // __builtin_unreachable();
     }
 
-#include <arch/x86_64/io.hpp>
-
     // Scheduler interrupt entry, handles save.
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
+
 
         CPU::CPUInst *cpu = CPU::get(); // Get an easy local reference to our current CPU.
 
@@ -562,7 +559,12 @@ decrement:
 
         assert(cpu->currthread, "Current thread should NEVER be NULL.\n");
 
-        cpu->currthread->setvruntime(QUANTUMMS); // Update virtual runtime, using the delta since apprx. last timer interrupt.
+        uint64_t now = TSC::query();
+        uint64_t delta = (((now - CPU::get()->lastschedts) * 1000) / TSC::hz); // Find delta between now and last timestamp. Convert to milliseconds.
+        CPU::get()->lastschedts = now;
+
+        cpu->currthread->setvruntime(delta); // Update virtual runtime, using the delta since last timer interrupt. This keeps things fair when a thread yields early.
+        // While we "wait" QUANTUMMS between scheduling interrupts, that might not be how long it *actually* takes, so, we accumulate runtime based on how much runtime actually occurred.
 
         updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
 
@@ -592,6 +594,10 @@ decrement:
 
         if (prev != next) { // We need to context switch.
             prev->savectx(ctx); // Use the interrupt context to override the save state of the previous thread.
+
+            if (prev->tstate == Thread::state::DEAD) {
+                delete prev; // Destroy old thread. XXX: Defer?
+            }
 
             cpu->runqueue.erase(&next->node); // Remove what we're scheduling from the run queue, so that it doesn't get load balanced onto something else (which can happen, if it's the only node in the run queue and last() is called), or stolen by another CPU.
 
@@ -638,7 +644,25 @@ decrement:
         }
     }
 
-    void Thread::init(Process *proc, size_t stacksize, void *entry) {
+    void yield(void) {
+        APIC::lapicstop(); // Stop currently running timer.
+
+        // Artificially induce a schedule interrupt, using a "loopback" IPI.
+        APIC::sendipi(CPU::get()->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
+
+        // At this point, we've either been rescheduled (if we were running) or marked dead.
+    }
+
+    void exit(void) {
+        // Thread exit.
+
+        CPU::get()->currthread->tstate = Thread::state::DEAD; // Kill ourselves. We will NOT be rescheduled.
+
+        yield(); // Yield back to scheduler, so the thread never gets rescheduled.
+        assert(false, "Exiting thread was rescheduled!");
+    }
+
+    void Thread::init(Process *proc, size_t stacksize, void *entry, void *arg) {
         this->process = proc;
 
         // Initialise stack within HHDM, from page allocated memory. Stacks need to be unique for each thread.
@@ -664,6 +688,7 @@ decrement:
 
         this->ctx.rsp = (uint64_t)this->stacktop;
         this->ctx.rip = (uint64_t)entry;
+        this->ctx.rdi = (uint64_t)arg; // Pass argument in through RDI (System V ABI first argument).
 
         this->ctx.rflags = 0x200; // Enable interrupts.
 #endif
@@ -676,7 +701,7 @@ decrement:
     void schedulethread(Thread *thread) {
         CPU::CPUInst *cpu = getidlest(); // The most idle CPU should be selected as the target of scheduling.
         cpu->runqueue.insert(&thread->node, vruntimecmp);
-        // updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
+        updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
     }
 
     static void idlework(void) {
@@ -698,6 +723,8 @@ decrement:
 
         CPU::get()->currthread = idlethread; // We start as the idle thread, even though we might not actually be running it.
 
+        CPU::get()->lastschedts = TSC::query(); // Initialise timestamp.
+
         Interrupts::regisr(0xfe, schedule, true); // Register the scheduling interrupt. Mark as needing EOI, because it's through the LAPIC.
 
         await(); // Jump into scheduler.
@@ -711,6 +738,8 @@ decrement:
 
         CPU::get()->idlethread = idlethread; // Assign to BSP.
         CPU::get()->currthread = idlethread; // We start with the idle thread, even though we may not be using it.
+
+        CPU::get()->lastschedts = TSC::query(); // Initialise timestamp.
 
         Interrupts::regisr(0xfe, schedule, true); // Register the scheduling interrupt. Mark as needing EOI, because it's through the LAPIC.
     }

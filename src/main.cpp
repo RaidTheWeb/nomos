@@ -63,17 +63,9 @@ void operator delete[](void *ptr, size_t size) {
     operator delete(ptr);
 }
 
-
-extern "C" void kernel_main(void) {
-    NUtil::printf("Nomos %s, built %s\n", VERSION, BUILDDATE);
-
-    // Initialise freestanding C++ "runtime" support.
-    NCxx::init();
-
-    // Initialise architecture-specific.
-    NArch::init();
-
-    // Command line argument enables memory sanitisation upon slab allocator free.
+// Called within the architecture-specific initialisation thread. Stage 1 (early).
+void kinit1(void) {
+    // Command line argument enables memory sanitisation upon slab allocator free. Helps highlight memory management issues, and protect against freed memory inspection.
     if (NArch::cmdline.get("mmsan")) {
         NMem::sanitisefreed = true;
     }
@@ -83,6 +75,16 @@ extern "C" void kernel_main(void) {
             NUtil::printf("Discovered driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
         }
     }
+}
+
+extern "C" void kernel_main(void) {
+    NUtil::printf("Nomos %s, built %s\n", VERSION, BUILDDATE);
+
+    // Initialise freestanding C++ "runtime" support.
+    NCxx::init();
+
+    // Initialise architecture-specific.
+    NArch::init();
 
     hcf();
 }

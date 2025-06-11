@@ -15,7 +15,7 @@ namespace NSched {
     static const int NICEWEIGHTS[40] = {
         /* -20 */ 88817, /* -19 */ 71054, /* -18 */ 56843, /* -17 */ 45474, /* -16 */ 36379,
         /* -15 */ 29103, /* -14 */ 23283, /* -13 */ 18626, /* -12 */ 14901, /* -11 */ 11920,
-        /* -10 */ 9536,  /* -9 */ 7629,   /* -8 */  6103,   /* -7 */ 4882,   /* -6 */ 3906,
+        /* -10 */ 9536,   /* -9 */ 7629,   /* -8 */ 6103,   /* -7 */ 4882,   /* -6 */ 3906,
         /* -5 */  3125,   /* -4 */ 2500,   /* -3 */ 2000,   /* -2 */ 1600,   /* -1 */ 1280,
         /*  0 */  1024,   /*  1 */ 819,    /*  2 */ 655,    /*  3 */ 524,    /*  4 */ 419,
         /*  5 */  335,    /*  6 */ 268,    /*  7 */ 214,    /*  8 */ 171,    /*  9 */ 137,
@@ -219,21 +219,25 @@ namespace NSched {
                 this->ctx = *ctx; // Copy context over old context. Updating it.
             }
 
-            void init(Process *proc, size_t stacksize, void *entry);
+            void init(Process *proc, size_t stacksize, void *entry, void *arg);
+
+            Thread(Process *proc, size_t stacksize, void *entry, void *arg) {
+                this->init(proc, stacksize, entry, arg);
+            }
 
             Thread(Process *proc, size_t stacksize, void *entry) {
-                this->init(proc, stacksize, entry);
+                this->init(proc, stacksize, entry, NULL);
             }
 
             Thread(Process *proc, size_t stacksize) {
-                this->init(proc, stacksize, NULL);
+                this->init(proc, stacksize, NULL, NULL);
             }
 
             Thread(Process *proc) {
-                this->init(proc, DEFAULTSTACKSIZE, NULL);
+                this->init(proc, DEFAULTSTACKSIZE, NULL, NULL);
             }
             Thread(void) {
-                this->init(kprocess, DEFAULTSTACKSIZE, NULL);
+                this->init(kprocess, DEFAULTSTACKSIZE, NULL, NULL);
             }
             void destroy(void);
 
@@ -247,6 +251,12 @@ namespace NSched {
 
     // Schedule a thread, targets the idlest CPU.
     void schedulethread(Thread *thread);
+
+    // Voluntarily relinquish access to the CPU. The yielding thread will be rewarded with more opportunities to make up the runtime it lost while yielding.
+    void yield(void);
+
+    // Exit a kernel thread. REQUIRED for ending kernel threads that return eventually.
+    void exit(void);
 
     // Await scheduling. This is run on the BSP to jump into the scheduler.
     void await(void);

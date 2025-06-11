@@ -139,6 +139,8 @@ namespace NArch {
 
         // Trigger oneshot interrupt on timeout.
         void lapiconeshot(uint64_t us, uint8_t vec);
+        // Stop any actively running timer.
+        void lapicstop(void);
         // Initialise Local APIC.
         void lapicinit(void);
 

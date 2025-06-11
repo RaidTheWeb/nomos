@@ -68,6 +68,7 @@ namespace NArch {
                 uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU.
                 bool intstatus = false; // Interrupts enabled?
 
+                uint64_t lastschedts; // For runtime delta calculations.
                 NSched::Thread *currthread = NULL; // Currently running thread, if any.
                 NSched::Thread *idlethread = NULL; // Fallback idle thread, for when there's no work.
 
