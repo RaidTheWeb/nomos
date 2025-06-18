@@ -7,12 +7,12 @@ namespace NLib {
         uint8_t *psrc = (uint8_t *)src;
 
         // Try to copy big bits of data if possible.
-        while (n >= sizeof(size_t)) {
-            *(size_t *)pdest = *(size_t *)psrc;
-            pdest += sizeof(size_t);
-            psrc += sizeof(size_t);
-            n -= sizeof(size_t);
-        }
+        // while (n >= sizeof(size_t)) {
+        //     *(size_t *)pdest = *(size_t *)psrc;
+        //     pdest += sizeof(size_t);
+        //     psrc += sizeof(size_t);
+        //     n -= sizeof(size_t);
+        // }
 
         // Copy in bytes for the rest.
         while (n--) {
@@ -93,6 +93,14 @@ namespace NLib {
         return pstr - str; // This is neat: we can return the difference between pointers to find the length of the string, instead of incrementing a variable or whatever.
     }
 
+    size_t strnlen(const char *str, size_t n) {
+        char *pstr = (char *)str;
+        while(n-- && *pstr) { // Same as strlen, but with a check for the max length.
+            pstr++;
+        }
+        return pstr - str;
+    }
+
     char *strcpy(char *dest, char *src) {
         size_t len = strlen(src);
         memcpy(dest, src, len); // Utilise memcpy for fast copying strings.
@@ -114,9 +122,21 @@ namespace NLib {
     }
 
     int strncmp(const char *s1, const char *s2, size_t n) {
-        size_t len = strlen(s2);
-        int ret = memcmp((void *)s1, (void *)s2, n);
-        return ((n - len) <= 0) || ret != 0 ? ret : 0; // Assume perfect match if we got here before we reached the end of s2.
+        size_t len1 = strnlen(s1, n);
+        size_t len2 = strnlen(s2, n);
+        size_t cmplen = len1 < len2 ? len1 : len2; // Find minimum of the two.
+
+        int ret = memcmp((void *)s1, (void *)s2, cmplen); // Compare against minimum string length.
+
+        if (!ret) {
+            if (len1 < len2) {
+                return -1;
+            } else if (len1 > len2) {
+                return 1;
+            }
+        }
+
+        return ret;
     }
 
     char *strchr(char *str, int c) {

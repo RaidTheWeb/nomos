@@ -230,16 +230,27 @@ namespace NMem {
             this->root = NULL; // NULL root.
         }
 
-        void *VMASpace::alloc(size_t size, size_t align) {
-            assert(size && align, "Attempting to allocate zero aligned/zero size VMA region.\n");
+        void VMASpace::setflags(uintptr_t start, uintptr_t end, uint8_t flags) {
+            this->free((void *)start, end - start); // Free size of region before remapping (in case it's only marking part of an area).
+
+            this->alloc(end - start, flags);
+        }
+
+        void *VMASpace::alloc(size_t size, uint8_t flags) {
+            assert(size && NArch::PAGESIZE, "Attempting to allocate zero aligned/zero size VMA region.\n");
 
             uintptr_t allocaddr = 0;
-            size_t alignsize = NArch::pagealign(size, align);
+            size_t alignsize = NArch::pagealign(size, NArch::PAGESIZE);
+
+            assert(this->root, "Root is NULL.\n");
 
             // Find a suitable node for this allocation.
-            struct vmanode *node = this->findfree(this->root, alignsize, align, &allocaddr);
+            struct vmanode *node = this->findfree(this->root, alignsize, NArch::PAGESIZE, &allocaddr);
 
-            assertarg(node, "OOM for VMA allocation of size %lu and %lu alignment.\n", size, align);
+            if (!node) {
+                this->dump();
+            }
+            assertarg(node, "OOM for VMA allocation of size %lu and %lu alignment.\n", size, NArch::PAGESIZE);
 
 
             struct vmanode *nodes[3];
@@ -250,7 +261,9 @@ namespace NMem {
             }
 
             // Allocate for the region we allocate.
-            nodes[count++] = this->newnode(allocaddr, allocaddr + alignsize, true);
+            nodes[count] = this->newnode(allocaddr, allocaddr + alignsize, true);
+            nodes[count]->flags = flags;
+            count++;
 
             if (allocaddr + alignsize < node->end) { // Allocation does not end at the end of the node region, therefore, allocate a node for the space after.
                 nodes[count++] = this->newnode(allocaddr + alignsize, node->end, false);
@@ -264,11 +277,13 @@ namespace NMem {
                 this->root = this->insert(this->root, nodes[i]);
             }
 
+            assert(this->root, "Root is NULL.\n");
+
             return (void *)allocaddr; // Return pointer to brand new virtual address space!
         }
 
 
-        void VMASpace::tranverse(struct vmanode *root, void (*callback)(struct vmanode *node)) {
+        void VMASpace::traverse(struct vmanode *root, void (*callback)(struct vmanode *node)) {
             if (!root) {
                 return; // We're done here.
             }
@@ -277,9 +292,9 @@ namespace NMem {
             // Left child of Node.
             // Node
             // Right child of Node.
-            this->tranverse(root->left, callback);
+            this->traverse(root->left, callback);
             callback(root);
-            this->tranverse(root->right, callback);
+            this->traverse(root->right, callback);
         }
 
         void VMASpace::validate(struct vmanode *root, uintptr_t *last) {
@@ -319,7 +334,7 @@ namespace NMem {
         void VMASpace::dump(void) {
             NUtil::printf("Dumping VMA AVL tree:\n");
             NUtil::printf(" Start               End                 State\n");
-            this->tranverse(this->root, printnode);
+            this->traverse(this->root, printnode);
         }
 
         struct vmanode *VMASpace::containing(struct vmanode *root, uintptr_t start, uintptr_t end) {
@@ -338,7 +353,7 @@ namespace NMem {
             return NULL;
         }
 
-        void *VMASpace::reserve(uintptr_t start, uintptr_t end) {
+        void *VMASpace::reserve(uintptr_t start, uintptr_t end, uint8_t flags) {
             // Find the node that contains this region.
             struct vmanode *node = this->containing(this->root, start, end);
 
@@ -348,11 +363,14 @@ namespace NMem {
             struct vmanode *nodes[3];
             size_t count = 0;
 
+            // this->dump();
             if (node->start < start) {
                 nodes[count++] = this->newnode(node->start, start, false);
             }
 
-            nodes[count++] = this->newnode(start, end, true);
+            nodes[count] = this->newnode(start, end, true);
+            nodes[count]->flags = flags;
+            count++;
 
             if (end < node->end) {
                 nodes[count++] = this->newnode(end, node->end, false);
@@ -363,7 +381,6 @@ namespace NMem {
             for (size_t i = 0; i < count; i++) {
                 this->root = this->insert(this->root, nodes[i]);
             }
-
 
             return (void *)start;
         }

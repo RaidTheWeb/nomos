@@ -6,7 +6,8 @@
 namespace NArch {
     namespace SMP {
         extern bool initialised;
-        extern CPU::CPUInst **cpulist;
+        extern struct CPU::cpulocal **cpulist;
+        extern uintptr_t phycpusaddr;
         extern size_t awakecpus;
 
         void setup(void);

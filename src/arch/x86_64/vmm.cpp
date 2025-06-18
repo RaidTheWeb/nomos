@@ -1,5 +1,6 @@
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/kpti.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
@@ -11,6 +12,11 @@ extern void *_data_start;
 extern void *_data_end;
 extern void *_rodata_start;
 extern void *_rodata_end;
+extern void *__trampoline_start;
+extern void *__trampoline_end;
+extern "C" void trampoline_entry(void);
+
+uint64_t *trampoline_kernelcr3;
 
 namespace NArch {
     namespace VMM {
@@ -28,7 +34,37 @@ namespace NArch {
         }
 
         void swapcontext(struct addrspace *space) {
-            swaptopml4((uintptr_t)hhdmsub(space->pml4));
+            swaptopml4(space->pml4phy);
+        }
+
+        void clonecontext(struct addrspace *space, struct pagetable **pt) {
+            assert(pt != NULL, "Invalid destination for clone.\n");
+
+            *pt = (struct pagetable *)PMM::alloc(PAGESIZE);
+            assert(*pt != NULL, "Failed to allocate top level page for cloned page table.\n");
+            *pt = (struct pagetable *)hhdmoff(*pt);
+            NLib::memset(*pt, 0, PAGESIZE);
+
+            for (size_t i = 0; i < 512; i++) {
+                // Copy entries into here. The highest level ones are already allocated, so it's just the lower level ones that'll ever change between CPUs, thus, everything stays up to date. The only real thing that needs to be kept consistent manually is the TLB, which can be solved with a shootdown IPI.
+
+                (*pt)->entries[i] = space->pml4->entries[i];
+            }
+
+            swaptopml4((uintptr_t)hhdmsub(*pt)); // Jump into page map on this CPU.
+
+            // We leave it up to whatever uses this function to remember that it belongs to the address space that we cloned.
+        }
+
+        void enterucontext(struct pagetable *pt, struct addrspace *space) {
+            // NLib::ScopeMCSSpinlock kguard(&kspace.lock);
+            // NLib::ScopeMCSSpinlock uguard(&space->lock);
+
+            for (size_t i = 0; i < 256; i++) { // Copy lower half userspace tables to kernel map.
+                pt->entries[i] = space->pml4->entries[i];
+            }
+
+            // swapcontext(space); // Swap into space.
         }
 
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt) {
@@ -98,7 +134,8 @@ namespace NArch {
             return (*pte & ADDRMASK) | (virt & OFFMASK);
         }
 
-        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool user) {
+        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
+            bool user = flags & USER; // If flags contain user, we should mark the intermediate pages as user too.
 
             // Align down to base of the page the address exists in.
             phys = pagealigndown(phys, PAGESIZE);
@@ -171,7 +208,7 @@ namespace NArch {
             size = end - virt; // Overwrite size of range to represent page alignmentment.
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
-                assertarg(_mappage(space, virt + i, phys + i, flags, false), "Failed to map page in range 0x%016llx->0x%016llx.\n", virt, virt + size);
+                assertarg(_mappage(space, virt + i, phys + i, flags), "Failed to map page in range 0x%016llx->0x%016llx.\n", virt, virt + size);
             }
             return true;
         }
@@ -186,16 +223,21 @@ namespace NArch {
             }
         }
 
+        static inline uint8_t convertflags(uint64_t flags) {
+            return 0 |
+                ((flags & VMM::WRITEABLE) ? NMem::Virt::VIRT_RW : 0) |
+                ((flags & VMM::USER) ? NMem::Virt::VIRT_USER : 0) |
+                ((flags & VMM::NOEXEC) ? NMem::Virt::VIRT_NX : 0);
+        }
+
         void mapkernel(void *start, void *end, uint64_t flags) {
             size_t len = (uintptr_t)end - (uintptr_t)start;
             uintptr_t base = (uintptr_t)start;
             uintptr_t phyaddr = (uintptr_t)start - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base;
 
-            kspace.vmaspace->reserve((uintptr_t)start, (uintptr_t)end); // Reserve kernel sections in VMA space.
+            kspace.vmaspace->reserve((uintptr_t)start, (uintptr_t)end, convertflags(flags)); // Reserve kernel sections in VMA space.
             maprange(&kspace, base, phyaddr, flags, len);
         }
-
-
 
         void setup(void) {
 
@@ -203,18 +245,20 @@ namespace NArch {
             kspace.pml4 = (struct pagetable *)PMM::alloc(PAGESIZE);
             assert(kspace.pml4 != NULL, "Failed to allocate top level page for kernel address space.\n");
 
+            kspace.pml4phy = (uintptr_t)kspace.pml4;
             kspace.pml4 = (struct pagetable *)hhdmoff(kspace.pml4);
             NLib::memset(kspace.pml4, 0, PAGESIZE); // Blank page.
 
             kspace.vmaspace = new NMem::Virt::VMASpace(0xffff800000000000, 0xffffffffffffffff);
-            kspace.vmaspace->reserve(0xffff800000000000, 0xffff800000001000); // Reserve NULL page, otherwise, this region will end up being allocated at some point.
+            kspace.vmaspace->reserve(0xffff800000000000, 0xffff800000001000, 0); // Reserve NULL page, otherwise, this region will end up being allocated at some point.
+            kspace.vmaspace->reserve(KPTI::TRAMPOLINEVIRT, KPTI::ULOCALVIRTTOP, NMem::Virt::VIRT_USER); // Reserve Trampoline pages.
 
 
-            for (size_t i = 256; i < 512; i++) {
+            for (size_t i = 256; i < 512; i++) { // Higher half -> Kernel. (0-256 is user space).
                 uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
                 assert(entry != NULL, "Failed to allocate intermediate entries.\n");
                 NLib::memset(hhdmoff(entry), 0, PAGESIZE);
-                kspace.pml4->entries[i] = (uint64_t)entry | PRESENT | WRITEABLE | USER;
+                kspace.pml4->entries[i] = (uint64_t)entry | PRESENT | WRITEABLE;
             }
 
             // Map entire memory range:
@@ -229,7 +273,7 @@ namespace NArch {
                     // Map entire region.
                     uintptr_t virt = (uintptr_t)hhdmoff((void *)entry->base);
                     // Reserve the region, so the VMA doesn't try to allocate over the HHDM (only reserved/completely unused regions will be available!).
-                    kspace.vmaspace->reserve(virt, virt + entry->length); // Reserve this range.
+                    kspace.vmaspace->reserve(virt, virt + entry->length, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX | NMem::Virt::VIRT_USER); // Reserve this range.
                     maprange(&kspace, virt, entry->base, NOEXEC | WRITEABLE | PRESENT, entry->length);
                 }
             }
@@ -238,6 +282,8 @@ namespace NArch {
             mapkernel(&_text_start, &_text_end, 0 | PRESENT); // Read-only + Executable.
             mapkernel(&_data_start, &_data_end, 0 | WRITEABLE | NOEXEC | PRESENT); // R/W + Not executable.
             mapkernel(&_rodata_start, &_rodata_end, 0 | NOEXEC | PRESENT); // Read-only + Not executable.
+
+            VMM::maprange(&kspace, KPTI::TRAMPOLINEVIRT, (uintptr_t)(trampoline_entry) - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base, VMM::PRESENT | VMM::USER, PAGESIZE * 4); // Read-only + Executable + User.
 
             uint64_t efer = 0;
             // Read EFER CPU register from 0xc0000080.
@@ -251,7 +297,10 @@ namespace NArch {
             uint64_t cr3;
             asm volatile("mov %%cr3, %0" : "=r"(cr3));
             asm volatile("mov %0, %%cr3" : : "r"((uint64_t)hhdmsub(&kspace.pml4->entries[0])));
-            asm volatile("mfence" : : : "memory");
+            asm volatile("lfence" : : : "memory");
+
+            CPU::getbsp()->kpt = kspace.pml4; // BSP should refer to the global one.
+
             NUtil::printf("[vmm]: Successfully swapped to kernel page table.\n");
 
             NUtil::printf("[vmm]: VMM initialised.\n");

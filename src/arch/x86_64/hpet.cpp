@@ -48,7 +48,9 @@ namespace NArch {
             hpet = (uint8_t *)ACPI::hpet->address.address;
 
             // Memory map whatever we're using.
-            assert(VMM::mappage(&VMM::kspace, ACPI::hpet->address.address, ACPI::hpet->address.address, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC, false), "Failed to memory map HPET base address.\n");
+            uintptr_t virt = (uintptr_t)VMM::kspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
+            assert(VMM::mappage(&VMM::kspace, virt, ACPI::hpet->address.address, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC), "Failed to memory map HPET base address.\n");
+            hpet = (uint8_t *)virt;
 
             uint64_t caps = read(GENERALCAPS); // Read capabilities.
             // 10^15 / period -> Where period is the last 32 bits of the capabilities register.

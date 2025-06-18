@@ -10,15 +10,24 @@
 namespace NMem {
     namespace Virt {
 
+        enum flags {
+            VIRT_RW         = (1 << 0), // Region is writeable.
+            VIRT_USER       = (1 << 1), // Region is unprivileged.
+            VIRT_NX         = (1 << 2), // Region is non-executable.
+            VIRT_SWAPPED    = (1 << 3), // Region is swapped out to disk.
+            VIRT_DIRTY      = (1 << 4)  // Region has been modified (and is thus, dirty). Automatic.
+        };
+
         // Address ordered AVL tree for managing the allocations of an address space.
         // Big block splits into needed, and free parts of the block.
-        // This type of tree is good because it's O(log n)
+        // This type of tree is good because it's O(log n) for any operation.
 
         // Each "node" indicates
         struct vmanode {
             uintptr_t start; // Start of range.
             uintptr_t end; // End of range.
             uintptr_t maxend; // Maximum end address.
+            uint8_t flags; // Collection of flags for this region.
             bool used; // Allocated?
             int8_t height;
             // Tree structure, branches between left and right.
@@ -78,7 +87,7 @@ namespace NMem {
                 struct vmanode *containing(struct vmanode *root, uintptr_t start, uintptr_t end);
 
                 // Traverse nodes in order, calling callback.
-                void tranverse(struct vmanode *root, void (*callback)(struct vmanode *node));
+                void traverse(struct vmanode *root, void (*callback)(struct vmanode *node));
 
                 // Validate nodes.
                 void validate(struct vmanode *root, uintptr_t *last);
@@ -87,10 +96,12 @@ namespace NMem {
                 void findadj(struct vmanode *root, struct vmanode *target, struct vmanode **prev, struct vmanode **next);
             public:
                 // Allocate an aligned region within address space.
-                void *alloc(size_t size, size_t align);
+                void *alloc(size_t size, uint8_t flags);
+
+                void setflags(uintptr_t start, uintptr_t end, uint8_t flags);
 
                 // Forcibly occupy this area of memory. Useful for areas of memory that we should avoid (kernel sections, regions of actual RAM). We only want to be allocating where we could not be having anything useful.
-                void *reserve(uintptr_t start, uintptr_t end);
+                void *reserve(uintptr_t start, uintptr_t end, uint8_t flags);
 
                 // Free an aligned region with address space.
                 void free(void *ptr, size_t size);

@@ -207,7 +207,9 @@ namespace NArch {
             }
 
             // Memory map whatever address we're going to be using, or else it won't let us!
-            assert(VMM::mappage(&VMM::kspace, lapicaddr, lapicaddr, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC, false), "Failed to memory map LAPIC base address.\n");
+            uintptr_t virt = (uintptr_t)VMM::kspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW);
+            assert(VMM::mappage(&VMM::kspace, virt, lapicaddr, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC), "Failed to memory map LAPIC base address.\n");
+            lapicaddr = virt;
 
             ioapics = new IoApic[numioapic];
             assert(ioapics, "Failed to allocate memory for IOAPIC list.\n");
@@ -216,10 +218,12 @@ namespace NArch {
                 struct acpi_madt_ioapic *ioapic = (struct acpi_madt_ioapic *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_IOAPIC, i);
 
                 ioapics[i].addr = (void *)(uintptr_t)ioapic->address;
+                uintptr_t virt = (uintptr_t)VMM::kspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW);
                 assert(VMM::mappage(&VMM::kspace,
-                    (uintptr_t)ioapics[i].addr, (uintptr_t)ioapics[i].addr,
-                    VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC, false
+                    virt, (uintptr_t)ioapics[i].addr,
+                    VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC
                 ), "Failed to memory map IOAPIC base address.\n");
+                ioapics[i].addr = (void *)virt;
 
                 ioapics[i].gsibase = ioapic->gsi_base;
                 ioapics[i].gsitop = ioapic->gsi_base + ((ioapics[i].read(IoApic::IOAPICVER) >> 16) & 0xff) + 1;

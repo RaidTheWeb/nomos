@@ -1,6 +1,9 @@
+#ifdef __x86_64__
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/kpti.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
+#endif
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 #include <sched/sched.hpp>
@@ -280,16 +283,16 @@ decrement:
 
     struct RBTree::node *RBTree::_next(struct node *node) {
 
-        if (node->right) { // If we have a right branch, we want to be traversing it to find the final node.
-            node = node->right;
-            while (node->left) {
-                node = node->left;
+        if (node->right) {
+            struct node *n = node->right;
+            while (n->left) {
+                n = n->left;
             }
-            return node;
+            return n;
         }
 
-        struct node *parent = node->getparent(); // Get parent of node.
-        while (parent && node == parent->right) { // While we can continue to traverse, and the node is the right branch.
+        struct node *parent = node->getparent();
+        while (parent && node == parent->right) {
             node = parent;
             parent = parent->getparent();
         }
@@ -436,9 +439,9 @@ decrement:
     }
 
     // Attempts to locate a busier CPU (considering STEALTHRESHOLD) to steal tasks from. This is used for load balancing.
-    static CPU::CPUInst *getstealbusiest(void) {
+    static struct CPU::cpulocal *getstealbusiest(void) {
         uint64_t maxload = 0;
-        CPU::CPUInst *busiest = NULL;
+        struct CPU::cpulocal *busiest = NULL;
         uint64_t ourload = __atomic_load_n(&CPU::get()->loadweight, memory_order_seq_cst);
 
         for (size_t i = 0; i < SMP::awakecpus; i++) {
@@ -455,9 +458,9 @@ decrement:
     }
 
     // Attempts to locate the most idle CPU. This is used for scheduling, and for the target of load balancing.
-    static CPU::CPUInst *getidlest(void) {
+    static struct CPU::cpulocal *getidlest(void) {
         uint64_t minload = __UINT64_MAX__; // Start at theoretical maximum, so any lower load will be chosen first.
-        CPU::CPUInst *idlest = NULL;
+        struct CPU::cpulocal *idlest = NULL;
 
         for (size_t i = 0; i < SMP::awakecpus; i++) {
             uint64_t load = __atomic_load_n(&SMP::cpulist[i]->loadweight, memory_order_seq_cst);
@@ -475,7 +478,7 @@ decrement:
         return idlest;
     }
 
-    void updateload(CPU::CPUInst *cpu) {
+    void updateload(struct CPU::cpulocal *cpu) {
         size_t num = cpu->runqueue.count();
         // Weighted load balancing calculation, considering the number of active tasks.
         __atomic_store_n(&cpu->loadweight,
@@ -484,7 +487,7 @@ decrement:
         memory_order_seq_cst);
     }
 
-    void loadbalance(CPU::CPUInst *cpu) {
+    void loadbalance(struct CPU::cpulocal *cpu) {
         if (cpu->runqueue.count() <= LOADTHRESHOLD) {
             return; // We're done here.
         }
@@ -492,8 +495,9 @@ decrement:
 
     // Get a hold of a thread from the busiest CPU, migrating it (but not adding it to the new run queue).
     Thread *steal(void) {
-        CPU::CPUInst *busiest = getstealbusiest(); // Get a handle on the busiest CPU.
+        struct CPU::cpulocal *busiest = getstealbusiest(); // Get a handle on the busiest CPU.
 
+        busiest = NULL;
         if (!busiest) {
             return NULL; // We're done here, there's nothing we can do.
         }
@@ -509,7 +513,7 @@ decrement:
         busiest->runqueue.lock.release();
 
         stolen->cid = CPU::get()->id; // Update CID.
-        return stolen;
+        return stolen; // XXX: Worry about the steal() function stealing from a thread that is referencing a different CPU during operation. Solution: Only steal non-suspended threads.
     }
 
     Thread *nextthread(void) {
@@ -521,6 +525,7 @@ decrement:
         return steal(); // We have no work, try to steal something from another CPU.
     }
 
+
     void switchthread(Thread *thread) {
 
         Thread *prev = CPU::get()->currthread;
@@ -528,13 +533,17 @@ decrement:
         CPU::get()->currthread = thread; // Update current thread.
 
         assert(prev, "Previous thread before context switch should *never* be NULL.\n");
-        if (prev->process->addrspace != thread->process->addrspace) { // If we need to change address space, change it. We don't want to be swapping contexts if we can help it (expensive TLB flush).
-            VMM::swapcontext(thread->process->addrspace); // Swap to VMM context.
+
+        if (!thread->process->kernel) {
+            VMM::enterucontext(CPU::get()->kpt, thread->process->addrspace);
         }
+
 
 #ifdef __x86_64__
         CPU::get()->intstatus = thread->ctx.rflags & 0x200; // Restore the interrupt status of the thread.
-        CPU::get()->ist.rsp0 = (uint64_t)thread->stacktop; // Point to top of stack, this is for the TSS.
+        CPU::get()->ist.rsp0 = (uint64_t)thread->stacktop;
+        struct CPU::ulocal *ulocal = &KPTI::ulocals[CPU::get()->id];
+        ulocal->ist.rsp0 = (uint64_t)thread->stacktop; // Point to top of stack, this is for the TSS. This points to the stack made for interrupt work in the kernel (and initial entrance into interrupts from userspace).
 #endif
         thread->tstate = Thread::state::RUNNING; // Set state.
 
@@ -548,8 +557,9 @@ decrement:
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
 
+        APIC::lapicstop(); // Prevent double schedule by stopping any running timer.
 
-        CPU::CPUInst *cpu = CPU::get(); // Get an easy local reference to our current CPU.
+        struct CPU::cpulocal *cpu = CPU::get(); // Get an easy local reference to our current CPU.
 
         assert(cpu, "Failed to acquire current CPU.\n");
 
@@ -628,6 +638,9 @@ decrement:
         // Each new process should be initialised with an atomically incremented PID.
         this->id = __atomic_add_fetch(&pidcounter, 1, memory_order_seq_cst);
         this->addrspace = space;
+        if (space == &VMM::kspace) {
+            this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
+        }
     }
 
     Process::~Process(void) {
@@ -666,10 +679,19 @@ decrement:
         this->process = proc;
 
         // Initialise stack within HHDM, from page allocated memory. Stacks need to be unique for each thread.
-        this->stack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(stacksize) + stacksize));
-        assert(this->stack, "Failed to allocate thread stack.\n");
+        if (this->process->kernel) {
+            this->stack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(stacksize) + stacksize));
+            assert(this->stack, "Failed to allocate thread stack.\n");
 
-        this->stacktop = (uint8_t *)((uintptr_t)this->stack + stacksize); // Determine stack top.
+            this->stacktop = (uint8_t *)((uintptr_t)this->stack + stacksize); // Determine stack top.
+        } else {
+            this->stack = (uint8_t *)((uintptr_t)PMM::alloc(stacksize) + stacksize);
+            assert(this->stack, "Failed to allocate thread stack.\n");
+
+            uintptr_t virt = (uintptr_t)this->process->addrspace->vmaspace->alloc(stacksize, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
+            this->stacktop = (uint8_t *)((uintptr_t)virt + stacksize); // Determine stack top.
+            VMM::maprange(this->process->addrspace, virt, (uintptr_t)this->stack, VMM::PRESENT | VMM::WRITEABLE | VMM::USER, stacksize);
+        }
 
         this->stacksize = stacksize;
 
@@ -680,11 +702,13 @@ decrement:
 #ifdef __x86_64__
         // XXX: These would be different segments for userspace:
 
-        this->ctx.cs = 0x08; // Kernel Code.
+        uint64_t code = this->process->kernel ? 0x08 : 0x23;
+        uint64_t data = this->process->kernel ? 0x10 : 0x1b;
+        this->ctx.cs = code; // Kernel Code.
 
-        this->ctx.ds = 0x10; // Kernel Data.
-        this->ctx.es = 0x10; // Ditto.
-        this->ctx.ss = 0x10; // Ditto.
+        this->ctx.ds = data; // Kernel Data.
+        this->ctx.es = data; // Ditto.
+        this->ctx.ss = data; // Ditto.
 
         this->ctx.rsp = (uint64_t)this->stacktop;
         this->ctx.rip = (uint64_t)entry;
@@ -695,11 +719,15 @@ decrement:
     }
 
     void Thread::destroy(void) {
-        PMM::free(hhdmsub(this->stack)); // Free stack.
+        if (this->process->kernel) {
+            PMM::free(hhdmsub(this->stack)); // Free stack.
+        } else {
+            PMM::free(this->stack);
+        }
     }
 
     void schedulethread(Thread *thread) {
-        CPU::CPUInst *cpu = getidlest(); // The most idle CPU should be selected as the target of scheduling.
+        struct CPU::cpulocal *cpu = getidlest(); // The most idle CPU should be selected as the target of scheduling.
         cpu->runqueue.insert(&thread->node, vruntimecmp);
         updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
     }

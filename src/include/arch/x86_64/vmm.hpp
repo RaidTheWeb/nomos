@@ -20,7 +20,7 @@ namespace NArch {
         uint64_t cr3;
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
         asm volatile("mov %0, %%cr3" : : "r"(cr3));
-        asm volatile("mfence" : : : "memory");
+        asm volatile("lfence" : : : "memory");
     }
 
     static inline void swaptopml4(uintptr_t table) {
@@ -29,7 +29,7 @@ namespace NArch {
         uint64_t cr3;
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
         asm volatile("mov %0, %%cr3" : : "r"(table));
-        asm volatile("mfence" : : : "memory");
+        asm volatile("lfence" : : : "memory");
     }
 
     static inline void *hhdmoff(void *ptr) {
@@ -115,12 +115,14 @@ namespace NArch {
         struct pagetable *walk(uint64_t entry);
 
         struct addrspace {
+            struct pagetable *pml4; // Top level page table for this address space.
+            uintptr_t pml4phy; // Physical address of the page table for this address space.
+
             // Virtual address space allocation:
             NMem::Virt::VMASpace *vmaspace;
 
             size_t ref;
 
-            struct pagetable *pml4; // Top level page table for this address space.
             MCSSpinlock lock; // Queued spinlocking, to prevent race conditions on page table modifications. XXX: Fast enough to consider normal spinlocking?
         };
 
@@ -131,7 +133,7 @@ namespace NArch {
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt);
 
         // (Unlocked) Map a virtual address with an entry.
-        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool user);
+        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags);
 
         bool _remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags);
 
@@ -162,9 +164,9 @@ namespace NArch {
         }
 
         // Map a virtual address with an entry.
-        static bool mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool user) {
+        static bool mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
             NLib::ScopeMCSSpinlock guard(&space->lock);
-            return _mappage(space, virt, phys, flags, user);
+            return _mappage(space, virt, phys, flags);
         }
 
         static bool remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags) {
@@ -194,6 +196,9 @@ namespace NArch {
         }
 
         void swapcontext(struct addrspace *space);
+        // Clone address space's page table map to a different location, the address space itself can be referred to just fine.
+        void clonecontext(struct addrspace *space, struct pagetable **pt);
+        void enterucontext(struct pagetable *pt, struct addrspace *space);
 
         // Maps kernel regions according to start and end of individual sections.
         void mapkernel(void *start, void *end, uint64_t flags);

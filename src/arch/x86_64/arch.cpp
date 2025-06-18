@@ -7,6 +7,7 @@
 #include <arch/x86_64/hpet.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
+#include <arch/x86_64/kpti.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/smp.hpp>
@@ -23,19 +24,70 @@
 
 extern void kinit1(void);
 
+extern void *__trampoline_start;
+extern void *__trampoline_end;
+extern "C" void trampoline_entry(void);
 namespace NArch {
     bool hypervisor_enabled = false;
     bool hypervisor_checked = false;
 
     NLib::CmdlineParser cmdline;
 
+
+    static int i = 0;
+
+    extern "C" void uentry(int *i);
+
     // This function runs as a thread, post scheduler initialisation.
     void archthreadinit(void) {
         NUtil::printf("Hello kernel thread!\n");
 
-        NSched::yield();
-
         kinit1();
+
+        struct VMM::addrspace uspace;
+        uspace.ref = 1;
+        uspace.pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
+        uspace.pml4phy = (uintptr_t)uspace.pml4;
+        uspace.pml4 = (struct VMM::pagetable *)hhdmoff(uspace.pml4);
+        NLib::memset(uspace.pml4, 0, PAGESIZE);
+
+        uspace.vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000); // Provide userspace VMA.
+
+        for (size_t i = 0; i < 256; i++) {
+            uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
+            assert(entry != NULL, "Failed to allocate intermediate entries.\n");
+            NLib::memset(hhdmoff(entry), 0, PAGESIZE);
+            uspace.pml4->entries[i] = (uint64_t)entry | VMM::PRESENT | VMM::WRITEABLE | VMM::USER;
+        }
+
+        NSched::Process *proc = new NSched::Process(&uspace);
+
+        NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE, (void *)uentry, (void *)&i);
+        uintptr_t ustack = (uintptr_t)PMM::alloc(NSched::DEFAULTSTACKSIZE); // Allocate user stack, and point RSP to the top.
+        uintptr_t virt = (uintptr_t)uspace.vmaspace->alloc(NSched::DEFAULTSTACKSIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
+        VMM::maprange(&uspace, virt, ustack, VMM::NOEXEC | VMM::WRITEABLE | VMM::USER | VMM::PRESENT, NSched::DEFAULTSTACKSIZE); // Map stack.
+
+        VMM::maprange(&uspace, KPTI::ULOCALVIRT, KPTI::ulocalphy, VMM::PRESENT | VMM::NOEXEC | VMM::USER, KPTI::ULOCALVIRTTOP - KPTI::ULOCALVIRT); // Map CPU locals into constant mapped memory.
+        VMM::maprange(&uspace, KPTI::TRAMPOLINEVIRT, (uintptr_t)(trampoline_entry) - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base, VMM::PRESENT | VMM::USER, PAGESIZE * 2); // Read-only + Executable + User.
+
+        uintptr_t evirt = (uintptr_t)uspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_USER);
+        uintptr_t ephy = (uintptr_t)uentry - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base;
+        size_t off = ephy % PAGESIZE;
+        uthread->ctx.rip = evirt + off;
+        VMM::mappage(&uspace, evirt, (uintptr_t)uentry - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base, VMM::PRESENT | VMM::USER);
+
+
+
+        uthread->ctx.rsp = virt + NSched::DEFAULTSTACKSIZE;
+
+        NSched::schedulethread(uthread);
+
+        size_t deadline = TSC::query() + 400000000;
+        while (TSC::query() < deadline) {
+            asm ("pause");
+        }
+
+        NUtil::printf("0x%08x.\n", i);
 
         NSched::exit();
     }
@@ -157,11 +209,11 @@ namespace NArch {
         VMM::setup();
 
         // Test VMA.
-        uintptr_t test = (uintptr_t)VMM::kspace.vmaspace->alloc(4096, 4096);
+        uintptr_t test = (uintptr_t)VMM::kspace.vmaspace->alloc(4096, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
         void *p = PMM::alloc(4096);
         *((uint8_t *)((uintptr_t)p + NLimine::hhdmreq.response->offset)) = 0xab;
 
-        VMM::mappage(&VMM::kspace, test, (uintptr_t)p, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC, false);
+        VMM::mappage(&VMM::kspace, test, (uintptr_t)p, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC);
         void *virtptr = (void *)test;
         assert(*((uint8_t *)virtptr) == 0xab, "VMA allocator + VMM mapping self-test failed.\n");
         VMM::unmappage(&VMM::kspace, test);
@@ -179,7 +231,11 @@ namespace NArch {
 
         NSched::setup();
 
+        KPTI::setup(); // Initialise KPTI protections, must be done before SMP is initialised to have the ulocals mapped.
+
         SMP::setup();
+
+        CPU::init(); // Initialise BSP state.
 
         NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)archthreadinit);
         NSched::schedulethread(kthread);

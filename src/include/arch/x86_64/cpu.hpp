@@ -56,54 +56,67 @@ namespace NArch {
         static const uint32_t MSRGSBASE     = 0xc0000101; // GS.
         static const uint32_t MSRKGSBASE    = 0xc0000102; // Kernel GS.
 
-        class CPUInst {
-            public:
-                struct MCSSpinlock::state mcsstate;
-                struct ist ist;
-                uint64_t gdt[7];
-                struct Interrupts::isr isrtable[256];
-                uint32_t id;
-                uint32_t lapicid;
-                uint64_t lapicfreq = 0;
-                uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU.
-                bool intstatus = false; // Interrupts enabled?
+        // Userspace per-CPU local. Mapped into read-only trampoline pages.
+        struct ulocal {
+            uintptr_t kcr3; // Kernel CR3.
+            uintptr_t stacktop;
+            uint64_t gdt[7];
+            struct ist ist;
+            struct Interrupts::idtentry idt[256]; // XXX: Consider one IDT, the only per-CPU part needs to be the ISR table.
+            uint8_t stack[PAGESIZE]; // Temporary stack for usage during context switches.
+        } __attribute__((aligned(64))); // Cache-aligned.
 
-                uint64_t lastschedts; // For runtime delta calculations.
-                NSched::Thread *currthread = NULL; // Currently running thread, if any.
-                NSched::Thread *idlethread = NULL; // Fallback idle thread, for when there's no work.
+        struct cpulocal {
+            // Place current thread pointer at the start of the CPU struct, so the offset is easier within the system call assembly.
+            NSched::Thread *currthread = NULL; // Currently running thread, if any.
+            uint64_t raxtemp; // Temporary location for use by syscall assembly to store RAX.
+            uint64_t cr3temp; // Temporary location for use by syscall assembly to store CR3 for context restore.
+            uintptr_t ulocalstack; // Reference to the top of the user local stack.
+            uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU to use during interrupts (when we shouldn't be using a stack that has ANYTHING to do with a thread).
 
-                uint64_t loadweight; // (oldweight * 3 + rqsize * 1024) / 4
-                NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.
-                size_t schedintr; //Incremented every scheduler interrupt. Used for time-based calculations, as we can approximate a scheduled * NSched::QUANTUMMS = milliseconds conversion.
+            struct VMM::pagetable *kpt; // Kernel page table instance -> simply aliases the pages from the "core" page table.
 
-                CPUInst(void) {
+            NSched::Thread *idlethread = NULL; // Fallback idle thread, for when trere's no work.
+            uint64_t lastschedts; // For runtime delta calculations.
 
+            struct MCSSpinlock::state mcsstate;
+            struct ist ist;
+            uint64_t gdt[7];
+            struct Interrupts::isr isrtable[256];
+            uint32_t id;
+            uint32_t lapicid;
+            uint64_t lapicfreq = 0;
+            bool intstatus = false; // Interrupts enabled?
+
+            uint64_t loadweight; // (oldweight * 3 + rqsize * 1024) / 4
+            NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.
+            size_t schedintr; // Incremented every scheduler interrupt. Used for time-based calculations, as we can approximate a scheduled * NSched::QUANTUMMS = milliseconds conversion.
+
+
+            bool setint(bool status) {
+                asm volatile("cli");
+                bool old = this->intstatus;
+                this->intstatus = status;
+
+                if (status) {
+                    asm volatile("sti");
                 }
 
-                bool setint(bool status) {
-                    asm volatile("cli");
-                    bool old = this->intstatus;
-                    this->intstatus = status;
-
-                    if (status) {
-                        asm volatile("sti");
-                    }
-
-                    return old;
-                }
+                return old;
+            }
         };
 
-        CPUInst *getbsp(void);
+        struct cpulocal *getbsp(void);
 
         // Set the current CPU in GS.
-        static inline void set(CPUInst *ptr) {
+        static inline void set(struct cpulocal *ptr) {
             // Write to MSR GS with pointer to instance.
             wrmsr(MSRGSBASE, (uint64_t)ptr);
         }
 
         // Get current CPU from GS.
-        static inline CPUInst *get(void) {
-            return (CPUInst *)rdmsr(MSRGSBASE);
+        static inline struct cpulocal *get(void) {
+            return (struct cpulocal *)rdmsr(MSRGSBASE);
         }
 
         void init(void);

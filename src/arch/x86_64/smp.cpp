@@ -3,6 +3,7 @@
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/gdt.hpp>
 #include <arch/x86_64/interrupts.hpp>
+#include <arch/x86_64/kpti.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
@@ -14,7 +15,7 @@
 namespace NArch {
     namespace SMP {
 
-        CPU::CPUInst **cpulist = NULL;
+        struct CPU::cpulocal **cpulist = NULL;
         size_t awakecpus = 1; // Start at 1, to include BSP.
         bool initialised = false;
 
@@ -23,6 +24,7 @@ namespace NArch {
             (void)isr;
             (void)ctx;
 
+            APIC::lapicstop(); // Prevent any scheduling work from jumping a CPU out of of the panic state.
             CPU::get()->setint(false);
             for (;;) {
                 asm volatile("hlt");
@@ -30,7 +32,7 @@ namespace NArch {
         }
 
         static void wakeup(struct limine_mp_info *info) {
-            CPU::set((CPU::CPUInst *)info->extra_argument); // Set from initial argument.
+            CPU::set((struct CPU::cpulocal *)info->extra_argument); // Set from initial argument.
 
             uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
             CPU::get()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack) + (64 * 1024 * 1024);
@@ -38,8 +40,8 @@ namespace NArch {
             GDT::reload(); // "Reload" GDT -> Initialise it on this CPU.
             Interrupts::reload(); // "Reload" IDT -> Initialise it on this CPU.
 
-            // Swap to page table.
-            VMM::swapcontext(&VMM::kspace); // Swap to kernel space.
+            // Swap to page table
+            VMM::clonecontext(&VMM::kspace, &CPU::get()->kpt); // Swap to kernel space, cloning the page table from the kernel address space.
 
             // Initialise LAPIC.
             APIC::lapicinit();
@@ -48,6 +50,8 @@ namespace NArch {
             Interrupts::regisr(0xfd, halt, false);
 
             CPU::init(); // Initialise CPU (Specifics).
+
+            KPTI::apsetup(); // Initialise KPTI.
 
             NUtil::printf("[smp]: Non-BSP CPU%lu initialised.\n", info->processor_id);
 
@@ -60,14 +64,14 @@ namespace NArch {
             // Interrupts::regisr(0xfd, halt, false);
             struct limine_mp_response *mpresp = NLimine::mpreq.response;
 
-            CPU::CPUInst *phycpus = (CPU::CPUInst *)PMM::alloc(pagealign(sizeof(CPU::CPUInst) * mpresp->cpu_count, PAGESIZE)); // We'll never free this.
+            struct CPU::cpulocal *phycpus = (struct CPU::cpulocal *)PMM::alloc(pagealign(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE)); // We'll never free this.
 
             assert(phycpus, "Failed to allocate memory for CPU instances.\n");
 
-            phycpus = (CPU::CPUInst *)NArch::hhdmoff((void *)phycpus);
-            NLib::memset(phycpus, 0, pagealign(sizeof(CPU::CPUInst) * mpresp->cpu_count, PAGESIZE));
+            phycpus = (struct CPU::cpulocal *)NArch::hhdmoff((void *)phycpus);
+            NLib::memset(phycpus, 0, pagealign(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE));
 
-            cpulist = new CPU::CPUInst *[mpresp->cpu_count]; // Slab allocate for pointers to pointers, this'll be used for looping on every CPU (for stuff like sending IPIs).
+            cpulist = new struct CPU::cpulocal *[mpresp->cpu_count]; // Slab allocate for pointers to pointers, this'll be used for looping on every CPU (for stuff like sending IPIs).
             assert(cpulist, "Failed to allocate memory for list of CPU instances.\n");
 
             bool nosmp = false;

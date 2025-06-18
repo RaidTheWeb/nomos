@@ -69,7 +69,7 @@ namespace NSched {
                 );
             }
 
-            NArch::MCSSpinlock lock;
+            NArch::Spinlock lock;
         private:
 
             size_t nodecount = 0;
@@ -102,31 +102,31 @@ namespace NSched {
 
             // Insert into Red-Black tree using cmp to compare left child against right child, for traversal.
             void insert(struct node *node, int (*cmp)(struct node *, struct node *)) {
-                NLib::ScopeMCSSpinlock guard(&this->lock);
+                NLib::ScopeSpinlock guard(&this->lock);
                 this->_insert(node, cmp);
             }
 
             // Remove a node.
             void erase(struct node *node) {
-                NLib::ScopeMCSSpinlock guard(&this->lock);
+                NLib::ScopeSpinlock guard(&this->lock);
                 this->_erase(node);
             }
 
             // Get first node.
             struct node *first(void) {
-                NLib::ScopeMCSSpinlock guard(&this->lock);
+                NLib::ScopeSpinlock guard(&this->lock);
                 return this->_first();
             }
 
             // Get last node.
             struct node *last(void) {
-                NLib::ScopeMCSSpinlock guard(&this->lock);
+                NLib::ScopeSpinlock guard(&this->lock);
                 return this->_last();
             }
 
             // Get next node.
             struct node *next(struct node *node) {
-                NLib::ScopeMCSSpinlock guard(&this->lock);
+                NLib::ScopeSpinlock guard(&this->lock);
                 return this->_next(node);
             }
 
@@ -134,14 +134,14 @@ namespace NSched {
             size_t count(void);
     };
 
-
-
     class Thread;
 
     class Process {
         private:
         public:
-            struct NArch::VMM::addrspace *addrspace = NULL;
+            struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space.
+            struct NArch::VMM::pagetable *table = NULL; // Kernel + User page table.
+            bool kernel = false;
             size_t id; // Process ID.
 
             Process(struct NArch::VMM::addrspace *space);
@@ -155,6 +155,11 @@ namespace NSched {
 
     class Thread {
         public:
+            uint8_t *stacktop = NULL; // Top of kernel stack is placed at offset 0, to make it easier to load from system call assembly.
+            Process *process = NULL; // Parent process controlling the threads.
+            uint8_t *stack = NULL;
+            size_t stacksize = DEFAULTSTACKSIZE;
+
             enum target {
                 STRICT, // The thread will ONLY be scheduled onto its target, and will refuse anything else until the target becomes available again.
                 RELAXED // The thread would *like* to be placed onto its target if possible, but it's not picky about it.
@@ -177,11 +182,6 @@ namespace NSched {
             int nice = 0; // -20 to +19, used for virtual runtime weighting. Lower values mean higher priority.
 
         public:
-            uint8_t *stacktop = NULL;
-            uint8_t *stack = NULL;
-            size_t stacksize = DEFAULTSTACKSIZE;
-
-            Process *process = NULL; // Parent process controlling the threads.
             enum state tstate = state::READY; // Current state of thread.
             struct RBTree::node node; // Red-Black tree node for this thread.
             size_t id = 0; // Thread ID.

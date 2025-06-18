@@ -10,7 +10,7 @@ namespace NArch {
         // Reference ISR table from assembly. This is for stubs, not handlers.
         extern "C" const uint64_t isr_table[256];
 
-        static struct idtentry idt[256];
+        struct idtentry idt[256];
         static struct idtr idtr;
 
         static const char *exceptions[] = {
@@ -90,24 +90,19 @@ namespace NArch {
 
         void exception_handler(struct isr *isr, struct CPU::context *ctx) {
             (void)ctx;
-            NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: CPU Exception: %s.\n", exceptions[isr->id & 0xffffffff]);
-
-
+            char errbuffer[2048];
             if ((isr->id & 0xffffffff) == 14) {
                 uintptr_t addr = 0;
                 asm volatile(
                     "mov %%cr2, %0"
                     : "=r"(addr) : : "memory"
                 );
-                NUtil::printf("Page fault at %p occurred due to %s %s in %p during %s.\n", ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation");
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s.\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor");
             } else if ((isr->id & 0xffffffff) == 13) {
-                NUtil::printf("General Protection Fault occurred at %p.\n", ctx->rip);
+                NUtil::printf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
             }
 
-            for (;;) { // "Unrecoverable"
-                asm("cli");
-                asm("hlt");
-            }
+            panic(errbuffer);
         }
 
         void setup(void) {

@@ -63,6 +63,12 @@ void operator delete[](void *ptr, size_t size) {
     operator delete(ptr);
 }
 
+extern "C" uint64_t syscall_test(void) {
+    // *ptr = value; // Fill a pointer with a value.
+    NUtil::printf("hey, it's me: syscall.\n");
+    return 0;
+}
+
 // Called within the architecture-specific initialisation thread. Stage 1 (early).
 void kinit1(void) {
     // Command line argument enables memory sanitisation upon slab allocator free. Helps highlight memory management issues, and protect against freed memory inspection.

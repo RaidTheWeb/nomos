@@ -16,6 +16,7 @@ uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out) {
 
 void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *str, ...) {
     (void)level;
+
     va_list ap;
     va_start(ap, str);
     NUtil::printf("[acpi]: ");
@@ -25,7 +26,8 @@ void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *str, ...) {
 
 void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
     using namespace NArch::VMM;
-    uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, NArch::PAGESIZE);
+    using namespace NMem::Virt;
+    uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, VIRT_RW | VIRT_NX);
     NArch::VMM::maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NArch::pagealign(length, NArch::PAGESIZE));
     size_t offset = phys - NArch::pagealigndown(phys, NArch::PAGESIZE);
     return (void *)(virt + offset);

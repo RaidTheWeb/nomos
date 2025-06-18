@@ -1,5 +1,7 @@
+#ifdef __x86_64__
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/pmm.hpp>
+#endif
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
 #include <mm/slab.hpp>

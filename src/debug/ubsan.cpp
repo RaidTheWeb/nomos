@@ -1,4 +1,7 @@
+#ifdef __x86_64__
 #include <arch/x86_64/io.hpp>
+#include <arch/x86_64/panic.hpp>
+#endif
 #include <debug/ubsan.hpp>
 #include <util/kprint.hpp>
 
@@ -25,11 +28,9 @@ namespace NDebug {
         };
 
         void handleviolation(const char *violation, struct sourceloc *loc) {
-            NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: UBSan violation (%s) at %s:%d failed:\n", violation, loc->file, loc->line);
-            for (;;) {
-                asm volatile("cli");
-                asm volatile("hlt");
-            }
+            char errbuffer[2048];
+            NUtil::snprintf(errbuffer, sizeof(errbuffer), "[\x1b[1;31mPANIC\x1b[0m]: UBSan violation (%s) at %s:%d failed:\n", violation, loc->file, loc->line);
+            NArch::panic(errbuffer);
         }
 
         extern "C" void __ubsan_handle_type_mismatch(struct typemismatch *info, uintptr_t ptr) {
