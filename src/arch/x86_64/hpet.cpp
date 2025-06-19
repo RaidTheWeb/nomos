@@ -1,4 +1,5 @@
 #include <arch/x86_64/acpi.hpp>
+#include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/hpet.hpp>
 #include <arch/x86_64/tsc.hpp>
@@ -42,6 +43,15 @@ namespace NArch {
         }
 
         void setup(void) {
+            if (ACPI::hpet == NULL) {
+                return; // No HPET exists on this hardware. Skip.
+            }
+
+            if (cmdline.get("nohpet")) {
+                NUtil::printf("[hpet]: HPET disabled due to `nohpet` command line argument.\n");
+                return;
+            }
+
             NUtil::printf("[hpet]: Initialising HPET%lu...\n", ACPI::hpet->number);
             assert(ACPI::hpet->address.address_space_id == ACPI_AS_ID_SYS_MEM, "HPET MMIO address space is not within system memory.\n");
 

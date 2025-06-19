@@ -101,10 +101,15 @@ namespace NArch {
             NUtil::printf("[acpi]: MADT initialised.\n");
 
             uacpi_table timer;
-            assert(uacpi_table_find_by_signature(ACPI_HPET_SIGNATURE, &timer) == UACPI_STATUS_OK, "Failed to find HPET table from ACPI.\n");
+            uacpi_status res = uacpi_table_find_by_signature(ACPI_HPET_SIGNATURE, &timer);
 
-            hpet = (struct acpi_hpet *)timer.ptr;
-            NUtil::printf("[acpi]: HPET initialised.\n");
+            if (res == UACPI_STATUS_OK) {
+                hpet = (struct acpi_hpet *)timer.ptr;
+                NUtil::printf("[acpi]: HPET initialised.\n");
+            } else {
+                NUtil::printf("[acpi]: HPET not present.\n");
+                hpet = NULL;
+            }
         }
     }
 }
