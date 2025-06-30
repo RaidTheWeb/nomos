@@ -5,6 +5,11 @@
 #include <stdint.h>
 
 namespace NMem {
+    // Fill allocations with 0xAA, like free santitisation.
+    extern bool nonzeroalloc;
+    // Fill freed allocations with 0xAA, to hide what they originally contained on next alloc.
+    extern bool sanitisefreed;
+
     __attribute__((used))
     static const size_t numslabs = 17;
 

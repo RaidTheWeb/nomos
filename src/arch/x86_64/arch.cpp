@@ -1,4 +1,5 @@
 #include <arch/limine/arch.hpp>
+#include <arch/limine/module.hpp>
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/acpi.hpp>
 #include <arch/x86_64/apic.hpp>
@@ -7,12 +8,12 @@
 #include <arch/x86_64/hpet.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
-#include <arch/x86_64/kpti.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
+#include <fs/ustar.hpp>
 #include <lib/assert.hpp>
 #include <lib/cmdline.hpp>
 #include <lib/string.hpp>
@@ -24,70 +25,70 @@
 
 extern void kinit1(void);
 
-extern void *__trampoline_start;
-extern void *__trampoline_end;
-extern "C" void trampoline_entry(void);
 namespace NArch {
     bool hypervisor_enabled = false;
     bool hypervisor_checked = false;
 
     NLib::CmdlineParser cmdline;
 
-
-    static int i = 0;
-
-    extern "C" void uentry(int *i);
+    extern "C" void uentry(void);
 
     // This function runs as a thread, post scheduler initialisation.
     void archthreadinit(void) {
         NUtil::printf("Hello kernel thread!\n");
 
-        kinit1();
+        kinit1(); // XXX: Driver init.
 
-        struct VMM::addrspace uspace;
-        uspace.ref = 1;
-        uspace.pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
-        uspace.pml4phy = (uintptr_t)uspace.pml4;
-        uspace.pml4 = (struct VMM::pagetable *)hhdmoff(uspace.pml4);
-        NLib::memset(uspace.pml4, 0, PAGESIZE);
-
-        uspace.vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000); // Provide userspace VMA.
-
-        for (size_t i = 0; i < 256; i++) {
-            uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
-            assert(entry != NULL, "Failed to allocate intermediate entries.\n");
-            NLib::memset(hhdmoff(entry), 0, PAGESIZE);
-            uspace.pml4->entries[i] = (uint64_t)entry | VMM::PRESENT | VMM::WRITEABLE | VMM::USER;
+        const char *initramfs = cmdline.get("initramfs");
+        if (initramfs) { // Exists, load it.
+            NUtil::printf("[arch/x86_64]: Attempting to load initramfs `%s`.\n", initramfs);
+            struct Module::modinfo mod = Module::loadmodule(initramfs); // Try to load.
+            assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
+            NFS::USTAR::enumerate(mod);
         }
 
-        NSched::Process *proc = new NSched::Process(&uspace);
+        struct VMM::addrspace *uspace = new struct VMM::addrspace;
+        uspace->ref = 1;
+        uspace->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
+        assert(uspace->pml4, "Failed to allocate memory for user space PML4.\n");
+        uspace->pml4phy = (uintptr_t)uspace->pml4;
+        uspace->pml4 = (struct VMM::pagetable *)hhdmoff(uspace->pml4);
+        NLib::memset(uspace->pml4, 0, PAGESIZE);
 
-        NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE, (void *)uentry, (void *)&i);
+        uspace->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000); // Provide userspace VMA.
+
+        uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
+        assert(entry != NULL, "Failed to allocate intermediate entries.\n");
+        NLib::memset(hhdmoff(entry), 0, PAGESIZE);
+        uspace->pml4->entries[0] = (uint64_t)entry | VMM::WRITEABLE | VMM::USER; // Isn't marked present explicitly: guard pages.
+        for (size_t i = 1; i < 256; i++) {
+            uspace->pml4->entries[i] = 0; // Don't even bother. It'll never be used, and if it is, it'll be allocated when it's needed.
+        }
+
+        for (size_t i = 256; i < 512; i++) {
+
+            uspace->pml4->entries[i] = VMM::kspace.pml4->entries[i]; // Map the kernel into userspace.
+        }
+
+        NSched::Process *proc = new NSched::Process(uspace);
+
+        NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE, (void *)uentry);
         uintptr_t ustack = (uintptr_t)PMM::alloc(NSched::DEFAULTSTACKSIZE); // Allocate user stack, and point RSP to the top.
-        uintptr_t virt = (uintptr_t)uspace.vmaspace->alloc(NSched::DEFAULTSTACKSIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
-        VMM::maprange(&uspace, virt, ustack, VMM::NOEXEC | VMM::WRITEABLE | VMM::USER | VMM::PRESENT, NSched::DEFAULTSTACKSIZE); // Map stack.
+        assert(ustack, "Failed to allocate memory for user stack.\n");
+        uintptr_t virt = (uintptr_t)uspace->vmaspace->alloc(NSched::DEFAULTSTACKSIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
+        VMM::maprange(uspace, virt, ustack, VMM::NOEXEC | VMM::WRITEABLE | VMM::USER | VMM::PRESENT, NSched::DEFAULTSTACKSIZE); // Map stack.
 
-        VMM::maprange(&uspace, KPTI::ULOCALVIRT, KPTI::ulocalphy, VMM::PRESENT | VMM::NOEXEC | VMM::USER, KPTI::ULOCALVIRTTOP - KPTI::ULOCALVIRT); // Map CPU locals into constant mapped memory.
-        VMM::maprange(&uspace, KPTI::TRAMPOLINEVIRT, (uintptr_t)(trampoline_entry) - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base, VMM::PRESENT | VMM::USER, PAGESIZE * 2); // Read-only + Executable + User.
-
-        uintptr_t evirt = (uintptr_t)uspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_USER);
+        uintptr_t evirt = (uintptr_t)uspace->vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_USER);
         uintptr_t ephy = (uintptr_t)uentry - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base;
         size_t off = ephy % PAGESIZE;
         uthread->ctx.rip = evirt + off;
-        VMM::mappage(&uspace, evirt, (uintptr_t)uentry - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base, VMM::PRESENT | VMM::USER);
+        VMM::mappage(uspace, evirt, ephy - off, VMM::PRESENT | VMM::USER);
 
-
+        NUtil::printf("u: %p %p.\n", evirt, off);
 
         uthread->ctx.rsp = virt + NSched::DEFAULTSTACKSIZE;
 
         NSched::schedulethread(uthread);
-
-        size_t deadline = TSC::query() + 400000000;
-        while (TSC::query() < deadline) {
-            asm ("pause");
-        }
-
-        NUtil::printf("0x%08x.\n", i);
 
         NSched::exit();
     }
@@ -182,23 +183,30 @@ namespace NArch {
 
         uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
         CPU::getbsp()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack) + (64 * 1024 * 1024);
+        NUtil::printf("kernel stack %p.\n", stack);
 
         // GDT needs to be initialised and loaded before the IDT.
         GDT::setup();
         GDT::reload();
-        NUtil::printf("[gdt]: GDT Reloaded.\n");
+        NUtil::printf("[arch/x86_64/gdt]: GDT Reloaded.\n");
 
         Interrupts::setup();
         Interrupts::reload();
-        NUtil::printf("[idt]: Interrupts Reloaded.\n");
+        NUtil::printf("[arch/x86_64/idt]: Interrupts Reloaded.\n");
 
         NMem::allocator.setup();
 
         // Setup command line, must happen after slab allocator is set up.
         cmdline.setup(NLimine::ecreq.response->cmdline);
 
+        // Command line argument enables memory sanitisation upon slab allocator free. Helps highlight memory management issues, and protect against freed memory inspection.
+        NMem::sanitisefreed = cmdline.get("mmsan") != NULL;
+
+        // Debug fill allocations with garbage 0xAA before allocation. Catches UBs on QEMU, where memory may not be filled with garbage initially.
+        NMem::nonzeroalloc = cmdline.get("nzalloc") != NULL;
+
         if (cmdline.get("serialcom1") != NULL) {
-            NUtil::printf("[arch/x86_64]: Serial enabled via serialcom1 command line argument.\n");
+            NUtil::printf("[arch/x86_64]: Serial enabled via `serialcom1` command line argument.\n");
 
             Serial::serialchecked = true;
             Serial::serialenabled = true;
@@ -231,9 +239,9 @@ namespace NArch {
 
         NSched::setup();
 
-        KPTI::setup(); // Initialise KPTI protections, must be done before SMP is initialised to have the ulocals mapped.
-
         SMP::setup();
+
+        swaptopml4((uintptr_t)hhdmsub((void *)CPU::getbsp()->syspt));
 
         CPU::init(); // Initialise BSP state.
 

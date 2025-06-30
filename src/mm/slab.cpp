@@ -7,6 +7,10 @@
 #include <mm/slab.hpp>
 
 namespace NMem {
+    // Debug.
+    bool nonzeroalloc = false;
+    bool sanitisefreed = false;
+
     // Get index of slab associated with allocation size.
     static size_t getslabidx(size_t size) {
         for (size_t i = 0; i < numslabs; i++) {
@@ -83,6 +87,10 @@ namespace NMem {
             meta->magic = ALLOCMAGIC;
             meta->endcanary = CANARY;
 
+            if (nonzeroalloc) {
+                NLib::memset((void *)((uintptr_t)block + sizeof(struct SubAllocator::metadata)), 0xaa, size);
+            }
+
             // Return pointer to the memory *after* the metadata.
             return (void *)((uintptr_t)block + sizeof(struct SubAllocator::metadata));
         } else {
@@ -102,6 +110,10 @@ namespace NMem {
             meta->startcanary = CANARY;
             meta->magic = ALLOCMAGIC;
             meta->endcanary = CANARY;
+
+            if (nonzeroalloc) {
+                NLib::memset((void *)((uintptr_t)ptr + sizeof(struct SubAllocator::metadata)), 0xaa, size);
+            }
 
             // Return pointer to data *after* metadata.
             return (void *)((uintptr_t)ptr + sizeof(struct SubAllocator::metadata));

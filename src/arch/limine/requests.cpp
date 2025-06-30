@@ -63,6 +63,14 @@ namespace NLimine {
         .response = NULL
     };
 
+    volatile struct limine_module_request modreq = {
+        .id = LIMINE_MODULE_REQUEST,
+        .revision = 0,
+        .response = NULL,
+        .internal_module_count = 0,
+        .internal_modules = NULL
+    };
+
     __attribute__((used))
     static volatile LIMINE_REQUESTS_END_MARKER;
 }

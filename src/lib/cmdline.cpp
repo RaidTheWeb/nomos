@@ -43,6 +43,8 @@ namespace NLib {
                         // String completed, set value.
                         this->addpair(namebuf, valuebuf);
                     } else {
+
+                        namebuf[writeidx] = '\0';
                         // Start parsing text.
                         writeidx = 0;
                         parsingtext = true;

@@ -10,6 +10,10 @@
 namespace NUtil {
     NArch::Spinlock printlock = NArch::Spinlock();
 
+    void oprintlock(void) {
+        printlock.release();
+    }
+
     // Advance one character, while also ensuring an early exit can be done on NULL.
     #define ADVANCE(PTR) \
         { \

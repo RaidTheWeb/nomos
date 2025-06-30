@@ -1,6 +1,7 @@
 #ifndef _ARCH__X86_64__SYNC_HPP
 #define _ARCH__X86_64__SYNC_HPP
 
+#include <arch/limine/console.hpp>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -23,34 +24,24 @@ namespace NArch {
             }
 
             void acquire(void) {
-                // while (true) {
-                //     if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) { // Try to exchange, if it goes through with success, we now own the lock.
-                //         break; // Success!
-                //     }
-                //
-                //     // Otherwise, wait on it.
-                //
-                //     size_t backoff = BACKOFFMIN;
-                //     do {
-                //         for (size_t i = 0; i < backoff; i++) {
-                //             asm volatile("pause"); // Pause to avoid consuming crazy amounts of power during contention. Backoff is used to reduce contention.
-                //         }
-                //
-                //         backoff = (backoff << 1) | 1;
-                //         if (backoff > BACKOFFMAX) {
-                //             backoff = BACKOFFMAX;
-                //         }
-                //     } while (this->locked);
-                // }
                 while (true) {
-                    if (!__sync_lock_test_and_set(&this->locked, 1)) {
-                        __sync_synchronize();
-                        return;
+                    if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) { // Try to exchange, if it goes through with success, we now own the lock.
+                        break; // Success!
                     }
 
-                    while (this->locked) {
-                        asm volatile("pause");
-                    }
+                    // Otherwise, wait on it.
+
+                    size_t backoff = BACKOFFMIN;
+                    do {
+                        for (size_t i = 0; i < backoff; i++) {
+                            asm volatile("pause"); // Pause to avoid consuming crazy amounts of power during contention. Backoff is used to reduce contention.
+                        }
+
+                        backoff = (backoff << 1) | 1;
+                        if (backoff > BACKOFFMAX) {
+                            backoff = BACKOFFMAX;
+                        }
+                    } while (this->locked);
                 }
             }
 
@@ -61,9 +52,7 @@ namespace NArch {
 
             void release(void) {
                 // Release the lock.
-                // __atomic_store_n(&this->locked, 0, memory_order_release);
-                __sync_synchronize();
-                __sync_lock_release(&this->locked);
+                __atomic_store_n(&this->locked, 0, memory_order_release);
             }
     };
 

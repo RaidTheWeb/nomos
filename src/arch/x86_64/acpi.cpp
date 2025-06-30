@@ -19,7 +19,7 @@ void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *str, ...) {
 
     va_list ap;
     va_start(ap, str);
-    NUtil::printf("[acpi]: ");
+    NUtil::printf("[arch/x86_64/acpi]: ");
     NUtil::vprintf(str, ap);
     va_end(ap);
 }
@@ -86,7 +86,7 @@ namespace NArch {
 
         void setup(void) {
             uacpi_setup_early_table_access((void *)((uintptr_t)PMM::alloc(32 * PAGESIZE) + NLimine::hhdmreq.response->offset), 32 * PAGESIZE);
-            NUtil::printf("[acpi]: Initialised uACPI.\n");
+            NUtil::printf("[arch/x86_64/acpi]: Initialised uACPI.\n");
 
             uacpi_table apic;
             assert(uacpi_table_find_by_signature(ACPI_MADT_SIGNATURE, &apic) == UACPI_STATUS_OK, "Failed to find APIC table from ACPI.\n");
@@ -98,16 +98,16 @@ namespace NArch {
 
             madt.end = (struct acpi_entry_hdr *)((uintptr_t)madtptr + madtptr->hdr.length);
             madt.initialised = true; // Mark as initialised.
-            NUtil::printf("[acpi]: MADT initialised.\n");
+            NUtil::printf("[arch/x86_64/acpi]: MADT initialised.\n");
 
             uacpi_table timer;
             uacpi_status res = uacpi_table_find_by_signature(ACPI_HPET_SIGNATURE, &timer);
 
             if (res == UACPI_STATUS_OK) {
                 hpet = (struct acpi_hpet *)timer.ptr;
-                NUtil::printf("[acpi]: HPET initialised.\n");
+                NUtil::printf("[arch/x86_64/acpi]: HPET initialised.\n");
             } else {
-                NUtil::printf("[acpi]: HPET not present.\n");
+                NUtil::printf("[arch/x86_64/acpi]: HPET not present.\n");
                 hpet = NULL;
             }
         }

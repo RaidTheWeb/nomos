@@ -61,12 +61,12 @@ namespace NArch {
                 MODEMCTL_DTR | MODEMCTL_RTS
             );
             this->initialised = true;
-            NUtil::printf("[serial]: Serial initialised.\n");
+            NUtil::printf("[arch/x86_64/serial]: Serial initialised.\n");
             for (size_t i = 0; i < this->backbufferidx; i++) {
                 // Dump backbuffer.
                 this->write(this->backbuffer[i]);
             }
-            NUtil::printf("[serial]: Pre-initialisation backbuffer restored.\n");
+            NUtil::printf("[arch/x86_64/serial]: Pre-initialisation backbuffer restored.\n");
         }
 
         bool SerialPort::poll(void) {

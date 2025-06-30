@@ -48,11 +48,11 @@ namespace NArch {
             }
 
             if (cmdline.get("nohpet")) {
-                NUtil::printf("[hpet]: HPET disabled due to `nohpet` command line argument.\n");
+                NUtil::printf("[arch/x86_64/hpet]: HPET disabled due to `nohpet` command line argument.\n");
                 return;
             }
 
-            NUtil::printf("[hpet]: Initialising HPET%lu...\n", ACPI::hpet->number);
+            NUtil::printf("[arch/x86_64/hpet]: Initialising HPET%lu...\n", ACPI::hpet->number);
             assert(ACPI::hpet->address.address_space_id == ACPI_AS_ID_SYS_MEM, "HPET MMIO address space is not within system memory.\n");
 
             hpet = (uint8_t *)ACPI::hpet->address.address;
@@ -65,7 +65,7 @@ namespace NArch {
             uint64_t caps = read(GENERALCAPS); // Read capabilities.
             // 10^15 / period -> Where period is the last 32 bits of the capabilities register.
             hz = 1000000000000000lu / ((caps >> 32) & 0xffffffff);
-            NUtil::printf("[hpet]: HPET%lu has a frequency of %lu Hz.\n", ACPI::hpet->number, hz);
+            NUtil::printf("[arch/x86_64/hpet]: HPET%lu has a frequency of %lu Hz.\n", ACPI::hpet->number, hz);
             assert(hz, "Failed to calculate HPET timer frequency.\n");
 
             // Initialisation:
@@ -76,7 +76,7 @@ namespace NArch {
 
             write(GENERALCONF, 1); // Enable CNF bit. Overall enable!
 
-            NUtil::printf("[hpet]: HPET%lu initialised.\n", ACPI::hpet->number);
+            NUtil::printf("[arch/x86_64/hpet]: HPET%lu initialised.\n", ACPI::hpet->number);
             // Counter is working by now.
             // We may query the timer ticks with read(MAINCOUNTER).
         }

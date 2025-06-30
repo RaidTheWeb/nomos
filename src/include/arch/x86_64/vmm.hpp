@@ -26,8 +26,7 @@ namespace NArch {
     static inline void swaptopml4(uintptr_t table) {
         // Includes TLB flush logic.
 
-        uint64_t cr3;
-        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        asm volatile("lfence" : : : "memory");
         asm volatile("mov %0, %%cr3" : : "r"(table));
         asm volatile("lfence" : : : "memory");
     }
@@ -123,7 +122,7 @@ namespace NArch {
 
             size_t ref;
 
-            MCSSpinlock lock; // Queued spinlocking, to prevent race conditions on page table modifications. XXX: Fast enough to consider normal spinlocking?
+            Spinlock lock; // Queued spinlocking, to prevent race conditions on page table modifications. XXX: Fast enough to consider normal spinlocking?
         };
 
         // (Unlocked) Resolve physical address of a virtual address.
@@ -153,45 +152,45 @@ namespace NArch {
 
         // Resolve physical address of virtual address.
         static uintptr_t virt2phys(struct addrspace *space, uintptr_t virt) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             return _virt2phys(space, virt);
         }
 
         // Resolve page table entry of a virtual address.
         static uint64_t *resolvepte(struct addrspace *space, uintptr_t virt) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             return _resolvepte(space, virt);
         }
 
         // Map a virtual address with an entry.
         static bool mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             return _mappage(space, virt, phys, flags);
         }
 
         static bool remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             return _remappage(space, virt, newphys, flags);
         }
 
         // Unmap a virtual address.
         static void unmappage(struct addrspace *space, uintptr_t virt) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             _unmappage(space, virt);
         }
 
         static bool maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             return _maprange(space, virt, phys, flags, size);
         }
 
         static bool remaprange(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags, size_t size) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             return _remaprange(space, virt, newphys, flags, size);
         }
 
         static void unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
-            NLib::ScopeMCSSpinlock guard(&space->lock);
+            NLib::ScopeSpinlock guard(&space->lock);
             _unmaprange(space, virt, size);
         }
 

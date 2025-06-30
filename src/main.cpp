@@ -26,10 +26,6 @@ static void hcf(void) {
     }
 }
 
-namespace NMem {
-    bool sanitisefreed = false;
-}
-
 // These operators must be defined here, or else they won't apply everywhere.
 
 void *operator new(size_t size) {
@@ -64,21 +60,16 @@ void operator delete[](void *ptr, size_t size) {
 }
 
 extern "C" uint64_t syscall_test(void) {
-    // *ptr = value; // Fill a pointer with a value.
     NUtil::printf("hey, it's me: syscall.\n");
     return 0;
 }
 
 // Called within the architecture-specific initialisation thread. Stage 1 (early).
 void kinit1(void) {
-    // Command line argument enables memory sanitisation upon slab allocator free. Helps highlight memory management issues, and protect against freed memory inspection.
-    if (NArch::cmdline.get("mmsan")) {
-        NMem::sanitisefreed = true;
-    }
-
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC) {
             NUtil::printf("Discovered driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
+            entry->create();
         }
     }
 }

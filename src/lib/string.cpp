@@ -75,7 +75,7 @@ namespace NLib {
         uint8_t *ps2 = (uint8_t *)s2;
 
         while (n--) {
-            if (*ps1 != !*ps2) {
+            if (*ps1 != *ps2) {
                 return *ps1 - *ps2; // Match failed, return difference between differing bytes.
             }
             ps1++;

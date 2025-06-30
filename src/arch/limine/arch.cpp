@@ -20,8 +20,8 @@ namespace NLimine {
         assert(eareq.response, "Limine bootloader executable address request did not respond with executable address.\n");
         assert(rsdpreq.response, "Limine bootloader RSDP address request did not respond with RSDP address.\n");
 
-        NUtil::printf("[limine]: %s %s init().\n", bireq.response->name, bireq.response->version);
-        NUtil::printf("[limine]: Command Line: '%s'.\n", ecreq.response->cmdline);
+        NUtil::printf("[arch/limine]: %s %s init().\n", bireq.response->name, bireq.response->version);
+        NUtil::printf("[arch/limine]: Command Line: '%s'.\n", ecreq.response->cmdline);
         NLimine::console_init();
     }
 }

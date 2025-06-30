@@ -38,9 +38,9 @@ namespace NSched {
 
         public:
             struct node {
-                uintptr_t parent; // Parent + Colour.
-                struct node *left;
-                struct node *right;
+                uintptr_t parent = 0; // Parent + Colour.
+                struct node *left = NULL;
+                struct node *right = NULL;
                 uint8_t pad[64 - (sizeof(uintptr_t) + (sizeof(struct node *) * 2))]; // Cache alignment. We *could* have used __attribute__((aligned(64))) here, but then aligned new would have to be implemented.
 
                 struct node *getparent(void) {
@@ -140,7 +140,6 @@ namespace NSched {
         private:
         public:
             struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space.
-            struct NArch::VMM::pagetable *table = NULL; // Kernel + User page table.
             bool kernel = false;
             size_t id; // Process ID.
 

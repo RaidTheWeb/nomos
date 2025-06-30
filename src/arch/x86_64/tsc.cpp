@@ -1,3 +1,4 @@
+#include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/hpet.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/tsc.hpp>
@@ -25,26 +26,29 @@ namespace NArch {
 
             assert(supported & (1 << 4), "Host CPU does NOT support RDTSC instruction.\n");
 
-            if (ACPI::hpet != NULL) {
-                NUtil::printf("[tsc]: Calibrating TSC on CPU%lu with HPET.\n", CPU::get()->id);
+            if (ACPI::hpet != NULL && !cmdline.get("nohpet")) {
+                NUtil::printf("[arch/x86_64/tsc]: Calibrating TSC on CPU%lu with HPET.\n", CPU::get()->id);
                 hz = HPET::calibratetsc();
             } else {
-                NUtil::printf("[tsc]: Calibrating TSC on CPU%lu with PIT.\n", CPU::get()->id);
+                NUtil::printf("[arch/x86_64/tsc]: Calibrating TSC on CPU%lu with PIT.\n", CPU::get()->id);
 
-                outb(0x43, 0x30); // Mode 0, binary counter.
-                uint16_t count = 1193182 / 200000; // Same 200ms calibration time.
+                outb(0x43, 0x34);
+                uint16_t count = 1193182 / 20; // Same 200ms calibration time.
                 outb(0x40, count & 0xff);
                 outb(0x40, (count >> 8) & 0xff);
 
-                asm volatile("nop; nop; nop; nop;"); // Pad with NOPs to give the PIT some time to start up.
+                // Incur 200~ cycle wait using CPUID instruction.
+                asm volatile ("cpuid" : : : "rax", "rbx", "rcx", "rdx");
+
+                while (!(inb(0x61) & 0x20)); // Wait until PIT starts counting.
 
                 uint64_t start = TSC::query();
-                while (!(inb(0x61) & 0x20)); // Wait until PIT signals it has reached zero.
+                while ((inb(0x61) & 0x20)); // Wait until PIT signals wrap around.
 
                 uint64_t end = TSC::query();
-                hz = (end - start) * 200000; // We have calibrated.
+                hz = (end - start) * 20; // We have calibrated.
             }
-            NUtil::printf("[tsc]: TSC on CPU%lu calibrated to %lu Hz.\n", CPU::get()->id, hz);
+            NUtil::printf("[arch/x86_64/tsc]: TSC on CPU%lu calibrated to %lu Hz.\n", CPU::get()->id, hz);
         }
     }
 }

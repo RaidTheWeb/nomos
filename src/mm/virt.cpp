@@ -356,7 +356,7 @@ namespace NMem {
         void *VMASpace::reserve(uintptr_t start, uintptr_t end, uint8_t flags) {
             // Find the node that contains this region.
             struct vmanode *node = this->containing(this->root, start, end);
-
+            assertarg(node, "No VMA node exists to contain %p->%p.\n", start, end);
 
             // Identical logic to alloc(), but we utilise the containing node instead of a found suitable node. This will still create holes for free allocation spaces, around the reserved regions.
 

@@ -5,7 +5,7 @@ isr_%1:
     push rbp ; Save
 
     mov rbp, %1 ; Put vector here for later.
-    jmp isr_common ; Common handler.
+    jmp isr_common
 %endmacro
 
 %macro ISR_ERROR 1
@@ -16,10 +16,9 @@ isr_%1:
 %endmacro
 
 extern isr_handle
-extern trampoline
 
 ; Define stub labels:
-section .trampoline.isrstub
+
 %assign i 0
 %rep 256 ; Repeat for entirety of ISR table.
 
@@ -32,19 +31,20 @@ section .trampoline.isrstub
 %assign i i + 1
 %endrep
 
-section .trampoline.text
 ; Generic Handler
 isr_common:
-    cmp qword [rsp + 24], 0x23 ; Are we in the user code segment?
-    jne .kentry ; Interrupt was triggered during kernel code, no need to swap GS.
+    test qword [rsp + 24], 0x3 ; Are we in the user code segment?
+    jz .kentry ; Interrupt was triggered during kernel code, no need to swap GS.
 
     push rax
 
-    mov rax, [gs:0x0] ; Swap to kernel CR3.
+
+    swapgs
+    lfence
+    mov rax, [gs:0x18] ; Swap to kernel CR3.
+
     mov cr3, rax
     lfence
-
-    swapgs ; Swap to kernel GS.
 
     pop rax
 
@@ -132,21 +132,10 @@ isr_common:
     ; Skip error code. Ditto.
     add rsp, 8
 
-    cmp qword [rsp + 8], 0x23 ; Are we within the user code segment?
-    jne .ret ; We're context switching within the kernel. Remain with current GS.
-
-    ; mov [gs:0x8], rsp ; Store RSP.
-    ; mov rsp, [gs:0x18] ; Load user local stack.
+    test qword [rsp + 8], 0x3 ; Are we within the user code segment?
+    jz .ret ; We're context switching within the kernel. Remain with current GS.
 
     push rax
-    ; mov rax, [gs:0x8] ; Restore old RSP, so we can copy over the context to the scratch stack.
-
-    ; Push IRETQ frame to scratch stack.
-    ; push qword [rax] ; RIP
-    ; push qword [rax + 8] ; CS
-    ; push qword [rax + 16] ; RFLAGS
-    ; push qword [rax + 24] ; RSP
-    ; push qword [rax + 32] ; SS
 
     ; Now we can use RAX again.
     ; Prepare for page table swap back, post-syscall.
@@ -155,12 +144,13 @@ isr_common:
     mov rax, [rax] ; Load address space pointer.
     mov rax, [rax + 8] ; Load physical PML4 of current thread into temp.
 
-    swapgs
+    lfence
     mov cr3, rax
     lfence
 
+    swapgs
+
     pop rax
-    ; jmp [trampoline]
 .ret: ; If this is a kernel thread, we're already in the kernel CR3, no work.
     o64 iret ; Go back to where we were before being interrupted.
 

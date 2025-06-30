@@ -54,18 +54,6 @@ SECTIONS
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     _data_end = .;
 
-    .trampoline : { /* Page mapping isolation trampoline section. */
-        __trampoline_start = .;
-        KEEP(*(.trampoline.entry)) /* Context switch trampoline entry should be placed first (it HAS to be referred to by a direct address). */
-        KEEP(*(.trampoline.isrstub))
-
-        KEEP(*(.trampoline.text .trampoline.text.*))
-        . = ALIGN(CONSTANT(MAXPAGESIZE));
-        KEEP(*(.trampoline.data .trampoline.data.*))
-        __trampoline_end = .;
-    }
-    . = ALIGN(CONSTANT(MAXPAGESIZE)); /* Page Align. We don't want to be leaking part of rodata into this section. */
-
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)

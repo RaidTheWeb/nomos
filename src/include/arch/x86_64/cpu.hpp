@@ -56,25 +56,17 @@ namespace NArch {
         static const uint32_t MSRGSBASE     = 0xc0000101; // GS.
         static const uint32_t MSRKGSBASE    = 0xc0000102; // Kernel GS.
 
-        // Userspace per-CPU local. Mapped into read-only trampoline pages.
-        struct ulocal {
-            uintptr_t kcr3; // Kernel CR3.
-            uintptr_t stacktop;
-            uint64_t gdt[7];
-            struct ist ist;
-            struct Interrupts::idtentry idt[256]; // XXX: Consider one IDT, the only per-CPU part needs to be the ISR table.
-            uint8_t stack[PAGESIZE]; // Temporary stack for usage during context switches.
-        } __attribute__((aligned(64))); // Cache-aligned.
-
         struct cpulocal {
             // Place current thread pointer at the start of the CPU struct, so the offset is easier within the system call assembly.
             NSched::Thread *currthread = NULL; // Currently running thread, if any.
             uint64_t raxtemp; // Temporary location for use by syscall assembly to store RAX.
             uint64_t cr3temp; // Temporary location for use by syscall assembly to store CR3 for context restore.
-            uintptr_t ulocalstack; // Reference to the top of the user local stack.
+            uintptr_t kcr3; // Kernel CR3.
+            uintptr_t schedstacktop;
             uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU to use during interrupts (when we shouldn't be using a stack that has ANYTHING to do with a thread).
 
-            struct VMM::pagetable *kpt; // Kernel page table instance -> simply aliases the pages from the "core" page table.
+            struct VMM::pagetable *syspt; // Kernel page table instance -> simply aliases the pages from the "core" page table. Used for system calls (combines kernel and user mappings before context switch).
+            struct VMM::pagetable *kpt; // Kernel page table instance. Used for kernel threads, should NEVER contain userspace entries.
 
             NSched::Thread *idlethread = NULL; // Fallback idle thread, for when trere's no work.
             uint64_t lastschedts; // For runtime delta calculations.

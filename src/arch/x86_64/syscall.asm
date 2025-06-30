@@ -8,46 +8,27 @@ syscall_table:
     dq syscall_test
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
-section .trampoline.text
+
+section .text
 global syscall_entry
 syscall_entry:
-
-    push rax ; Temporarily store RAX so we can use it for page map setting.
-
-    ; Swap to kernel + user page table map.
-    mov rax, [gs:0x0] ; CR3 is here within the User Local per-CPU data.
-    mov cr3, rax ; Swap to kernel pagemap.
-    lfence ; Speculatation issue mitigation.
-
-    pop rax ; Restore RAX.
-
     swapgs ; Swap GS, because we need the kernel's view on the GS base.
 
     mov [gs:0x8], rax ; Save RAX into temp. Yay!
 
-    mov rax, [gs:0x0] ; Current thread pointer is at offset 0.
-    mov rax, [rax + 0] ; Load address of stack top into RAX. It's also at offset 0 in thread pointer, so we don't need anything else.
+    mov rax, qword [gs:0x0] ; Current thread pointer is at offset 0.
+    mov rax, qword [rax + 0] ; Load address of stack top into RAX. It's also at offset 0 in thread pointer, so we don't need anything else.
     xchg rsp, rax ; Swap RAX into RSP, so we're now using the kernel stack, and the user stack sits in the thread's stack top. It'll be swapped back when we exit the system call.
 
     ; RAX now contains the user stack, and RSP contains the kernel stack.
 
-    push qword 0x1b ; User SS.
     push rax ; User RSP. Dump here, so that on exit, we can restore the user stack.
-    mov rax, [gs:0x8]  ; Restore original RAX (containing system call number).
     push r11 ; RFLAGS (stored in r11).
-    push qword 0x23 ; User CS.
     push rcx ; User RIP.
 
+    mov rax, [gs:0x8] ; Restore original RAX (containing system call number).
     ; Save original register state, so we can use later.
     push rax ; System call number (for indexing into table). (96)
-
-    ; Now we can use RAX again.
-    ; Prepare for page table swap back, post-syscall.
-    mov rax, [gs:0x0] ; Load current thread pointer.
-    mov rax, [rax + 8] ; Load current process pointer.
-    mov rax, [rax] ; Load address space pointer.
-    mov rax, [rax + 8] ; Load physical PML4 of current thread into temp.
-    mov [gs:0x10], rax ; Store into CR3 temp portion of CPU Local.
 
     push rdi ; (88)
     push rsi ; (80)
@@ -110,26 +91,18 @@ syscall_entry:
     pop rdi
     pop rax
 
-    mov rcx, [rsp + 24] ; Grab user RSP.
+    mov rcx, [rsp + 16] ; Grab user RSP.
     xchg rsp, rcx ; Swap back to user stack. RCX now contains the kernel stack
 
     ; Push frame for transition across to userspace.
-    push qword [rcx + 24] ; System call stack (old state).
-    push qword [rcx + 16] ; RFLAGS
-    push qword [rcx + 8] ; CS
+    push qword [rcx + 16] ; System call stack (old state).
+    push qword [rcx + 8] ; RFLAGS
     push qword [rcx] ; RIP
 
-    ; Swap back to user page map.
-    ; We can use RCX here, because we'll be popping its new value off the stack anyway.
-    mov rcx, [gs:0x10] ; Load user CR3 from temporary location.
-
     swapgs ; Swap back to user GS.
-    mov cr3, rcx
-    lfence
 
     ; Pop frame off of user stack.
     pop rcx ; RIP
-    add rsp, 8 ; Skip code segment.
     pop r11 ; Restore RFLAGS.
     pop rsp ; Restore stack.
 

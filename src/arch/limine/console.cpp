@@ -38,7 +38,7 @@ namespace NLimine {
             console_write(backbuffer, backbufferidx);
         }
 
-        NUtil::printf("[limine]: Flanterm initialised.\n");
+        NUtil::printf("[arch/limine/console]: Flanterm initialised.\n");
     }
 
 }

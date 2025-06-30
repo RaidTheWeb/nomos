@@ -38,14 +38,14 @@ namespace NArch {
             // Size of the largest area of free memory.
             size_t largestsize = 0;
 
-            NUtil::printf("[pmm]: Initialising using 4KiB pages.\n");
+            NUtil::printf("[arch/x86_64/pmm]: Initialising using 4KiB pages.\n");
             for (size_t i = 0; i < NLimine::mmreq.response->entry_count; i++) {
                 struct limine_memmap_entry *entry = NLimine::mmreq.response->entries[i];
                 if (entry->length == 0) {
                     continue; // Skip empty entries.
                 }
 
-                NUtil::printf("[pmm]: Memory map entry: 0x%016lx->0x%016lx, length %lu, type %s.\n", entry->base, entry->base + entry->length, entry->length, maptype[entry->type]);
+                NUtil::printf("[arch/x86_64/pmm]: Memory map entry: 0x%016lx->0x%016lx, length %lu, type %s.\n", entry->base, entry->base + entry->length, entry->length, maptype[entry->type]);
 
                 switch (entry->type) {
                     case LIMINE_MEMMAP_USABLE: // Free! We can use this!
@@ -63,8 +63,8 @@ namespace NArch {
                 }
             }
 
-            NUtil::printf("[pmm]: Usable Pages: %lu (%luMiB).\n", usablepages, (usablepages * PAGESIZE) / 1024 / 1024);
-            NUtil::printf("[pmm]: Using largest region of usable memory: size %luMiB, at 0x%016lx.\n", (largestsize) / 1024 / 1024, largestaddr);
+            NUtil::printf("[arch/x86_64/pmm]: Usable Pages: %lu (%luMiB).\n", usablepages, (usablepages * PAGESIZE) / 1024 / 1024);
+            NUtil::printf("[arch/x86_64/pmm]: Using largest region of usable memory: size %luMiB, at 0x%016lx.\n", (largestsize) / 1024 / 1024, largestaddr);
 
             // Align to block size.
             largestaddr = (largestaddr + (SMALLESTBLOCK - 1)) & ~(SMALLESTBLOCK - 1);
@@ -79,7 +79,7 @@ namespace NArch {
                 zone.freelist[i] = NULL;
             }
 
-            NUtil::printf("[pmm]: Initialising buddy allocator...\n");
+            NUtil::printf("[arch/x86_64/pmm]: Initialising buddy allocator...\n");
 
             // Shove the *entire* region into the top level freelist.
 
@@ -106,7 +106,7 @@ namespace NArch {
                 i++; // Increment counter.
                 size -= biggestblock; // Decrement available size by block size.
             }
-            NUtil::printf("[pmm]: Buddy allocator initialised.\n");
+            NUtil::printf("[arch/x86_64/pmm]: Buddy allocator initialised.\n");
 
             // Sanity check:
             // If we allocate, and then immediately free, the next allocation of the same size should be the same pointer (free list logic).
@@ -116,9 +116,9 @@ namespace NArch {
             free(test2);
             assertarg(test1 == test2, "Buddy allocator does not return last freed (0x%016x != 0x%016x).\n", test1, test2);
 
-            NUtil::printf("[pmm]: Buddy allocator self-test passed.\n");
+            NUtil::printf("[arch/x86_64/pmm]: Buddy allocator self-test passed.\n");
 
-            NUtil::printf("[pmm]: PMM initialised.\n");
+            NUtil::printf("[arch/x86_64/pmm]: PMM initialised.\n");
         }
 
         void *alloc(size_t size) {
@@ -144,7 +144,7 @@ namespace NArch {
             }
 
             if (found == ALLOCLEVEL) { // If we have actually reached the maximum allocation level, then we couldn't find anything.
-                NUtil::printf("[pmm]: Buddy allocator OOM when trying to find for size %lu.\n", size);
+                NUtil::printf("[arch/x86_64/pmm]: Buddy allocator OOM when trying to find for size %lu.\n", size);
                 return NULL; // OOM.
             }
 

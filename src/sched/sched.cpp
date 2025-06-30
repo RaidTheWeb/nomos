@@ -1,6 +1,5 @@
 #ifdef __x86_64__
 #include <arch/x86_64/cpu.hpp>
-#include <arch/x86_64/kpti.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
 #endif
@@ -40,104 +39,7 @@ namespace NSched {
         __atomic_add_fetch(&this->nodecount, 1, memory_order_seq_cst);
     }
 
-/*
-    struct RBTree::node *RBTree::_sibling(struct node *node) {
-        if (!node->getparent()) {
-            return NULL;
-        }
-
-        if (node->getparent()->left == node) {
-            return node->getparent()->right;
-        }
-        return node->getparent()->left;
-    }
-
     void RBTree::_erase(struct node *node) {
-        struct node *successor = NULL;
-
-        if (node->left && node->right) {
-            successor = this->_next(node->right);
-        }
-
-        if (!node->left && !node->right) {
-            successor =  NULL;
-        }
-
-        if (node->left) {
-            successor = node->left;
-        } else {
-            successor = node->right;
-        }
-
-        bool bothblack = ((!successor || successor->getcolour() == colour::BLACK) && (node->getcolour() == colour::BLACK));
-
-        struct node *parent = node->getparent();
-
-        if (!successor) {
-            if (node == this->root) {
-                this->root = NULL;
-            } else {
-                if (bothblack) {
-                    this->fixblackblack(node);
-                } else {
-                    if (this->_sibling(node)) {
-                        this->_sibling(node)->packcolour(colour::RED);
-                    }
-                }
-
-                // Unreference whatever side on the parent.
-                if (node->getparent()->left == node) {
-                    node->getparent()->left = NULL;
-                } else {
-                    node->getparent()->right = NULL;
-                }
-            }
-            // Decrement cached count.
-            __atomic_sub_fetch(&this->nodecount, 1, memory_order_seq_cst);
-            return;
-        }
-
-        if (!node->left || !node->right) {
-            if (node == this->root) {
-                // Update successor, override reference.
-                *(node == node->getparent()->left ? &node->getparent()->left : &node->getparent()->right) = successor;
-                node->left = NULL;
-                node->right = NULL;
-            } else {
-                if (node->getparent()->left == node) {
-                    node->getparent()->left = successor;
-                } else {
-                    node->getparent()->right = successor;
-                }
-
-                successor->packparent(node->getparent());
-
-                if (bothblack) {
-                    this->fixblackblack(successor);
-                } else {
-                    successor->packcolour(colour::BLACK);
-                }
-            }
-            // Decrement cached count.
-            __atomic_sub_fetch(&this->nodecount, 1, memory_order_seq_cst);
-            return;
-        }
-
-        struct node *old = successor;
-        *(successor == successor->getparent()->left ? &successor->getparent()->left : &successor->getparent()->right) = node;
-        *(node == node->getparent()->left ? &node->getparent()->left : &node->getparent()->right) = old;
-
-
-        this->_erase(successor);
-
-decrement:
-        // Decrement cached count.
-        __atomic_sub_fetch(&this->nodecount, 1, memory_order_seq_cst);
-    }
-*/
-
-    void RBTree::_erase(struct node *node) {
-
         struct node *child = NULL;
         struct node *parent = NULL;
 
@@ -247,7 +149,7 @@ decrement:
         } else if (y == y->getparent()->right) { // We are the right path of the parent.
             y->getparent()->right = x;
         } else {
-            y->getparent()->left = y;
+            y->getparent()->left = x;
         }
 
         x->right = y;
@@ -517,16 +419,16 @@ decrement:
     }
 
     Thread *nextthread(void) {
-        struct RBTree::node *node = CPU::get()->runqueue.first(); // Get the node with the least virtual runtime (this could mean *either* that it has higher priority, or just hasn't run for very long yet).
+        struct RBTree::node *node = CPU::get()->runqueue._first(); // Get the node with the least virtual runtime (this could mean *either* that it has higher priority, or just hasn't run for very long yet).
         if (node) {
-            return RBTree::getentry<Thread>(node);
+            CPU::get()->runqueue._erase(node); // Remove first.
+            return RBTree::getentry<Thread>(node); // Then return the entry.
         }
 
         return steal(); // We have no work, try to steal something from another CPU.
     }
 
-
-    void switchthread(Thread *thread) {
+    void switchthread(Thread *thread, bool needswap) {
 
         Thread *prev = CPU::get()->currthread;
 
@@ -534,18 +436,15 @@ decrement:
 
         assert(prev, "Previous thread before context switch should *never* be NULL.\n");
 
-        if (!thread->process->kernel) {
-            VMM::enterucontext(CPU::get()->kpt, thread->process->addrspace);
+        if (needswap) {
+            swaptopml4(thread->process->addrspace->pml4phy);
         }
-
 
 #ifdef __x86_64__
         CPU::get()->intstatus = thread->ctx.rflags & 0x200; // Restore the interrupt status of the thread.
         CPU::get()->ist.rsp0 = (uint64_t)thread->stacktop;
-        struct CPU::ulocal *ulocal = &KPTI::ulocals[CPU::get()->id];
-        ulocal->ist.rsp0 = (uint64_t)thread->stacktop; // Point to top of stack, this is for the TSS. This points to the stack made for interrupt work in the kernel (and initial entrance into interrupts from userspace).
 #endif
-        thread->tstate = Thread::state::RUNNING; // Set state.
+        __atomic_store_n(&thread->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
 
 
         CPU::ctx_swap(&thread->ctx); // Restore context.
@@ -556,6 +455,7 @@ decrement:
     // Scheduler interrupt entry, handles save.
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
+        // NLimine::console_write("schedule()", 11);
 
         APIC::lapicstop(); // Prevent double schedule by stopping any running timer.
 
@@ -579,21 +479,30 @@ decrement:
         updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
 
         // Load Balance on an interval:
-        if (curintr % 4) { // Every fourth schedule interrupt:
+        if (!(curintr % 4)) { // Every fourth schedule interrupt:
             loadbalance(cpu);
         }
 
         Thread *prev = cpu->currthread; // Currently running thread.
         Thread *next = NULL; // What we're planning to schedule next.
 
-        if (prev->tstate == Thread::state::RUNNING && prev != cpu->idlethread) { // Thread is still "runnable", and it's not the idle thread (WE NEVER WANT TO SCHEDULE THE IDLE THREAD.)
+        {
+            NLib::ScopeSpinlock guard(&cpu->runqueue.lock); // Lock run queue, so we can gather and remove the next thread.
+            if (prev != cpu->idlethread) {
+                if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::RUNNING) { // Thread is still "runnable".
 
-            prev->tstate = Thread::state::SUSPENDED; // Dumped back into running queue.
-            cpu->runqueue.insert(&prev->node, vruntimecmp); // Shove it back onto the run queue for this CPU. It'll be ran later.
+                    __atomic_store_n(&prev->tstate, Thread::state::SUSPENDED, memory_order_release);
+                    cpu->runqueue._insert(&prev->node, vruntimecmp); // Shove it back onto the run queue for this CPU. It'll be ran later.
+                }
+            }
+
+            next = nextthread(); // Get the next task to schedule. It'll return NULL if we have nothing to do.
+            assert(next != cpu->idlethread, "Next thread should NEVER be the idle thread (it is not supposed to be in the run queue).\n");
+
+            if (prev != next && prev != cpu->idlethread) {
+                prev->savectx(ctx); // Use the interrupt context to override the save state of the previous thread.
+            }
         }
-
-        next = nextthread(); // Get the next task to schedule. It'll return NULL if we have nothing to do.
-        assert(next != cpu->idlethread, "Next thread should NEVER be the idle thread (it is not supposed to be in the run queue).\n");
 
         if (!next) {
             next = cpu->idlethread; // We have NO work, and can't steal ANY others. Default to idle thread until next schedule().
@@ -603,29 +512,25 @@ decrement:
         next->cid = cpu->id; // Update new thread's current CPU ID.
 
         if (prev != next) { // We need to context switch.
-            prev->savectx(ctx); // Use the interrupt context to override the save state of the previous thread.
-
-            if (prev->tstate == Thread::state::DEAD) {
-                delete prev; // Destroy old thread. XXX: Defer?
+            bool needswap = prev->process->addrspace != next->process->addrspace;
+            if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::DEAD) {
+                // delete prev; // Destroy old thread. XXX: Defer?
             }
 
-            cpu->runqueue.erase(&next->node); // Remove what we're scheduling from the run queue, so that it doesn't get load balanced onto something else (which can happen, if it's the only node in the run queue and last() is called), or stolen by another CPU.
-
-
             APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
-            switchthread(next); // Swap to context.
+
+            switchthread(next, needswap); // Swap to context.
         }
 
-        cpu->runqueue.erase(&next->node);
-        next->tstate = Thread::state::RUNNING;
+        __atomic_store_n(&next->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
+
 
         // We haven't changed anything. We were just given our old thread, this happens most commonly when running the idle thread.
         // It'd be a waste to attempt to context switch when we're working on the same code.
 
-        cpu->setint(true); // Simply just restore initial interrupt state, and move on with our lives.
+        // cpu->setint(true); // Simply just restore initial interrupt state, and move on with our lives.
 
         APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
-        // XXX: Consider: With userspace, we'd still have to make sure to restore the userspace context as we move back into ring 3.
 
         // If it's the same thread, we'll just be dumped right back to where we are.
     }
@@ -669,7 +574,7 @@ decrement:
     void exit(void) {
         // Thread exit.
 
-        CPU::get()->currthread->tstate = Thread::state::DEAD; // Kill ourselves. We will NOT be rescheduled.
+        __atomic_store_n(&CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release); // Kill ourselves. We will NOT be rescheduled.
 
         yield(); // Yield back to scheduler, so the thread never gets rescheduled.
         assert(false, "Exiting thread was rescheduled!");
@@ -679,24 +584,18 @@ decrement:
         this->process = proc;
 
         // Initialise stack within HHDM, from page allocated memory. Stacks need to be unique for each thread.
-        if (this->process->kernel) {
-            this->stack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(stacksize) + stacksize));
-            assert(this->stack, "Failed to allocate thread stack.\n");
+        this->stack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(stacksize)));
+        assert(this->stack, "Failed to allocate thread stack.\n");
 
-            this->stacktop = (uint8_t *)((uintptr_t)this->stack + stacksize); // Determine stack top.
-        } else {
-            this->stack = (uint8_t *)((uintptr_t)PMM::alloc(stacksize) + stacksize);
-            assert(this->stack, "Failed to allocate thread stack.\n");
-
-            uintptr_t virt = (uintptr_t)this->process->addrspace->vmaspace->alloc(stacksize, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
-            this->stacktop = (uint8_t *)((uintptr_t)virt + stacksize); // Determine stack top.
-            VMM::maprange(this->process->addrspace, virt, (uintptr_t)this->stack, VMM::PRESENT | VMM::WRITEABLE | VMM::USER, stacksize);
-        }
+        this->stacktop = (uint8_t *)((uintptr_t)this->stack + stacksize); // Determine stack top.
 
         this->stacksize = stacksize;
 
         // Allocate thread ID.
         this->id = __atomic_add_fetch(&pidcounter, 1, memory_order_seq_cst);
+
+        // Zero context.
+        NLib::memset(&this->ctx, 0, sizeof(this->ctx));
 
         // Initialise context:
 #ifdef __x86_64__
@@ -740,13 +639,10 @@ decrement:
 
     void entry(void) {
         Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process.
-        idlethread->setaffinity(CPU::get()->id); // Prefer this current CPU. Later target mode settings will enforce this preference.
-        idlethread->settmode(Thread::target::STRICT); // Prevent load balancing migrations.
-        idlethread->setnice(19); // Lowest priority.
-
         CPU::get()->idlethread = idlethread; // Assign to this CPU.
 
-        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(16 * PAGESIZE) + 16 * PAGESIZE)); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
+        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(16 * PAGESIZE))); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
+        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
 
         CPU::get()->currthread = idlethread; // We start as the idle thread, even though we might not actually be running it.
@@ -762,7 +658,12 @@ decrement:
         // Create PID 0 for kernel threading. Uses kernel address space so that the process has access to the entire memory map.
         kprocess = new Process(&VMM::kspace);
 
-        Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process. We need not set any affinity logic, as this thread is never actually *scheduled*, per se.
+        Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process. We need not set any affinity logic, as this thread is never actually *scheduled*.
+
+        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(16 * PAGESIZE))); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
+        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
+        assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
+
 
         CPU::get()->idlethread = idlethread; // Assign to BSP.
         CPU::get()->currthread = idlethread; // We start with the idle thread, even though we may not be using it.

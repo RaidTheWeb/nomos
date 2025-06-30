@@ -37,7 +37,7 @@ namespace NArch {
             while (entry != NULL) { // As long as there are entries to find:
 
                 if (entry->source == irq) { // If this override maps for the IRQ we're trying to set.
-                    NUtil::printf("[apic]: IRQ%lu provides an interrupt source override.\n", irq);
+                    NUtil::printf("[arch/x86_64/apic]: IRQ%lu provides an interrupt source override.\n", irq);
                     polarity = entry->flags & IoApic::INTSOPOLARITY ? // Check against the second bit in the flag (second bit of the offset for this flag).
                         1 : // 0b11 is active low.
                         0; // 0b01 is Should be active high.
@@ -82,10 +82,6 @@ namespace NArch {
             (void)ctx;
 
             assert(false, "NMI Triggered.\n");
-        }
-
-        static void timerint(struct Interrupts::isr *isr, struct CPU::context *ctx) {
-
         }
 
         void lapictimerinit(void) {
@@ -197,13 +193,13 @@ namespace NArch {
 
             // Address where LAPIC registers are mapped into memory (since this is per-processor, it'll end up being mapped for the current unit).
             lapicaddr = CPU::rdmsr(CPU::MSRAPICBASE) & 0xfffff000; // Read in LAPIC base address.
-            NUtil::printf("[apic]: 32-bit LAPIC address: %p.\n", lapicaddr);
+            NUtil::printf("[arch/x86_64/apic]: 32-bit LAPIC address: %p.\n", lapicaddr);
 
             // Obtain address override (if it exists).
             struct acpi_madt_lapic_address_override *addroverride = (struct acpi_madt_lapic_address_override *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_ADDRESS_OVERRIDE, 0);
             if (addroverride != NULL) {
                 lapicaddr = addroverride->address; // If the ACPI tables specify an override for the base address, we should use it instead.
-                NUtil::printf("[apic]: 64-bit LAPIC address override: %p.\n", lapicaddr);
+                NUtil::printf("[arch/x86_64/apic]: 64-bit LAPIC address override: %p.\n", lapicaddr);
             }
 
             // Memory map whatever address we're going to be using, or else it won't let us!
@@ -229,10 +225,10 @@ namespace NArch {
                 ioapics[i].gsitop = ioapic->gsi_base + ((ioapics[i].read(IoApic::IOAPICVER) >> 16) & 0xff) + 1;
 
                 ioapics[i].maskall(); // Mask the entire redirection table.
-                NUtil::printf("[apic]: Masked redirection table in IOAPIC %lu.\n", ioapic->id);
+                NUtil::printf("[arch/x86_64/apic]: Masked redirection table in IOAPIC %lu.\n", ioapic->id);
             }
 
-            NUtil::printf("[apic]: APIC initialised.\n");
+            NUtil::printf("[arch/x86_64/apic]: APIC initialised.\n");
         }
     }
 }
