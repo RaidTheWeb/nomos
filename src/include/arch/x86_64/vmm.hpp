@@ -39,14 +39,6 @@ namespace NArch {
         return (void *)((uintptr_t)ptr - NLimine::hhdmreq.response->offset);
     }
 
-    static inline uintptr_t pagealigndown(uintptr_t addr, size_t size) {
-        return (addr & ~(size - 1));
-    }
-
-    static inline uintptr_t pagealign(uintptr_t addr, size_t size) {
-        return (addr + size - 1) & ~(size - 1);
-    }
-
     // Invalidate an entire range of pages.
     // XXX: Slow! With big ranges, we should just be flushing the entire TLB.
     static inline void invlrange(uintptr_t addr, size_t size) {

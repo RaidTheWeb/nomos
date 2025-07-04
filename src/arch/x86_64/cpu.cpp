@@ -13,7 +13,7 @@ namespace NArch {
         extern "C" void syscall_entry(void);
 
         void init(void) {
-            CPU::get()->kcr3 = (uintptr_t)hhdmsub(CPU::get()->syspt);
+            CPU::get()->kcr3 = VMM::kspace.pml4phy;
             wrmsr(MSRKGSBASE, 0x01);
 
             uint64_t efer = rdmsr(MSREFER);

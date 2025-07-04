@@ -1,6 +1,7 @@
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/vmm.hpp>
+#include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
 #include <util/kprint.hpp>
@@ -127,8 +128,8 @@ namespace NArch {
             bool user = flags & USER; // If flags contain user, we should mark the intermediate pages as user too.
 
             // Align down to base of the page the address exists in.
-            phys = pagealigndown(phys, PAGESIZE);
-            virt = pagealigndown(virt, PAGESIZE);
+            phys = NLib::aligndown(phys, PAGESIZE);
+            virt = NLib::aligndown(virt, PAGESIZE);
 
             // Decode virtual address:
             uint64_t pml4idx = (virt & PML4MASK) >> 39;
@@ -190,10 +191,10 @@ namespace NArch {
         }
 
         bool _maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
-            size_t end = pagealign(virt + size, PAGESIZE); // Align length to page.
+            size_t end = NLib::alignup(virt + size, PAGESIZE); // Align length to page.
             // Align down to base.
-            phys = pagealigndown(phys, PAGESIZE);
-            virt = pagealigndown(virt, PAGESIZE);
+            phys = NLib::aligndown(phys, PAGESIZE);
+            virt = NLib::aligndown(virt, PAGESIZE);
             size = end - virt; // Overwrite size of range to represent page alignmentment.
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
@@ -203,8 +204,8 @@ namespace NArch {
         }
 
         void _unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
-            size_t end = pagealign(virt + size, PAGESIZE); // Align length to page.
-            virt = pagealigndown(virt, PAGESIZE);
+            size_t end = NLib::alignup(virt + size, PAGESIZE); // Align length to page.
+            virt = NLib::aligndown(virt, PAGESIZE);
             size = end - virt;
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
@@ -280,10 +281,7 @@ namespace NArch {
             // Write EFER CPU register into 0xc0000080.
             asm volatile("wrmsr" : : "A"(efer), "c"(CPU::MSREFER));
 
-            // Clone into BSP's syscall kernel map.
-            VMM::clonecontext(&VMM::kspace, &CPU::getbsp()->syspt);
-
-            asm volatile("mov %0, %%cr3" : : "r"((uint64_t)hhdmsub(CPU::getbsp()->syspt)));
+            asm volatile("mov %0, %%cr3" : : "r"((uint64_t)kspace.pml4phy));
             asm volatile("lfence" : : : "memory");
 
             NUtil::printf("[arch/x86_64/vmm]: Successfully swapped to kernel page table.\n");

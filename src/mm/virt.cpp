@@ -5,6 +5,7 @@
 
 #include <mm/slab.hpp>
 #include <mm/virt.hpp>
+#include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <util/kprint.hpp>
 
@@ -100,7 +101,7 @@ namespace NMem {
             }
 
             if (!node->used) { // If this particular node is free, we should be checking if it'll satisfy the requirements for the allocation (this will be called in both the top-level and recursed states).
-                uintptr_t alignedstart = NArch::pagealigndown(node->start, align);
+                uintptr_t alignedstart = NLib::aligndown(node->start, align);
                 uintptr_t end = alignedstart + size;
 
                 if (end <= node->end) { // Ideal node, fits within the region.
@@ -240,7 +241,7 @@ namespace NMem {
             assert(size && NArch::PAGESIZE, "Attempting to allocate zero aligned/zero size VMA region.\n");
 
             uintptr_t allocaddr = 0;
-            size_t alignsize = NArch::pagealign(size, NArch::PAGESIZE);
+            size_t alignsize = NLib::alignup(size, NArch::PAGESIZE);
 
             assert(this->root, "Root is NULL.\n");
 
@@ -390,8 +391,8 @@ namespace NMem {
                 return; // Don't attempt to free zero pointer or zero size.
             }
 
-            uintptr_t start = NArch::pagealigndown((uintptr_t)ptr, NArch::PAGESIZE);
-            uintptr_t end = start + NArch::pagealign(size, NArch::PAGESIZE);
+            uintptr_t start = NLib::aligndown((uintptr_t)ptr, NArch::PAGESIZE);
+            uintptr_t end = start + NLib::alignup(size, NArch::PAGESIZE);
 
             struct vmanode *tofree = NULL;
             struct vmanode *current = this->root;

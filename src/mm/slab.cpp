@@ -53,10 +53,11 @@ namespace NMem {
 
             SubAllocator *sub = &this->slabs[idx];
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
-                void *ptr = ((void *)((uintptr_t)NArch::PMM::alloc(NArch::PAGESIZE) + NLimine::hhdmreq.response->offset)); // Allocate a single page (this works because all slabs are smaller than a page).
+                void *ptr = NArch::PMM::alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
                     return NULL;
                 }
+                ptr = NArch::hhdmoff(ptr);
 
                 // Try to prepare as many slab blocks in this page as we can.
                 uintptr_t current = (uintptr_t)ptr;
@@ -96,11 +97,12 @@ namespace NMem {
         } else {
             // Unable to find slab (too big). Try to allocate this as a page.
 
-            size_t needed = (aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
-            void *ptr = ((void *)((uintptr_t)NArch::PMM::alloc(needed) + NLimine::hhdmreq.response->offset));
+            size_t needed = ((aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE) * NArch::PAGESIZE;
+            void *ptr = NArch::PMM::alloc(needed);
             if (ptr == NULL) {
                 return NULL;
             }
+            ptr = NArch::hhdmoff(ptr);
 
             // Store metadata header at the start of page allocation.
             struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)ptr;

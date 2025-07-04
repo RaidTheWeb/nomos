@@ -7,12 +7,12 @@ namespace NLib {
         uint8_t *psrc = (uint8_t *)src;
 
         // Try to copy big bits of data if possible.
-        // while (n >= sizeof(size_t)) {
-        //     *(size_t *)pdest = *(size_t *)psrc;
-        //     pdest += sizeof(size_t);
-        //     psrc += sizeof(size_t);
-        //     n -= sizeof(size_t);
-        // }
+        while (n >= sizeof(size_t)) {
+            *(size_t *)pdest = *(size_t *)psrc;
+            pdest += sizeof(size_t);
+            psrc += sizeof(size_t);
+            n -= sizeof(size_t);
+        }
 
         // Copy in bytes for the rest.
         while (n--) {
@@ -113,7 +113,9 @@ namespace NLib {
         memcpy(dest, src, n);
 
         // Pad remaining bytes.
-        memset(dest + (len + 1), 0, (n - len));
+        if (n > len) {
+            memset(dest + (len + 1), 0, (n - len));
+        }
         return dest;
     }
 

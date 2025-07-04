@@ -449,7 +449,7 @@ namespace NSched {
 
         CPU::ctx_swap(&thread->ctx); // Restore context.
 
-        // __builtin_unreachable();
+        __builtin_unreachable();
     }
 
     // Scheduler interrupt entry, handles save.
@@ -514,7 +514,7 @@ namespace NSched {
         if (prev != next) { // We need to context switch.
             bool needswap = prev->process->addrspace != next->process->addrspace;
             if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::DEAD) {
-                // delete prev; // Destroy old thread. XXX: Defer?
+                delete prev; // Destroy old thread. XXX: Defer?
             }
 
             APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
@@ -527,8 +527,6 @@ namespace NSched {
 
         // We haven't changed anything. We were just given our old thread, this happens most commonly when running the idle thread.
         // It'd be a waste to attempt to context switch when we're working on the same code.
-
-        // cpu->setint(true); // Simply just restore initial interrupt state, and move on with our lives.
 
         APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
 

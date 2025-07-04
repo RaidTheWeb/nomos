@@ -30,8 +30,17 @@ namespace NArch {
             struct block *freelist[ALLOCLEVEL]; // References to linked list that reference blocks, for each buddy allocation level.
         };
 
-        extern struct zone zone;
-        extern Spinlock buddylock;
+        struct bzone {
+            uintptr_t addr; // Base address for allocation region.
+
+            size_t size; // Size of allocation region.
+            uint8_t *bitmap; // Associated bitmap for this region.
+        };
+
+        struct bheader {
+            uint64_t magic; // Magic for ensuring we're working with an allocation that has actually been made.
+            uint64_t size; // Size of allocation.
+        };
 
         extern size_t alloci;
         void setup(void);

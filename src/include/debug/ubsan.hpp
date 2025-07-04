@@ -63,6 +63,10 @@ namespace NDebug {
             struct sourceloc attrloc;
             int argidx;
         };
+
+        struct unreachable {
+            struct sourceloc loc;
+        };
     }
 }
 

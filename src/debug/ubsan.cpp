@@ -15,7 +15,7 @@ namespace NDebug {
         }
 
         static const char *kinds[] = {
-            "load of",
+            "load",
             "store to",
             "reference binding to",
             "member access within",
@@ -28,13 +28,9 @@ namespace NDebug {
         };
 
         void handleviolation(const char *violation, struct sourceloc *loc) {
-            // char errbuffer[2048];
-            // NUtil::snprintf(errbuffer, sizeof(errbuffer), "UBSan violation (%s) at %s:%d failed:\n", violation, loc->file, loc->line);
-            // NArch::panic(errbuffer);
-            NUtil::printf("UBSan violation (%s) at %s:%d failed:\n", violation, loc->file, loc->line);
-            for (;;) {
-                asm volatile("hlt");
-            }
+            char errbuffer[2048];
+            NUtil::snprintf(errbuffer, sizeof(errbuffer), "UBSan violation (%s) at %s:%d failed:\n", violation, loc->file, loc->line);
+            NArch::panic(errbuffer);
         }
 
         extern "C" void __ubsan_handle_type_mismatch(struct typemismatch *info, uintptr_t ptr) {
@@ -47,6 +43,7 @@ namespace NDebug {
                 NUtil::snprintf(violation, sizeof(violation), "Unaligned memory access");
             } else {
                 NUtil::snprintf(violation, sizeof(violation), "Insufficient size in %s of address %p with insufficient space for %s", kinds[info->kind], (void *)ptr, info->type->name);
+                return;
             }
 
             handleviolation(violation, loc);
@@ -63,6 +60,7 @@ namespace NDebug {
                 NUtil::snprintf(violation, sizeof(violation), "Unaligned memory access");
             } else {
                 NUtil::snprintf(violation, sizeof(violation), "Insufficient size in %s of address %p with insufficient space for %s", kinds[info->kind], (void *)ptr, info->type->name);
+                return;
             }
 
             handleviolation(violation, loc);
@@ -124,6 +122,10 @@ namespace NDebug {
         extern "C" void __ubsan_handle_nonnull_arg(struct nonnullarg *info, intptr_t idx) {
             (void)idx;
             handleviolation("Null argument", &info->loc);
+        }
+
+        extern "C" void __ubsan_handle_builtin_unreachable(struct unreachable *info) {
+            handleviolation("Unreachable reached", &info->loc);
         }
     }
 }

@@ -241,8 +241,6 @@ namespace NArch {
 
         SMP::setup();
 
-        swaptopml4((uintptr_t)hhdmsub((void *)CPU::getbsp()->syspt));
-
         CPU::init(); // Initialise BSP state.
 
         NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)archthreadinit);

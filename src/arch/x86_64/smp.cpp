@@ -5,6 +5,7 @@
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/vmm.hpp>
+#include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
 #include <sched/sched.hpp>
@@ -39,9 +40,7 @@ namespace NArch {
             GDT::reload(); // "Reload" GDT -> Initialise it on this CPU.
             Interrupts::reload(); // "Reload" IDT -> Initialise it on this CPU.
 
-            VMM::clonecontext(&VMM::kspace, &CPU::get()->syspt); // Clone system call page map.
-            swaptopml4((uintptr_t)hhdmsub(CPU::get()->syspt)); // Swap to main kernel map.
-
+            VMM::swapcontext(&VMM::kspace);
 
             // Initialise LAPIC.
             APIC::lapicinit();
@@ -62,12 +61,12 @@ namespace NArch {
             // Interrupts::regisr(0xfd, halt, false);
             struct limine_mp_response *mpresp = NLimine::mpreq.response;
 
-            struct CPU::cpulocal *phycpus = (struct CPU::cpulocal *)PMM::alloc(pagealign(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE)); // We'll never free this.
+            struct CPU::cpulocal *phycpus = (struct CPU::cpulocal *)PMM::alloc(NLib::alignup(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE)); // We'll never free this.
 
             assert(phycpus, "Failed to allocate memory for CPU instances.\n");
 
             phycpus = (struct CPU::cpulocal *)NArch::hhdmoff((void *)phycpus);
-            NLib::memset(phycpus, 0, pagealign(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE));
+            NLib::memset(phycpus, 0, NLib::alignup(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE));
 
             cpulist = new struct CPU::cpulocal *[mpresp->cpu_count]; // Slab allocate for pointers to pointers, this'll be used for looping on every CPU (for stuff like sending IPIs).
             assert(cpulist, "Failed to allocate memory for list of CPU instances.\n");

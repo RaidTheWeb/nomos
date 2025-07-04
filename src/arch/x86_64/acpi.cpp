@@ -1,6 +1,7 @@
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/acpi.hpp>
 #include <arch/x86_64/vmm.hpp>
+#include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
 #include <uacpi/acpi.h>
@@ -28,14 +29,14 @@ void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
     using namespace NArch::VMM;
     using namespace NMem::Virt;
     uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, VIRT_RW | VIRT_NX);
-    NArch::VMM::maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NArch::pagealign(length, NArch::PAGESIZE));
-    size_t offset = phys - NArch::pagealigndown(phys, NArch::PAGESIZE);
+    NArch::VMM::maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NLib::alignup(length, NArch::PAGESIZE));
+    size_t offset = phys - NLib::aligndown(phys, NArch::PAGESIZE);
     return (void *)(virt + offset);
 }
 
 void uacpi_kernel_unmap(void *ptr, uacpi_size length) {
     using namespace NArch::VMM;
-    NArch::VMM::unmaprange(&NArch::VMM::kspace, (uintptr_t)ptr, NArch::pagealign(length, NArch::PAGESIZE));
+    NArch::VMM::unmaprange(&NArch::VMM::kspace, (uintptr_t)ptr, NLib::alignup(length, NArch::PAGESIZE));
     kspace.vmaspace->free(ptr, length);
 }
 

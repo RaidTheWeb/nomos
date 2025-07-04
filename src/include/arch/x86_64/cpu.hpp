@@ -65,9 +65,6 @@ namespace NArch {
             uintptr_t schedstacktop;
             uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU to use during interrupts (when we shouldn't be using a stack that has ANYTHING to do with a thread).
 
-            struct VMM::pagetable *syspt; // Kernel page table instance -> simply aliases the pages from the "core" page table. Used for system calls (combines kernel and user mappings before context switch).
-            struct VMM::pagetable *kpt; // Kernel page table instance. Used for kernel threads, should NEVER contain userspace entries.
-
             NSched::Thread *idlethread = NULL; // Fallback idle thread, for when trere's no work.
             uint64_t lastschedts; // For runtime delta calculations.
 
