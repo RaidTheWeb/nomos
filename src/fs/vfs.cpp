@@ -485,12 +485,12 @@ namespace NFS {
 
             struct stat st = node->getattr();
 
-            if ((flags & O_DIRECTORY) && !S_ISDIR(st.st_mode)) {
+            if ((flags & O_DIRECTORY) && !S_ISDIR(st.st_mode)) { // If we're supposed to open a directory, we'd have to verify that the node is a directory.
                 node->unref();
                 return -ENOTDIR;
             }
 
-            if (!vfs.checkaccess(node, flags, proc->euid, proc->egid)) {
+            if (!vfs.checkaccess(node, flags, proc->euid, proc->egid)) { // Check if current process' effective UID and GID are valid for access the node in this way.
                 node->unref();
                 return -EACCES;
             }
@@ -517,6 +517,8 @@ namespace NFS {
 
         extern "C" uint64_t sys_write(int fd, const void *buf, size_t count) {
             NUtil::printf("sys_write(%d, %p, %lu).\n", fd, buf, count);
+
+
             return count;
         }
 

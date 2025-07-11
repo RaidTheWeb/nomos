@@ -166,7 +166,7 @@ namespace NSys {
 
                     if (phdrs[i].msize > phdrs[i].fsize) {
                         // Fill remaining region of allocation with zeroes.
-                        NLib::memset((void *)((uintptr_t)NArch::hhdmoff(phys) + phdrs[i].fsize), 0, (phdrs[i].msize - phdrs[i].fsize));
+                        NLib::memset((void *)((uintptr_t)NArch::hhdmoff(phys) + phdrs[i].fsize + misalign), 0, (phdrs[i].msize - phdrs[i].fsize));
                     }
                 }
             }
