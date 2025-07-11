@@ -1,5 +1,6 @@
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/pmm.hpp>
+#include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/sync.hpp>
@@ -33,7 +34,7 @@ namespace NArch {
             for (size_t i = 0; i < NLimine::mmreq.response->entry_count; i++) {
                 struct limine_memmap_entry *entry = NLimine::mmreq.response->entries[i];
 
-                NUtil::printf("[arch/x86_64/pmm]: Memory map entry: 0x%016lx->0x%016lx, length %lu, type %s.\n", entry->base, entry->base + entry->length, entry->length, maptype[entry->type]);
+                NUtil::printf("[arch/x86_64/pmm]: Memory map entry: %p->%p, length %lu, type %s.\n", entry->base, entry->base + entry->length, entry->length, maptype[entry->type]);
 
                 if (entry->type == LIMINE_MEMMAP_USABLE) {
                     usable += entry->length;

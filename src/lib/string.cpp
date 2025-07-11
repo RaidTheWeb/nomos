@@ -1,4 +1,5 @@
 #include <lib/string.hpp>
+#include <mm/slab.hpp>
 #include <util/kprint.hpp>
 
 namespace NLib {
@@ -201,4 +202,23 @@ namespace NLib {
 
         return str;
     }
+
+    char *strdup(const char *str) {
+        size_t len = strlen(str);
+        char *dup = new char[len + 1];
+        strncpy(dup, (char *)str, len);
+        dup[len] = '\0';
+        return dup;
+    }
+
+    char *strndup(const char *str, size_t n) {
+        size_t len = strnlen(str, n);
+
+        char *dup = new char[len + 1];
+        strncpy(dup, (char *)str, len);
+        dup[len] = '\0';
+        return dup;
+    }
+
+
 }

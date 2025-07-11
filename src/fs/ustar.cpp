@@ -1,95 +1,24 @@
 #include <fs/ustar.hpp>
 #include <fs/vfs.hpp>
+#include <lib/align.hpp>
 #include <lib/string.hpp>
 #include <util/kprint.hpp>
 
 namespace NFS {
     namespace USTAR {
 
-        ssize_t RAMNode::read(void *buf, size_t count, off_t offset) {
-            assert(buf, "Reading into invalid buffer.\n");
-            assert(count, "Invalid count.\n");
+        int USTARFileSystem::mount(const char *path) {
+            int super = this->RAMFS::RAMFileSystem::mount(path); // Super.
+            if (super != 0) {
+                return super;
+            }
 
             NLib::ScopeSpinlock guard(&this->spin);
 
-            if (offset >= this->attr.st_size) {
-                return 0;
-            }
-            if ((off_t)(offset + count) > this->attr.st_size) {
-                count = this->datasize - offset;
-            }
+            size_t size = this->modinfo.size;
+            uintptr_t loc = this->modinfo.loc;
 
-            NLib::memcpy(buf, this->data + offset, count);
-            return count;
-        }
-
-        ssize_t RAMNode::write(const void *buf, size_t count, off_t offset) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
-            if ((off_t)(offset + count) > this->attr.st_size) {
-                this->attr.st_size = offset + count;
-                this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
-
-                this->data = (uint8_t *)NMem::allocator.realloc(this->data, this->attr.st_size);
-            }
-
-            NLib::memcpy(this->data + offset, (void *)buf, count);
-            return count;
-        }
-
-        VFS::INode *RAMNode::lookup(const char *name) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
-            if (!VFS::S_ISDIR(this->attr.st_mode)) {
-                return NULL; // Non-directories possess no children.
-            }
-
-            RAMNode **node = this->children.find(name);
-            if (node) {
-                (*node)->ref();
-                return (*node);
-            }
-
-            return NULL;
-        }
-
-        bool RAMNode::add(VFS::INode *node) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
-            if (!VFS::S_ISDIR(this->attr.st_mode)) {
-                return false; // Non-directories possess no children.
-            }
-
-            RAMNode *rnode = (RAMNode *)node;
-            this->children.insert(rnode->name, rnode);
-            return true;
-        }
-
-        bool RAMNode::remove(const char *name) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
-            if (!VFS::S_ISDIR(this->attr.st_mode)) {
-                return false; // Non-directories possess no children.
-            }
-
-            return this->children.remove(name);
-        }
-
-        VFS::INode *RAMFileSystem::create(const char *name, struct VFS::stat attr) {
-            attr.st_blksize = 512;
-            return new RAMNode(this, name, attr);
-        }
-
-        void enumerate(struct NArch::Module::modinfo info) {
-
-            size_t size = info.size;
-            uintptr_t loc = info.loc;
-            NUtil::printf("[fs/ustar]: Enumerating USTAR module `%s` at %p with length %lu.\n", info.path, loc, size);
-
-            RAMFileSystem *fs = new RAMFileSystem();
-
-            VFS::VFS vfs;
-            vfs.mount("/", fs);
+            NUtil::printf("[fs/ustar]: Enumerating USTAR module `%s` at %p with length %lu.\n", this->modinfo.path, loc, size);
 
             struct info *current = (struct info *)loc; // First file is at the start of the archive.
             char *longpath = NULL; // Because a long path is set before the actual file is featured (in order), we'll store this between files, so we can set it on the next one (the intended target).
@@ -103,16 +32,15 @@ namespace NFS {
                     longpath = NULL;
                 }
 
-                char nname[101];
-                nname[0] = '/';
-                NLib::strncpy(nname + 1, name, sizeof(current->name));
+                char nname[sizeof(current->name) + 1];
+                NUtil::snprintf(nname, sizeof(current->name) + 1, "%s/%s", path, name);
                 name = nname;
 
                 if (!NLib::strcmp(name, "./")) {
                     continue; // We should skip the "current directory".
                 }
 
-                NUtil::printf("[fs/ustar]: Discovered entry `%s`.\n", name);
+                NUtil::printf("[fs/ustar]: Discovered entry `%s`.\n", VFS::Path(name).construct());
 
                 uint64_t fsize = oct2int(current->size, sizeof(current->size));
                 uint64_t mtime = oct2int(current->mtime, sizeof(current->mtime));
@@ -124,28 +52,44 @@ namespace NFS {
                         struct VFS::stat attr;
                         attr.st_mode = mode | VFS::S_IFREG;
                         attr.st_mtime = mtime;
-                        node = vfs.create(name, attr);
+                        node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
 
                         size_t count = node->write((void *)((uintptr_t)current + 512), fsize, 0);
-                        assert(count, "Failed to write VFS node data.\n");
+                        assert(count == fsize, "Failed to write VFS node data.\n");
                         break;
                     }
                     case type::DIR: {
                         struct VFS::stat attr;
                         attr.st_mode = mode | VFS::S_IFDIR;
                         attr.st_mtime = mtime;
-                        node = vfs.create(name, attr);
+                        node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
                         break;
                     }
+                    case type::SYMLINK: {
+                        struct VFS::stat attr;
+                        attr.st_mode = mode | VFS::S_IFLNK;
+                        attr.st_mtime = mtime;
+                        node = VFS::vfs.create(name, attr);
+                        assert(node, "Failed to allocate VFS node.\n");
+
+                        size_t count = node->write(lname, sizeof(current->linkname), 0);
+                        assert(count, "Failed to write link to VFS node.\n");
+                        NUtil::printf("[fs/ustar]: Entry is a link from `%s` -> `%s`.\n", VFS::Path(name).construct(), lname);
+                        break;
+                    }
                     case type::PATH: {
+                        longpath = (char *)((uintptr_t)current + 512);
+                        longpath[fsize] = '\0';
                         break;
                     }
                 }
 
-                current = (struct info *)((uintptr_t)current + 512 + ((fsize + 512 - 1) & ~(512 - 1)));
+                current = (struct info *)((uintptr_t)current + 512 + NLib::alignup(fsize, 512));
             }
+            return 0;
         }
+
     }
 }

@@ -6,6 +6,7 @@
 #include <arch/x86_64/sync.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
+#include <fs/vfs.hpp>
 #include <util/kmarker.hpp>
 #include <stddef.h>
 
@@ -138,12 +139,32 @@ namespace NSched {
 
     class Process {
         private:
+            void init(struct NArch::VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable);
         public:
             struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space.
             bool kernel = false;
             size_t id; // Process ID.
+            NFS::VFS::FileDescriptorTable *fdtable = NULL;
+            NFS::VFS::INode *cwd = NULL;
+            // Effective UID and GID, manipulated by syscalls.
+            int euid;
+            int egid;
 
-            Process(struct NArch::VMM::addrspace *space);
+            // Saved UID and GID. Used for reversion.
+            int suid;
+            int sgid;
+
+            // Real UID and GID. Who launched the program?
+            int uid;
+            int gid;
+
+            Process(struct NArch::VMM::addrspace *space) {
+                this->init(space, NULL);
+            }
+
+            Process(struct NArch::VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
+                this->init(space, fdtable);
+            }
 
             ~Process(void);
     };

@@ -4,7 +4,9 @@
 #ifdef __x86_64__
 #include <arch/x86_64/sync.hpp>
 #endif
+#include <lib/bitmap.hpp>
 #include <lib/list.hpp>
+#include <lib/sync.hpp>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -52,6 +54,36 @@ namespace NFS {
             X_OK        = 1 // File can be executed.
         };
 
+        static const ssize_t AT_FDCWD = -100; // Special FD for openat that signifies we should use the current working directory.
+
+        enum flags {
+            O_RDONLY    = 0,
+            O_WRONLY    = 1,
+            O_RDWR      = 2,
+
+            O_CREAT     = 0100,
+            O_EXCL      = 0200,
+            O_NOCTTY    = 0400,
+            O_TRUNC     = 01000,
+            O_APPEND    = 02000,
+            O_NONBLOCK  = 04000,
+            O_DSYNC     = 010000,
+            O_ASYNC     = 020000,
+            O_DIRECT    = 040000,
+            O_LARGEFILE = 0100000,
+            O_DIRECTORY = 0200000,
+            O_NOFOLLOW  = 0400000,
+            O_NOATIME   = 01000000,
+            O_CLOEXEC   = 02000000,
+            O_SYNC      = 04010000,
+            O_RSYNC     = 04010000,
+            O_PATH      = 010000000,
+            O_EXEC      = 010000000,
+            O_TMPFILE   = 020000000,
+
+            O_ACCMODE   = (03 | O_PATH)
+        };
+
         constexpr bool S_ISSOCK(uint32_t m) {
             return (m & S_IFMT) == S_IFSOCK;
         }
@@ -97,6 +129,11 @@ namespace NFS {
                 NLib::DoubleList<const char *> components;
                 bool absolute;
             public:
+                // Version to build path from scratch.
+                Path(bool absolute) {
+                    this->absolute = absolute;
+                }
+
                 Path(const char *path) {
                     absolute = path[0] == '/'; // If it starts with /, it's absolute.
                     const char *start = path + (absolute ? 1 : 0);
@@ -108,9 +145,7 @@ namespace NFS {
                         }
 
                         if (end > start) {
-                            char *comp = new char[(end - start) + 1];
-                            NLib::strncpy(comp, (char *)start, end - start);
-                            comp[end - start] = '\0';
+                            char *comp = NLib::strndup(start, end - start);
 
                             if (!NLib::strncmp(comp, ".", end - start)) {
                                 ; // Nothing needs to be done, basically ignored.
@@ -132,12 +167,33 @@ namespace NFS {
                     }
                 }
 
+                ~Path(void) {
+                    this->components.foreach([](const char **data) {
+                        delete *data; // Free memory.
+                    });
+                }
+
                 bool isabsolute(void) {
                     return this->absolute;
                 }
 
+                // Force path to be absolute. Valuable in path concatenation.
+                void setabsolute(void) {
+                    this->absolute = true;
+                }
+
                 NLib::DoubleList<const char *>::Iterator iterator(void) {
                     return this->components.begin();
+                }
+
+                void pushcomponent(const char *comp, bool back = true) {
+                    char *dup = NLib::strdup(comp);
+
+                    if (back) {
+                        this->components.pushback(dup);
+                    } else {
+                        this->components.push(dup);
+                    }
                 }
 
                 const char *construct(void) {
@@ -209,11 +265,12 @@ namespace NFS {
                 IFileSystem *fs;
                 struct stat attr;
                 const char *name;
+                INode *parent = NULL;
             public:
                 INode(IFileSystem *fs, const char *name, struct stat attr) {
                     this->fs = fs;
                     this->attr = attr;
-                    this->name = name;
+                    this->name = NLib::strdup(name);
                 }
 
                 virtual ~INode(void) = default;
@@ -227,6 +284,23 @@ namespace NFS {
                 virtual bool add(INode *node) = 0;
                 // Remove child node by name.
                 virtual bool remove(const char *name) = 0;
+
+                void setparent(INode *parent) {
+                    NLib::ScopeSpinlock guard(&this->spin);
+                    this->parent = parent;
+                }
+
+                INode *getparent(void) {
+                    NLib::ScopeSpinlock guard(&this->spin);
+                    return this->parent;
+                }
+
+                const char *getname(void) {
+                    NLib::ScopeSpinlock guard(&this->spin);
+                    return this->name;
+                }
+
+                virtual INode *resolvesymlink(void) = 0;
 
                 struct stat getattr(void) {
                     NLib::ScopeSpinlock guard(&this->spin);
@@ -246,11 +320,15 @@ namespace NFS {
                 }
         };
 
+        class VFS;
+
         // Generic filesystem interface.
         class IFileSystem {
             protected:
                 INode *root = NULL;
                 NArch::Spinlock spin;
+                VFS *vfs;
+                bool mounted = false;
             public:
                 virtual ~IFileSystem(void) {
                     if (this->root) {
@@ -263,8 +341,12 @@ namespace NFS {
                     return this->root;
                 }
 
-                virtual int mount(void) = 0; // Called upon mount -> Good for initialising nodes.
-                virtual int unmount(void) = 0; // Called upon unmount -> Good for clean up.
+                virtual VFS *getvfs(void) {
+                    return this->vfs;
+                }
+
+                virtual int mount(const char *path) = 0; // Called upon mount -> Good for initialising nodes.
+                virtual int umount(void) = 0; // Called upon unmount -> Good for clean up.
                 virtual int sync(void) = 0; // Called whenever a sync is required.
 
                 // Create a node.
@@ -285,20 +367,103 @@ namespace NFS {
 
                 struct mntpoint *findmount(Path *path);
             public:
-
-                // VFS(void);
-                ~VFS(void);
-
                 // Mount filesystem on path.
                 int mount(const char *path, IFileSystem *fs);
                 // Unmount filesystem on path.
                 int umount(const char *path);
 
+                virtual INode *getroot(void) {
+                    this->root->ref();
+                    return this->root;
+                }
+
+                // Check if UID or GID are allowed to access the node, given the flags.
+                bool checkaccess(INode *node, int flags, uint32_t uid, uint32_t gid);
+
                 // Resolve node by path.
-                INode *resolve(const char *path, INode *relativeto = NULL);
+                INode *resolve(const char *path, INode *relativeto = NULL, bool symlink = true);
 
                 INode *create(const char *path, struct stat attr);
         };
+
+        class FileDescriptor {
+            private:
+                INode *node;
+                size_t offset; // In-file offset.
+                size_t refcount; // Reference count.
+                int flags;
+            public:
+
+                FileDescriptor(INode *node, int flags) {
+                    this->refcount = 1;
+                    this->flags = flags;
+                    this->offset = 0;
+                    this->node = node;
+                    if (this->node) {
+                        this->node->ref();
+                    }
+                }
+
+                ~FileDescriptor(void) {
+                    if (this->node) {
+                        this->node->unref();
+                    }
+                }
+
+                INode *getnode(void) {
+                    this->node->ref();
+                    return this->node;
+                }
+
+                size_t ref(void) {
+                    __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
+                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                }
+
+                size_t getref(void) {
+                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                }
+
+                size_t unref(void) {
+                    __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
+                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                }
+        };
+
+        class FileDescriptorTable {
+            private:
+                static const int MAXFDS = 1024; // Hard limit on the number of FDs a single descriptor table is capable of handling. Upper limit prevents expansion that would cripple the kernel.
+
+                NArch::Spinlock lock;
+                size_t maxfds = 0; // Current maximum number of file descriptors.
+                NLib::Bitmap openfds; // File descriptors currently open.
+                NLib::Bitmap closeonexec; // File descriptors that we should close before using exec().
+                NLib::Vector<FileDescriptor *> fds;
+            public:
+                FileDescriptorTable(void) : openfds(256), closeonexec(256) {
+                    this->fds.resize(256);
+                }
+
+                ~FileDescriptorTable(void) {
+                    this->closeall();
+                }
+
+                int open(INode *node, int flags);
+                int close(int fd);
+
+                int dup(int oldfd);
+                int dup2(int oldfd, int newfd);
+
+                FileDescriptor *get(int fd);
+
+                FileDescriptorTable *fork(void);
+
+                void doexec(void);
+
+                void closeall(void);
+        };
+
+        extern VFS vfs;
     }
 }
 

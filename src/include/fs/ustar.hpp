@@ -5,6 +5,7 @@
 #include <arch/limine/module.hpp>
 #endif
 
+#include <fs/ramfs.hpp>
 #include <fs/vfs.hpp>
 
 namespace NFS {
@@ -41,43 +42,15 @@ namespace NFS {
             char prefix[155];
         };
 
-        class RAMNode : public VFS::INode {
+        class USTARFileSystem : public RAMFS::RAMFileSystem {
             private:
-                uint8_t *data = NULL;
-                size_t datasize = 0;
-                NLib::HashMap<RAMNode *> children;
+                struct NArch::Module::modinfo modinfo;
             public:
-
-                RAMNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr) : VFS::INode(fs, name, attr) { }
-
-                ssize_t read(void *buf, size_t count, off_t offset) override;
-                ssize_t write(const void *buf, size_t count, off_t offset) override;
-                VFS::INode *lookup(const char *name) override;
-                bool add(VFS::INode *node) override;
-                bool remove(const char *name) override;
-
-                // Inherit the data directly from an existing address.
-                void inherit(uint8_t *data, size_t size) {
-                    this->data = data;
-                    this->datasize = size;
-                }
-        };
-
-        class RAMFileSystem : public VFS::IFileSystem {
-            private:
-            public:
-                RAMFileSystem(void) {
-                    struct VFS::stat attr = (struct VFS::stat) {
-                        .st_mode = 0755 | VFS::S_IFDIR,
-                    };
-                    this->root = new RAMNode(this, "", attr);
+                USTARFileSystem(VFS::VFS *vfs, struct NArch::Module::modinfo mod) : RAMFS::RAMFileSystem(vfs) {
+                    this->modinfo = mod;
                 }
 
-                int mount(void) override { return 0; }
-                int unmount(void) override { return 0; }
-                int sync(void) override { return 0; }
-
-                VFS::INode *create(const char *name, struct VFS::stat attr) override;
+                int mount(const char *path) override;
         };
 
         // Convert octal to binary integer.
@@ -89,8 +62,6 @@ namespace NFS {
             }
             return val;
         }
-
-        void enumerate(struct NArch::Module::modinfo info);
     }
 }
 

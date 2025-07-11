@@ -7,6 +7,97 @@
 namespace NLib {
 
     template<typename T>
+    class Vector {
+        private:
+            T *data = NULL;
+            size_t size = 0;
+            size_t capacity = 0;
+
+            bool realloc(size_t newcap) {
+                this->data = (T *)NMem::allocator.realloc(this->data, newcap * sizeof(T));
+                if (!this->data) {
+                    return false;
+                }
+                if (newcap > this->capacity) {
+                    NLib::memset((void *)((uintptr_t)this->data + this->capacity * sizeof(T)), 0, (newcap - this->capacity) * sizeof(T)); // Zero new allocation, so NULL is correct.
+                }
+                this->capacity = newcap;
+                return true;
+            }
+
+        public:
+            Vector(void) = default;
+
+            ~Vector(void) {
+                this->clear();
+                delete[] this->data;
+            }
+
+            T &operator[](size_t idx) {
+                return this->data[idx];
+            }
+
+            T &front(void) {
+                return this->data[0];
+            }
+
+            T &back(void) {
+                return this->data[this->size - 1];
+            }
+
+            T *getdata(void) {
+                return this->data;
+            }
+
+            bool empty(void) {
+                return !this->size;
+            }
+
+            size_t getsize(void) {
+                return this->size;
+            }
+
+            size_t getcapacity(void) {
+                return this->capacity;
+            }
+
+            bool reserve(size_t newcap) {
+                if (newcap > this->capacity) {
+                    return this->realloc(newcap);
+                }
+                return true;
+            }
+
+            bool resize(size_t newsize) {
+                if (newsize > this->size) {
+                    if (!reserve(newsize)) {
+                        return false;
+                    }
+                }
+
+                this->size = newsize;
+                return true;
+            }
+
+            void shrink(void) {
+                if (this->size < this->capacity) {
+                    this->realloc(this->size);
+                }
+            }
+
+            void clear(void) {
+                this->size = 0;
+            }
+
+            void push(T &val) {
+                if (this->size >= this->capacity) {
+                    this->reserve(this->capacity ? this->capacity * 2 : 1);
+                }
+                this->data[this->size++] = val;
+            }
+    };
+
+    template<typename T>
     class HashMap {
         private:
             struct entry {
@@ -29,7 +120,7 @@ namespace NLib {
                     hash ^= (size_t)key[i];
                     hash *= prime;
                 }
-                return hash % bucketcount;
+                return hash % this->bucketcount;
             }
 
             void rehash(size_t newsize) {
@@ -177,7 +268,7 @@ namespace NLib {
                     }
 
                     T *value(void) {
-                        return this->current->value;
+                        return &this->current->value;
                     }
 
                     void next(void) {
@@ -380,7 +471,7 @@ namespace NLib {
 
             void unlink(struct node *node) {
                 assert(!this->empty(), "Somehow unlinking node within empty list.\n");
-                assert(!node, "Unlinking NULL node.\n");
+                assert(node, "Unlinking NULL node.\n");
 
                 if (node->prev) {
                     node->prev->next = node->next; // Cause previous to skip us.

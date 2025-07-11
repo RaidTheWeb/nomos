@@ -23,7 +23,7 @@
 
 #define EARLYSERIAL 0
 
-extern void kinit1(void);
+extern void kpostarch(void);
 
 namespace NArch {
     bool hypervisor_enabled = false;
@@ -37,58 +37,8 @@ namespace NArch {
     void archthreadinit(void) {
         NUtil::printf("Hello kernel thread!\n");
 
-        kinit1(); // XXX: Driver init.
+        kpostarch();
 
-        const char *initramfs = cmdline.get("initramfs");
-        if (initramfs) { // Exists, load it.
-            NUtil::printf("[arch/x86_64]: Attempting to load initramfs `%s`.\n", initramfs);
-            struct Module::modinfo mod = Module::loadmodule(initramfs); // Try to load.
-            assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
-            NFS::USTAR::enumerate(mod);
-        }
-
-        struct VMM::addrspace *uspace = new struct VMM::addrspace;
-        uspace->ref = 1;
-        uspace->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
-        assert(uspace->pml4, "Failed to allocate memory for user space PML4.\n");
-        uspace->pml4phy = (uintptr_t)uspace->pml4;
-        uspace->pml4 = (struct VMM::pagetable *)hhdmoff(uspace->pml4);
-        NLib::memset(uspace->pml4, 0, PAGESIZE);
-
-        uspace->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000); // Provide userspace VMA.
-
-        uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
-        assert(entry != NULL, "Failed to allocate intermediate entries.\n");
-        NLib::memset(hhdmoff(entry), 0, PAGESIZE);
-        uspace->pml4->entries[0] = (uint64_t)entry | VMM::WRITEABLE | VMM::USER; // Isn't marked present explicitly: guard pages.
-        for (size_t i = 1; i < 256; i++) {
-            uspace->pml4->entries[i] = 0; // Don't even bother. It'll never be used, and if it is, it'll be allocated when it's needed.
-        }
-
-        for (size_t i = 256; i < 512; i++) {
-
-            uspace->pml4->entries[i] = VMM::kspace.pml4->entries[i]; // Map the kernel into userspace.
-        }
-
-        NSched::Process *proc = new NSched::Process(uspace);
-
-        NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE, (void *)uentry);
-        uintptr_t ustack = (uintptr_t)PMM::alloc(NSched::DEFAULTSTACKSIZE); // Allocate user stack, and point RSP to the top.
-        assert(ustack, "Failed to allocate memory for user stack.\n");
-        uintptr_t virt = (uintptr_t)uspace->vmaspace->alloc(NSched::DEFAULTSTACKSIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
-        VMM::maprange(uspace, virt, ustack, VMM::NOEXEC | VMM::WRITEABLE | VMM::USER | VMM::PRESENT, NSched::DEFAULTSTACKSIZE); // Map stack.
-
-        uintptr_t evirt = (uintptr_t)uspace->vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_USER);
-        uintptr_t ephy = (uintptr_t)uentry - NLimine::eareq.response->virtual_base + NLimine::eareq.response->physical_base;
-        size_t off = ephy % PAGESIZE;
-        uthread->ctx.rip = evirt + off;
-        VMM::mappage(uspace, evirt, ephy - off, VMM::PRESENT | VMM::USER);
-
-        NUtil::printf("u: %p %p.\n", evirt, off);
-
-        uthread->ctx.rsp = virt + NSched::DEFAULTSTACKSIZE;
-
-        NSched::schedulethread(uthread);
 
         NSched::exit();
     }

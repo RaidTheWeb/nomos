@@ -7,7 +7,7 @@ namespace NArch {
     // XXX: This needs to be made thread local!
     void MCSSpinlock::initstate(struct state *state) {
         state->depth = 0;
-        state->node = (struct mcsnode *)NMem::allocator.alloc(sizeof(struct mcsnode));
+        state->node = new struct mcsnode;
         state->node->next = NULL;
         state->node->locked = 0;
         state->inited = true;

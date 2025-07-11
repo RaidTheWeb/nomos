@@ -57,16 +57,17 @@ namespace NUtil {
     enum {
         ZEROPAD = (1 << 0),
         LEFTJUST = (1 << 1),
-        SIGN = (1 << 2),
-        SPACE = (1 << 3),
-        HASH = (1 << 4),
+        SIGN = (1 << 2), // Display + or - in front.
+        SIGNED = (1 << 3), // Handle negative. Does not add +.
+        SPACE = (1 << 4),
+        HASH = (1 << 5),
 
         // Length modifiers:
-        LONG = (1 << 5),
-        LONGLONG = (1 << 6),
+        LONG = (1 << 6),
+        LONGLONG = (1 << 7),
 
         // Uppercase digits.
-        UPPER = (1 << 7)
+        UPPER = (1 << 8)
     };
 
     static void putnum(char **buf, unsigned long long num, int base, int width, int flags, int *counter, int max) {
@@ -76,9 +77,12 @@ namespace NUtil {
         char temp[32];
 
         bool negative = false;
-        if (flags & SIGN && (long long)num < 0) {
-            negative = true;
-            num = (unsigned long long)-(long long)num;
+        if (flags & SIGN || flags & SIGNED) {
+            long long snum = (long long)num;
+            if (snum < 0) {
+                negative = true;
+                num = (unsigned long long)-snum;
+            }
         }
 
         if (flags & HASH && base == 16) {
@@ -120,8 +124,8 @@ namespace NUtil {
             putchar(buf, temp[idx], counter, max);
         }
 
-        if (flags & LEFTJUST && width > idx) {
-            for (int i = 0; i < width; i++) {
+        if (flags & LEFTJUST && width > (idx + 1)) {
+            for (int i = (idx + 1); i < width; i++) {
                 putchar(buf, ' ', counter, max); // Left justification is spaces.
             }
         }
@@ -217,6 +221,7 @@ flagbreak:
                         num = va_arg(ap, int);
                     }
 
+                    flags |= SIGNED;
                     putnum(buf, num, 10, width, flags, counter, max);
                     break;
                 }

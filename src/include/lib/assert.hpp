@@ -1,14 +1,16 @@
 #ifndef _LIB__ASSERT_HPP
 #define _LIB__ASSERT_HPP
 
-#ifdef __x86_64__
-#include <arch/x86_64/panic.hpp>
-#endif
 #include <stdarg.h>
 #include <lib/string.hpp>
 #include <util/kprint.hpp>
 
+namespace NArch {
+    extern void panic(const char *buf);
+}
+
 namespace NLib {
+
     static inline void __assert(bool statement, const char *expr, const char *func, const char *file, int line, const char *msg, ...) {
         if (!statement) {
             va_list ap;

@@ -1,4 +1,5 @@
 #ifdef __x86_64__
+#include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
@@ -455,7 +456,6 @@ namespace NSched {
     // Scheduler interrupt entry, handles save.
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
-        // NLimine::console_write("schedule()", 11);
 
         APIC::lapicstop(); // Prevent double schedule by stopping any running timer.
 
@@ -537,12 +537,17 @@ namespace NSched {
     static size_t pidcounter = 0;
     Process *kprocess = NULL; // Kernel process.
 
-    Process::Process(struct VMM::addrspace *space) {
+    void Process::init(struct VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
         // Each new process should be initialised with an atomically incremented PID.
         this->id = __atomic_add_fetch(&pidcounter, 1, memory_order_seq_cst);
         this->addrspace = space;
         if (space == &VMM::kspace) {
             this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
+        }
+        if (!fdtable) {
+            this->fdtable = new NFS::VFS::FileDescriptorTable();
+        } else {
+            this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
         }
     }
 
@@ -556,12 +561,14 @@ namespace NSched {
         this->addrspace->lock.release();
 
         if (ref == 0) {
-            NMem::allocator.free(this->addrspace);
+            delete this->addrspace;
         }
     }
 
     void yield(void) {
         APIC::lapicstop(); // Stop currently running timer.
+
+        CPU::get()->setint(true);
 
         // Artificially induce a schedule interrupt, using a "loopback" IPI.
         APIC::sendipi(CPU::get()->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
@@ -616,11 +623,7 @@ namespace NSched {
     }
 
     void Thread::destroy(void) {
-        if (this->process->kernel) {
-            PMM::free(hhdmsub(this->stack)); // Free stack.
-        } else {
-            PMM::free(this->stack);
-        }
+        PMM::free(hhdmsub(this->stack)); // Free stack.
     }
 
     void schedulethread(Thread *thread) {
@@ -681,5 +684,11 @@ namespace NSched {
         for (;;) {
             asm volatile("hlt");
         }
+    }
+
+    extern "C" uint64_t sys_exit(int status) {
+        NUtil::printf("Exit %d.\n", status);
+        exit(); // Exit.
+        return 0;
     }
 }

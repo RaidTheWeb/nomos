@@ -7,7 +7,7 @@
 namespace NLib {
 
     void CmdlineParser::addpair(char *key, char *value) {
-        struct pair *pair = (struct pair *)NMem::allocator.alloc(sizeof(struct pair));
+        struct pair *pair = new struct pair;
         assert(pair != NULL, "Failed to allocate memory for cmdline pair.\n");
         // Put values into pair.
         NLib::strncpy(pair->key, key, sizeof(pair->key) - 1);

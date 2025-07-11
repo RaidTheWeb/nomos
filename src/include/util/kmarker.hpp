@@ -11,7 +11,7 @@ namespace NUtil {
     })
 
     #define MARKED(val) ({ \
-        NUtil::printf("Reached marker in %s() at %s:%d with %p.\n", __FUNCTION__, __FILE__, __LINE__); \
+        NUtil::printf("Reached marker in %s() at %s:%d with %p.\n", __FUNCTION__, __FILE__, __LINE__, val); \
     })
 }
 

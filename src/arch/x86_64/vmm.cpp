@@ -3,6 +3,7 @@
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
+#include <lib/errno.hpp>
 #include <lib/string.hpp>
 #include <util/kprint.hpp>
 
@@ -30,6 +31,36 @@ namespace NArch {
 
         void swapcontext(struct addrspace *space) {
             swaptopml4(space->pml4phy);
+        }
+
+        void uclonecontext(struct addrspace *src, struct addrspace **dest) {
+            assert(src, "Invalid source.\n");
+            assert(dest, "Invalid destination.\n");
+
+            NLib::ScopeSpinlock sguard(&src->lock);
+
+            *dest = new struct VMM::addrspace;
+            NLib::ScopeSpinlock dguard(&(*dest)->lock);
+
+            (*dest)->ref = 1;
+            (*dest)->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
+            assert((*dest)->pml4, "Failed to allocate memory for user space PML4.\n");
+            (*dest)->pml4phy = (uintptr_t)(*dest)->pml4;
+            (*dest)->pml4 = (struct VMM::pagetable *)hhdmoff((*dest)->pml4);
+            NLib::memset((*dest)->pml4, 0, PAGESIZE);
+
+            (*dest)->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000);
+
+            uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
+            assert(entry, "Failed to allocate initial intermediate entry.\n");
+            NLib::memset(hhdmoff(entry), 0, PAGESIZE);
+
+            // Only needs to map entry 0 for the entire userspace address space.
+            (*dest)->pml4->entries[0] = (uint64_t)entry | VMM::WRITEABLE | VMM::USER;
+
+            for (size_t i = 256; i < 512; i++) {
+                (*dest)->pml4->entries[i] = src->pml4->entries[i];
+            }
         }
 
         void clonecontext(struct addrspace *space, struct pagetable **pt) {
@@ -228,6 +259,85 @@ namespace NArch {
             kspace.vmaspace->reserve((uintptr_t)start, (uintptr_t)end, convertflags(flags)); // Reserve kernel sections in VMA space.
             maprange(&kspace, base, phyaddr, flags, len);
         }
+
+        #define PROT_NONE       0x00
+        #define PROT_READ       0x01
+        #define PROT_WRITE      0x02
+        #define PROT_EXEC       0x04
+
+        #define MAP_FILE        0x00
+        #define MAP_SHARED      0x01
+        #define MAP_PRIVATE     0x02
+        #define MAP_FIXED       0x10
+        #define MAP_ANONYMOUS   0x20
+
+        // Convert libc prot into VMA flags.
+        static inline uint64_t prottovma(int prot) {
+            return 0 |
+                NMem::Virt::VIRT_USER |
+                (prot & PROT_WRITE ? NMem::Virt::VIRT_RW : 0) |
+                (prot & PROT_EXEC ? 0 : NMem::Virt::VIRT_NX);
+        }
+
+        // Convert libc prot into VMM flags.
+        static inline uint64_t prottovmm(int prot) {
+            return 0 |
+                USER | PRESENT |
+                (prot & PROT_WRITE ? WRITEABLE : 0) |
+                (prot & PROT_EXEC ? 0 : NOEXEC);
+        }
+
+        extern "C" uint64_t sys_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t off) {
+            NUtil::printf("sys_mmap(%p, %lu, %u, %u, %d, %lu).\n", hint, size, prot, flags, fd, off);
+
+            if (!size || (off % PAGESIZE)) {
+                return -EINVAL;
+            }
+
+            size = NLib::alignup(size, PAGESIZE);
+
+            bool isfile = !(flags & MAP_ANONYMOUS); // Anonymous mappings have nothing to do with files.
+            if (isfile && fd < 0) {
+                return -EBADF;
+            }
+
+            struct addrspace *space = CPU::get()->currthread->process->addrspace;
+
+            NLib::ScopeSpinlock guard(&space->lock);
+
+            void *region = space->vmaspace->alloc(size, prottovma(prot)); // Allocate VMA region.
+            if (!region) {
+                return -ENOMEM;
+            }
+
+            void *phys = PMM::alloc(size);
+            if (!phys) {
+                space->vmaspace->free(region, size);
+                return -ENOMEM;
+            }
+
+            if (flags & MAP_ANONYMOUS) {
+                NLib::memset(hhdmoff(phys), 0, size);
+            }
+
+            if (!_maprange(space, (uintptr_t)region, (uintptr_t)phys, prottovmm(prot), size)) {
+                space->vmaspace->free(region, size);
+                PMM::free(phys);
+                return -ENOMEM;
+            }
+
+            // Sets return address of memory map with region.
+            return (uint64_t)region;
+        }
+
+        extern "C" uint64_t sys_munmap(void *ptr, size_t size) {
+            return 0;
+        }
+
+        extern "C" uint64_t sys_mprotect(void *ptr, size_t size, int prot) {
+            return 0;
+        }
+
 
         void setup(void) {
 

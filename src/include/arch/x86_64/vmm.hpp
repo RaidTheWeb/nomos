@@ -189,6 +189,7 @@ namespace NArch {
         void swapcontext(struct addrspace *space);
         // Clone address space's page table map to a different location, the address space itself can be referred to just fine.
         void clonecontext(struct addrspace *space, struct pagetable **pt);
+        void uclonecontext(struct addrspace *src, struct addrspace **dest);
         void enterucontext(struct pagetable *pt, struct addrspace *space);
 
         // Maps kernel regions according to start and end of individual sections.

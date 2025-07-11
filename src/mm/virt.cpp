@@ -101,7 +101,7 @@ namespace NMem {
             }
 
             if (!node->used) { // If this particular node is free, we should be checking if it'll satisfy the requirements for the allocation (this will be called in both the top-level and recursed states).
-                uintptr_t alignedstart = NLib::aligndown(node->start, align);
+                uintptr_t alignedstart = NLib::alignup(node->start, align);
                 uintptr_t end = alignedstart + size;
 
                 if (end <= node->end) { // Ideal node, fits within the region.
@@ -110,14 +110,8 @@ namespace NMem {
                 }
             }
 
-            if (node->left && node->left->maxend >= (node->start + size)) {
-                struct vmanode *leftres = this->findfree(node->left, size, align, out); // Recurse through left-hand-side if the maximum end indicates that it could handle our allocation.
-                if (leftres) {
-                    return leftres;
-                }
-            }
-
-            return this->findfree(node->right, size, align, out); // Otherwise: we'll traverse down the right side.
+            struct vmanode *left = this->findfree(node->left, size, align, out);
+            return left ? left : this->findfree(node->right, size, align, out); // Otherwise: we'll traverse down the right side.
         }
 
         struct vmanode *VMASpace::insert(struct vmanode *root, struct vmanode *node) {
@@ -151,7 +145,7 @@ namespace NMem {
             } else { // Matches our range allocation.
                 if (!root->left || !root->right) { // Possesses one or no children, no more nodes to search, remove it.
                     struct vmanode *tmp = root->left ? root->left : root->right; // Figure out whatever is left.
-                    NMem::allocator.free(root);
+                    delete root;
                     return tmp; // Return NULL or remaining child.
                 }
 
@@ -175,7 +169,7 @@ namespace NMem {
 
         struct vmanode *VMASpace::newnode(uintptr_t start, uintptr_t end, bool used) {
             // Allocate and initialise new VMA node.
-            struct vmanode *node = (struct vmanode *)NMem::allocator.alloc(sizeof(struct vmanode));
+            struct vmanode *node = new struct vmanode;
             node->start = start;
             node->end = end;
             node->maxend = end;
@@ -194,7 +188,7 @@ namespace NMem {
             this->destroytree(node->left);
             this->destroytree(node->right);
 
-            NMem::allocator.free(node); // Finally, destroy the node allocation.
+            delete node;// Finally, destroy the node allocation.
         }
 
         void VMASpace::findadj(struct vmanode *root, struct vmanode *target, struct vmanode **prev, struct vmanode **next) {
@@ -364,7 +358,6 @@ namespace NMem {
             struct vmanode *nodes[3];
             size_t count = 0;
 
-            // this->dump();
             if (node->start < start) {
                 nodes[count++] = this->newnode(node->start, start, false);
             }

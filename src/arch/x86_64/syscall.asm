@@ -1,11 +1,31 @@
 
-extern syscall_test
+extern sys_exit
+extern sys_prctl
+extern sys_debug
+extern sys_mmap
+extern sys_munmap
+extern sys_mprotect
+extern sys_openat
+extern sys_close
+extern sys_read
+extern sys_write
+extern sys_seek
 
 MAXSYSCALLS equ 256
 
 section .rodata ; This can be in the normal rodata section, because we'll be using kernel maps by the time we want to use it.
 syscall_table:
-    dq syscall_test
+    dq sys_exit
+    dq sys_prctl
+    dq sys_debug
+    dq sys_mmap
+    dq sys_munmap
+    dq sys_mprotect
+    dq sys_openat
+    dq sys_close
+    dq sys_read
+    dq sys_write
+    dq sys_seek
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 
@@ -47,7 +67,6 @@ syscall_entry:
     mov ax, 0x10
     mov ds, ax
     mov es, ax
-    mov fs, ax
     ; GS has already been set by SWAPGS.
 
     mov rdi, [rsp + 96] ; RAX, system call number (96 offset in stack).

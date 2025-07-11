@@ -42,6 +42,26 @@ namespace NArch {
             asm volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(base));
         }
 
+        static inline uint64_t rdcr0(void) {
+            uint64_t ret;
+            asm volatile("mov %%cr0, %0" : "=r"(ret) : : "memory");
+            return ret;
+        }
+
+        static inline void wrcr0(uint64_t val) {
+            asm volatile("mov %0, %%cr0" : : "r"(val) : "memory");
+        }
+
+        static inline uint64_t rdcr4(void) {
+            uint64_t ret;
+            asm volatile("mov %%cr4, %0" : "=r"(ret) : : "memory");
+            return ret;
+        }
+
+        static inline void wrcr4(uint64_t val) {
+            asm volatile("mov %0, %%cr4" : : "r"(val) : "memory");
+        }
+
         static const uint32_t MSRAPICBASE   = 0x0000001b;
 
         static const uint32_t MSREFER       = 0xc0000080;

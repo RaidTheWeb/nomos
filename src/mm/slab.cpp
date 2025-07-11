@@ -1,6 +1,7 @@
 #ifdef __x86_64__
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/pmm.hpp>
+#include <arch/x86_64/vmm.hpp>
 #endif
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
@@ -157,7 +158,7 @@ namespace NMem {
             }
 
             // Metadata start is the start of the page, therefore, we can just shove the location of the metadata into the PMM to free it.
-            NArch::PMM::free(meta);
+            NArch::PMM::free(NArch::hhdmsub(meta));
         }
     }
 
