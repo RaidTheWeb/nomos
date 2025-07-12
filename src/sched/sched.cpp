@@ -543,11 +543,28 @@ namespace NSched {
         this->addrspace = space;
         if (space == &VMM::kspace) {
             this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
-        }
-        if (!fdtable) {
-            this->fdtable = new NFS::VFS::FileDescriptorTable();
-        } else {
-            this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
+        } else { // Only userspace threads should bother creating file descriptor tables.
+            if (!fdtable) {
+                this->fdtable = new NFS::VFS::FileDescriptorTable();
+                NFS::VFS::INode *stdin = NFS::VFS::vfs.resolve("/dev/zero");
+                assert(stdin, "Could not resolve standard input.\n");
+                stdin->unref();
+
+                this->fdtable->reserve(STDIN_FILENO, stdin, NFS::VFS::O_RDONLY);
+
+                NFS::VFS::INode *stdout = NFS::VFS::vfs.resolve("/dev/console");
+                assert(stdout, "Could not resolve standard output.\n");
+                stdout->unref();
+
+                this->fdtable->reserve(STDOUT_FILENO, stdout, NFS::VFS::O_WRONLY | NFS::VFS::O_CLOEXEC);
+                NFS::VFS::INode *stderr = NFS::VFS::vfs.resolve("/dev/null");
+                assert(stderr, "Could not resolve standard error.\n");
+                stderr->unref();
+
+                this->fdtable->reserve(STDERR_FILENO, stderr, NFS::VFS::O_WRONLY | NFS::VFS::O_NONBLOCK);
+            } else {
+                this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
+            }
         }
     }
 

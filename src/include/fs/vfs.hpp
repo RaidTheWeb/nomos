@@ -5,6 +5,7 @@
 #include <arch/x86_64/sync.hpp>
 #endif
 #include <lib/bitmap.hpp>
+#include <lib/errno.hpp>
 #include <lib/list.hpp>
 #include <lib/sync.hpp>
 #include <stddef.h>
@@ -55,6 +56,13 @@ namespace NFS {
         };
 
         static const ssize_t AT_FDCWD = -100; // Special FD for openat that signifies we should use the current working directory.
+
+
+        enum seek {
+            SEEK_SET = 0,
+            SEEK_CUR = 1,
+            SEEK_END = 2
+        };
 
         enum flags {
             O_RDONLY    = 0,
@@ -277,6 +285,31 @@ namespace NFS {
 
                 virtual ssize_t read(void *buf, size_t count, off_t offset) = 0;
                 virtual ssize_t write(const void *buf, size_t count, off_t offset) = 0;
+                virtual int open(int flags) {
+                    (void)flags;
+                    return 0;
+                }
+                virtual int close(void) {
+                    return 0;
+                }
+                virtual int mmap(void *addr, size_t offset, uint64_t flags) {
+                    (void)addr;
+                    (void)offset;
+                    (void)flags;
+                    return -EFAULT;
+                }
+                virtual int munmap(void *addr) {
+                    (void)addr;
+                    return -EFAULT;
+                }
+                virtual int isatty(void) {
+                    return -ENOTTY;
+                }
+                virtual int ioctl(uint32_t request, uint64_t arg) {
+                    (void)request;
+                    (void)arg;
+                    return -EINVAL;
+                }
 
                 // Locate child by name.
                 virtual INode *lookup(const char *name) = 0;
@@ -415,6 +448,22 @@ namespace NFS {
                     return this->node;
                 }
 
+                int getflags(void) {
+                    return this->flags;
+                }
+
+                size_t getoff(void) {
+                    return __atomic_load_n(&this->offset, memory_order_seq_cst);
+                }
+
+                void setoff(off_t off) {
+                    __atomic_store_n(&this->offset, off, memory_order_seq_cst);
+                }
+
+                void addoff(off_t by) {
+                    __atomic_add_fetch(&this->offset, by, memory_order_seq_cst);
+                }
+
                 size_t ref(void) {
                     __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
                     return __atomic_load_n(&this->refcount, memory_order_seq_cst);
@@ -447,6 +496,8 @@ namespace NFS {
                 ~FileDescriptorTable(void) {
                     this->closeall();
                 }
+
+                void reserve(int fd, INode *node, int flags);
 
                 int open(INode *node, int flags);
                 int close(int fd);

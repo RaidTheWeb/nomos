@@ -1,6 +1,8 @@
 #ifndef _DEV__DEV_HPP
 #define _DEV__DEV_HPP
 
+#include <lib/errno.hpp>
+#include <lib/list.hpp>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -13,6 +15,107 @@ namespace NDev {
     class Driver {
         public:
 
+    };
+
+    class BusDriver : public Driver {
+        public:
+    };
+
+    class DevDriver;
+
+    class Device {
+        public:
+            DevDriver *driver = NULL;
+
+            uint64_t id;
+
+            Device(uint64_t id, DevDriver *driver) {
+                this->id = id;
+                this->driver = driver;
+            }
+    };
+
+    class DeviceRegistry {
+        private:
+            NLib::KVHashMap<uint64_t, Device *> map;
+        public:
+            void add(Device *dev) {
+                this->map.insert(dev->id, dev);
+            }
+
+            Device *get(uint64_t id) {
+                Device **dev = this->map.find(id);
+                if (dev) {
+                    return (*dev);
+                }
+                return NULL;
+            }
+
+            void remove(uint64_t id) {
+                this->map.remove(id);
+            }
+
+            void remove(Device *dev) {
+                this->remove(dev->id);
+            }
+    };
+
+    extern DeviceRegistry *registry;
+    void setup(void);
+
+    // Driver that is represented with on the dev filesystem.
+    class DevDriver : public Driver {
+        protected:
+        public:
+
+            virtual ~DevDriver(void) = default;
+
+            virtual ssize_t read(uint32_t minor, void *buf, size_t count, off_t offset) {
+                (void)minor;
+                (void)buf;
+                (void)count;
+                (void)offset;
+                return 0;
+            }
+            virtual ssize_t write(uint32_t minor, const void *buf, size_t count, off_t offset) {
+                (void)minor;
+                (void)buf;
+                (void)count;
+                (void)offset;
+                return 0;
+            }
+//            XXX: virtual int poll(uint32_t minor, ...)
+            virtual int mmap(uint32_t minor, void *addr, size_t offset, uint64_t flags) {
+                (void)minor;
+                (void)addr;
+                (void)offset;
+                (void)flags;
+                return -EFAULT;
+            }
+            virtual int munmap(uint32_t minor, void *addr) {
+                (void)minor;
+                (void)addr;
+                return -EFAULT;
+            }
+            virtual int isatty(uint32_t minor) {
+                (void)minor;
+                return -ENOTTY;
+            }
+            virtual int open(uint32_t minor, int flags) {
+                (void)minor;
+                (void)flags;
+                return 0;
+            }
+            virtual int close(uint32_t minor) {
+                (void)minor;
+                return 0;
+            }
+            virtual int ioctl(uint32_t minor, uint32_t request, uint64_t arg) {
+                (void)minor;
+                (void)request;
+                (void)arg;
+                return -EINVAL;
+            }
     };
 
     struct reginfo {
@@ -62,7 +165,7 @@ namespace NDev {
         uint32_t magic;
         Driver *(*create)(void);
         struct reginfo *info;
-    };
+    } __attribute__((aligned(16)));
 
     extern "C" struct regentry __drivers_start[];
     extern "C" struct regentry __drivers_end[];

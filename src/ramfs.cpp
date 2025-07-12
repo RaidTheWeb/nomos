@@ -49,7 +49,7 @@ namespace NFS {
             VFS::VFS *vfs = this->fs->getvfs();
 
             // Attempt to resolve the node our data points to. Uses normal resolution function, but it doesn't attempt to resolve symbolic links (we don't want any crazy recursion).
-            return vfs->resolve((const char *)this->data, NULL, false);
+            return vfs->resolve((const char *)this->data, this, false);
         }
 
         VFS::INode *RAMNode::lookup(const char *name) {
@@ -95,7 +95,7 @@ namespace NFS {
         int RAMFileSystem::umount(void) {
             NLib::ScopeSpinlock guard(&this->spin);
 
-            if (!mounted) {
+            if (!this->mounted) {
                 return -EINVAL; // Unmounted.
             }
 

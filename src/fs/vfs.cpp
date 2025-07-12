@@ -217,6 +217,17 @@ namespace NFS {
             return fd;
         }
 
+        void FileDescriptorTable::reserve(int fd, INode *node, int flags) {
+            NLib::ScopeSpinlock guard(&this->lock);
+
+            this->fds[fd] = new FileDescriptor(node, flags);
+            if (!this->fds[fd]) {
+                return;
+            }
+
+            this->openfds.set(fd);
+        }
+
         int FileDescriptorTable::close(int fd) {
             NLib::ScopeSpinlock guard(&this->lock);
 
@@ -290,6 +301,8 @@ namespace NFS {
                 }
             }
 
+            // XXX: Special case handling for standard streams.
+
             if (this->openfds.test(newfd)) {
                 if (this->fds[newfd]->unref() == 0) { // Decrement reference within our table.
                     delete fds[newfd];
@@ -305,7 +318,6 @@ namespace NFS {
         FileDescriptor *FileDescriptorTable::get(int fd) {
             NLib::ScopeSpinlock guard(&this->lock);
 
-            NUtil::printf("FD: %d, %lu, %u.\n", fd, this->fds.getsize(), this->openfds.test(fd));
             if (fd < 0 || fd >= (int)this->fds.getsize() || !this->openfds.test(fd)) {
                 // If the fd is negative, over our current maximum, or not currently allocated:
                 return NULL;
@@ -495,11 +507,33 @@ namespace NFS {
                 return -EACCES;
             }
 
+            int accmode = flags & O_ACCMODE;
+
+            switch (accmode) {
+                case O_RDONLY:
+                    if (flags & O_TRUNC) {
+                        node->unref();
+                        return -EINVAL; // Can't truncate without write access.
+                    }
+                    break;
+                case O_WRONLY:
+                case O_RDWR:
+                    if (S_ISDIR(st.st_mode)) {
+                        node->unref();
+                        return -EISDIR; // Can't write to directory.
+                    }
+                    break;
+                default:
+                    node->unref();
+                    return -EINVAL;
+            }
+
             // if ((flags & O_TRUNC) && S_ISREG(st.st_mode)) {
 
             // }
 
             int fd = NArch::CPU::get()->currthread->process->fdtable->open(node, flags);
+            node->open(flags); // Trigger open hook.
             node->unref(); // Unreference. FD table will handle the reference.
 
             return fd;
@@ -507,24 +541,189 @@ namespace NFS {
 
         extern "C" uint64_t sys_close(int fd) {
             NUtil::printf("sys_close(%d).\n", fd);
+
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            if (fd == NSched::STDIN_FILENO || fd == NSched::STDOUT_FILENO || fd == NSched::STDERR_FILENO) {
+                return 0; // Refuse to close standard streams.
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            INode *node = desc->getnode();
+            int res = node->close(); // Trigger close hook.
+            node->unref();
+            if (res < 0) {
+                return res;
+            }
+
+            res = proc->fdtable->close(fd);
+            if (res < 0) {
+                return res;
+            }
+
             return 0;
         }
 
         extern "C" uint64_t sys_read(int fd, void *buf, size_t count) {
             NUtil::printf("sys_read(%d, %p, %lu).\n", fd, buf, count);
-            return count;
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            if (!buf && count > 0) {
+                return -EFAULT;
+            }
+
+            if (!NMem::UserCopy::valid(buf, count)) {
+                return -EFAULT; // Invalid buffer.
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                MARKER;
+                return -EBADF;
+            }
+
+            int accmode = desc->getflags() & O_ACCMODE;
+
+            if (accmode != O_RDONLY && accmode != O_RDWR) {
+                MARKER;
+                return -EBADF; // Not open for read.
+            }
+
+            INode *node = desc->getnode();
+
+            struct stat st = node->getattr();
+            if (S_ISDIR(st.st_mode)) {
+                node->unref();
+                return -EISDIR;
+            }
+
+            if (S_ISLNK(st.st_mode)) {
+                node->unref();
+                return -EINVAL;
+            }
+
+            ssize_t read = node->read(buf, count, desc->getoff());
+            node->unref();
+            if (read < 0) {
+                MARKER;
+                return read; // Return error code.
+            }
+
+            desc->addoff(read); // Increment offset.
+
+            return read; // Return the actual number of bytes read.
         }
 
         extern "C" uint64_t sys_write(int fd, const void *buf, size_t count) {
             NUtil::printf("sys_write(%d, %p, %lu).\n", fd, buf, count);
 
+            if (fd < 0) {
+                return -EBADF;
+            }
 
-            return count;
+            if (!buf && count > 0) {
+                return -EFAULT;
+            }
+
+            if (!NMem::UserCopy::valid(buf, count)) {
+                return -EFAULT; // Invalid buffer.
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            int accmode = desc->getflags() & O_ACCMODE;
+
+            if (accmode != O_WRONLY && accmode != O_RDWR) {
+                return -EBADF;
+            }
+
+            INode *node = desc->getnode();
+            struct stat st = node->getattr();
+            if (S_ISDIR(st.st_mode)) {
+                node->unref();
+                return -EISDIR;
+            }
+
+            uint64_t wroff = desc->getoff();
+            if (desc->getflags() & O_APPEND) {
+                wroff = st.st_size; // We should begin at the end of the file.
+            }
+
+            ssize_t written = node->write(buf, count, wroff);
+            node->unref();
+            if (written < 0) {
+                return written;
+            }
+
+            if (!(desc->getflags() & O_APPEND)) {
+                desc->setoff(wroff + written); // New offset should be here. XXX: Useless? We already rely on st_size.
+            }
+
+            return written;
         }
 
         extern "C" uint64_t sys_seek(int fd, off_t off, int whence) {
             NUtil::printf("sys_seek(%d, %ld, %d).\n", fd, off, whence);
-            return 0;
+
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            INode *node = desc->getnode();
+
+            struct stat st = node->getattr();
+
+            if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) {
+                node->unref();
+                return -ESPIPE;
+            }
+            node->unref();
+
+            off_t newoff = 0;
+            switch (whence) {
+                case SEEK_SET:
+                    newoff = off; // Works from absolute position.
+                    break;
+                case SEEK_CUR:
+                    newoff = desc->getoff() + off; // Relative.
+                    break;
+                case SEEK_END:
+                    newoff = st.st_size + off; // Relative from end of file.
+                    break;
+                default:
+                    return -EINVAL;
+            }
+
+            if (newoff < 0) {
+                return -EINVAL; // Ultimately, invalid offset.
+            }
+
+            desc->setoff(newoff); // Set new offset.
+            return newoff;
         }
     }
 }

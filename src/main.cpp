@@ -13,6 +13,7 @@
 #include <dev/dev.hpp>
 
 #include <cxxruntime.hpp>
+#include <fs/devfs.hpp>
 #include <fs/ustar.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
@@ -66,6 +67,13 @@ void operator delete[](void *ptr, size_t size) {
 
 // Called within the architecture-specific initialisation thread. Stage 1 (early).
 void kpostarch(void) {
+
+    NDev::setup(); // Initialise device registry.
+
+    NFS::DEVFS::DevFileSystem *devfs = new NFS::DEVFS::DevFileSystem(&NFS::VFS::vfs); // Create and mount device filesystem.
+    NFS::VFS::vfs.mount("/dev", devfs);
+
+
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC) {
             NUtil::printf("Discovered driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");

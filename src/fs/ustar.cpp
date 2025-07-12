@@ -40,8 +40,6 @@ namespace NFS {
                     continue; // We should skip the "current directory".
                 }
 
-                NUtil::printf("[fs/ustar]: Discovered entry `%s`.\n", VFS::Path(name).construct());
-
                 uint64_t fsize = oct2int(current->size, sizeof(current->size));
                 uint64_t mtime = oct2int(current->mtime, sizeof(current->mtime));
                 uint64_t mode = oct2int(current->mode, sizeof(current->mode));
@@ -76,7 +74,6 @@ namespace NFS {
 
                         size_t count = node->write(lname, sizeof(current->linkname), 0);
                         assert(count, "Failed to write link to VFS node.\n");
-                        NUtil::printf("[fs/ustar]: Entry is a link from `%s` -> `%s`.\n", VFS::Path(name).construct(), lname);
                         break;
                     }
                     case type::PATH: {

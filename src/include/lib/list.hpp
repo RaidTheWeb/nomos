@@ -97,6 +97,196 @@ namespace NLib {
             }
     };
 
+    template<typename K, typename T>
+    class KVHashMap {
+        private:
+            struct entry {
+                K key;
+                T value;
+                struct entry *next = NULL;
+            };
+
+            struct entry **buckets = NULL;
+            size_t bucketcount = 0;
+            size_t itemcount = 0;
+            size_t load = 0;
+
+            // FNV-1a hash function.
+            size_t hash(uint8_t *key) const {
+                const size_t prime = 16777619;
+                size_t hash = 2166136261u;
+
+                for (size_t i = 0; i < sizeof(K); i++) {
+                    hash ^= (size_t)key[i];
+                    hash *= prime;
+                }
+                return hash % this->bucketcount;
+            }
+
+            void rehash(size_t newsize) {
+                struct entry **newbuckets = new struct entry *[newsize];
+                NLib::memset(newbuckets, 0, sizeof(struct entry *) * newsize);
+
+                for (size_t i = 0; i < this->bucketcount; i++) {
+                    struct entry *entry = this->buckets[i];
+                    while (entry) {
+                        struct entry *next = entry->next;
+                        size_t newidx = this->hash((uint8_t *)&entry->key);
+                        entry->next = newbuckets[newidx];
+                        newbuckets[newidx] = entry;
+                        entry = next;
+                    }
+                }
+
+                delete[] this->buckets; // Remove old buckets.
+
+                // Update with new bucket list.
+                this->buckets = newbuckets;
+                this->bucketcount = newsize;
+                this->load = (newsize * 3) / 4; // Update load factor.
+            }
+        public:
+            KVHashMap(size_t size = 16) {
+                this->bucketcount = size;
+                this->itemcount = 0;
+                this->buckets = new struct entry *[this->bucketcount];
+                NLib::memset(this->buckets, 0, sizeof(struct entry *) * this->bucketcount);
+                this->load = (this->bucketcount * 3) / 4;
+            }
+
+            ~KVHashMap(void) {
+                this->clear(); // Free all entries.
+                delete[] this->buckets;
+            }
+
+            void insert(K key, T &val) {
+                if (this->itemcount >= this->load) { // If we have too many items, we'll want to rehash for more buckets.
+                    this->rehash(this->bucketcount * 2); // Simply double the size.
+                }
+
+                size_t idx = this->hash((uint8_t *)&key);
+                struct entry *entry = this->buckets[idx];
+
+                // Loop through bucket to find an existing key.
+                while (entry) {
+                    if (entry->key == key) { // If the key already exists, we should just update the value.
+                        entry->value = val;
+                        return;
+                    }
+                    entry = entry->next;
+                }
+
+                struct entry *current = this->buckets[idx]; // Get current bucket at this index.
+                this->buckets[idx] = new struct entry;
+                this->buckets[idx]->key = key;
+                this->buckets[idx]->value = val;
+                this->buckets[idx]->next = current; // Point the bucket to our previous current bucket, while also setting values.
+                this->itemcount++;
+            }
+
+            bool remove(K key) {
+                size_t idx = this->hash((uint8_t *)&key);
+                struct entry **entry = &this->buckets[idx];
+
+                while (*entry) {
+                    if ((*entry)->key == key) {
+                        struct entry *todel = *entry;
+                        *entry = todel->next; // Skip this entry, we're deleting it.
+                        delete todel;
+
+                        this->itemcount--;
+                        return true; // Item was found.
+                    }
+                    entry = &(*entry)->next; // Skip to next one.
+                }
+                return false; // If we couldn't find a matching pair, we return false.
+            }
+
+            T *find(K key) {
+                size_t idx = this->hash((uint8_t *)&key);
+                struct entry *entry = this->buckets[idx];
+
+                while (entry) {
+                    if (entry->key == key) {
+                        return &entry->value; // Return a reference to the value, we found it.
+                    }
+                    entry = entry->next;
+                }
+                return NULL;
+            }
+
+            // Clear all entries within this hash map.
+            void clear(void) {
+                for (size_t i = 0; i < this->bucketcount; i++) {
+                    struct entry *entry = this->buckets[i];
+                    while (entry) {
+                        struct entry *next = entry->next;
+                        delete entry;
+                        entry = next;
+                    }
+                    this->buckets[i] = NULL;
+                }
+                this->itemcount = 0;
+            }
+
+            size_t size(void) {
+                return this->itemcount;
+            }
+
+            size_t capacity(void) {
+                return this->bucketcount;
+            }
+
+            class Iterator {
+                private:
+                    KVHashMap *map = NULL;
+                    size_t bucket = 0;
+                    struct entry *current = NULL;
+
+                    // Locate the next beginning of a bucket.
+                    void getnext(void) {
+                        while (!this->current && ++this->bucket < map->bucketcount) {
+                            this->current = this->map->buckets[this->bucket];
+                        }
+                    }
+                public:
+                    Iterator(KVHashMap *map, size_t bucket, struct entry *entry) {
+                        this->map = map;
+                        this->bucket = bucket;
+                        this->current = entry;
+                        if (this->bucket < this->map->bucketcount && !this->current) {
+                            this->getnext();
+                        }
+                    }
+
+                    bool valid(void) {
+                        return this->current;
+                    }
+
+                    K &key(void) {
+                        return this->current->key;
+                    }
+
+                    T *value(void) {
+                        return &this->current->value;
+                    }
+
+                    void next(void) {
+                        if (this->current) {
+                            this->current = this->current->next;
+                            if (!this->current) { // Reached the end of the bucket.
+                                this->getnext();
+                            }
+                        }
+                    }
+            };
+
+            // Get an iterator for the hashmap's entries.
+            Iterator begin(void) {
+                return Iterator(this, 0, this->buckets[0]);
+            }
+    };
+
     template<typename T>
     class HashMap {
         private:

@@ -3,5 +3,9 @@
 #include <lib/sync.hpp>
 
 namespace NDev {
+    DeviceRegistry *registry = NULL;
 
+    void setup(void) {
+        registry = new DeviceRegistry();
+    }
 }

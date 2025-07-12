@@ -137,6 +137,12 @@ namespace NSched {
 
     class Thread;
 
+    enum stdfds {
+        STDIN_FILENO = 0,
+        STDOUT_FILENO = 1,
+        STDERR_FILENO = 2
+    };
+
     class Process {
         private:
             void init(struct NArch::VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable);

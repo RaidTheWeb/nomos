@@ -75,7 +75,7 @@ namespace NDev {
     };
 
     static struct reginfo info = {
-        .name = "PS2",
+        .name = "ps2kbd",
         .type = reginfo::GENERIC,
         .match = { }
     };
