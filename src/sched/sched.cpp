@@ -675,8 +675,10 @@ namespace NSched {
 
             this->xctx.mathused = true;
 
-            // Initialise region.
-            asm volatile("xsave (%0)" : : "r"(this->xctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+            if (CPU::get()->hasxsave) {
+                // Initialise region.
+                asm volatile("xsave (%0)" : : "r"(this->xctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+            }
         }
 #endif
     }
