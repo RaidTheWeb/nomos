@@ -3,7 +3,8 @@
 
 namespace NFS {
     namespace RAMFS {
-        ssize_t RAMNode::read(void *buf, size_t count, off_t offset) {
+        ssize_t RAMNode::read(void *buf, size_t count, off_t offset, int fdflags) {
+            (void)fdflags;
             assert(buf, "Reading into invalid buffer.\n");
             assert(count, "Invalid count.\n");
 
@@ -20,7 +21,8 @@ namespace NFS {
             return count;
         }
 
-        ssize_t RAMNode::write(const void *buf, size_t count, off_t offset) {
+        ssize_t RAMNode::write(const void *buf, size_t count, off_t offset, int fdflags) {
+            (void)fdflags;
             NLib::ScopeSpinlock guard(&this->spin);
 
             if ((off_t)(offset + count) > this->attr.st_size) {

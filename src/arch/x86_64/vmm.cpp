@@ -331,13 +331,16 @@ namespace NArch {
         }
 
         extern "C" uint64_t sys_munmap(void *ptr, size_t size) {
+            NUtil::printf("sys_munmap(%p, %lu).\n", ptr, size);
+            assert(false, "Unimplemented system call.\n");
             return 0;
         }
 
         extern "C" uint64_t sys_mprotect(void *ptr, size_t size, int prot) {
+            NUtil::printf("sys_mprotect(%p, %lu, %d).\n", ptr, size, prot);
+            assert(false, "Unimplemented system call.\n");
             return 0;
         }
-
 
         void setup(void) {
 

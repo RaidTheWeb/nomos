@@ -3,24 +3,24 @@
 namespace NFS {
     namespace DEVFS {
 
-        ssize_t DevNode::read(void *buf, size_t count, off_t offset) {
+        ssize_t DevNode::read(void *buf, size_t count, off_t offset, int fdflags) {
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->read(minor(this->attr.st_rdev), buf, count, offset);
+            return this->device->driver->read(this->attr.st_rdev, buf, count, offset, fdflags);
         }
 
-        ssize_t DevNode::write(const void *buf, size_t count, off_t offset) {
+        ssize_t DevNode::write(const void *buf, size_t count, off_t offset, int fdflags) {
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->write(minor(this->attr.st_rdev), buf, count, offset);
+            return this->device->driver->write(this->attr.st_rdev, buf, count, offset, fdflags);
         }
 
         int DevNode::open(int flags) {
@@ -30,57 +30,61 @@ namespace NFS {
                 return -ENODEV;
             }
 
-            return this->device->driver->open(minor(this->attr.st_rdev), flags);
+            return this->device->driver->open(this->attr.st_rdev, flags);
         }
 
-        int DevNode::close(void) {
+        int DevNode::close(int fdflags) {
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->close(minor(this->attr.st_rdev));
+            return this->device->driver->close(this->attr.st_rdev, fdflags);
         }
 
-        int DevNode::mmap(void *addr, size_t offset, uint64_t flags) {
+        int DevNode::mmap(void *addr, size_t offset, uint64_t flags, int fdflags) {
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->mmap(minor(this->attr.st_rdev), addr, offset, flags);
+            return this->device->driver->mmap(this->attr.st_rdev, addr, offset, flags, fdflags);
         }
 
-        int DevNode::munmap(void *addr) {
+        int DevNode::munmap(void *addr, int fdflags) {
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->munmap(minor(this->attr.st_rdev), addr);
+            return this->device->driver->munmap(this->attr.st_rdev, addr, fdflags);
         }
 
-        int DevNode::isatty(void) {
+        int DevNode::ioctl(unsigned long request, uint64_t arg) {
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->isatty(minor(this->attr.st_rdev));
+            return this->device->driver->ioctl(this->attr.st_rdev, request, arg);
         }
 
-        int DevNode::ioctl(uint32_t request, uint64_t arg) {
+        int DevNode::stat(struct VFS::stat *st) {
             NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->ioctl(minor(this->attr.st_dev), request, arg);
+            int ret = this->device->driver->stat(this->attr.st_dev, st);
+            if (ret == -123123123) { // XXX: Make constant. Specific error code so that the device node knows to retrieve its stat attributes instead of the driver.
+                *st = this->attr;
+                return 0;
+            }
+            return ret;
         }
 
         VFS::INode *DevNode::resolvesymlink(void) {
@@ -94,7 +98,6 @@ namespace NFS {
                 return NULL;
             }
             VFS::VFS *vfs = this->fs->getvfs();
-            NUtil::printf("Resolve %s.\n", this->symlinktarget);
             return vfs->resolve(this->symlinktarget, this, false);
         }
 
@@ -174,6 +177,7 @@ namespace NFS {
             NDev::Device *dev = NDev::registry->get(attr.st_rdev);
             if (dev) {
                 dnode->setdev(dev);
+                dev->ifnode = dnode; // Give device a reference to the node it is connected to.
             } else {
                 delete dnode; // Invalid node.
                 return NULL;

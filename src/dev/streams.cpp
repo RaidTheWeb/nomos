@@ -25,7 +25,7 @@ namespace NDev {
                 registry->add(new Device(DEVFS::makedev(MAJOR, URANDOMMINOR), this));
 
                 // Initial stat struct. All of the streams are the same, so we can just change the device to reflect a different stream.
-                struct VFS::stat st{
+                struct VFS::stat st {
                     .st_mode = 0666 | VFS::S_IFCHR,
                     .st_rdev = DEVFS::makedev(MAJOR, NULLMINOR),
                     .st_blksize = 4096
@@ -46,8 +46,9 @@ namespace NDev {
                 VFS::vfs.create("/dev/urandom", st);
             }
 
-            ssize_t read(uint32_t minor, void *buf, size_t count, off_t offset) override {
+            ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {
                 (void)offset;
+                uint32_t minor = DEVFS::minor(dev);
 
                 switch (minor) {
                     case NULLMINOR: {
@@ -64,10 +65,10 @@ namespace NDev {
                 }
             }
 
-            ssize_t write(uint32_t minor, const void *buf, size_t count, off_t offset) override {
-                (void)minor;
+            ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 (void)buf;
                 (void)offset;
+                uint64_t minor = DEVFS::minor(dev);
 
                 if (minor == FULLMINOR) {
                     return -ENOSPC; // /dev/full should return ENOSPC error on write.

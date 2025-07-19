@@ -62,14 +62,14 @@ namespace NFS {
                     this->device = dev;
                 }
 
-                ssize_t read(void *buf, size_t count, off_t offset) override;
-                ssize_t write(const void *buf, size_t count, off_t offset) override;
+                ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
+                ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
                 int open(int flags) override;
-                int close(void) override;
-                int mmap(void *addr, size_t offset, uint64_t flags) override;
-                int munmap(void *addr) override;
-                int isatty(void) override;
-                int ioctl(uint32_t request, uint64_t arg) override;
+                int close(int fdflags) override;
+                int mmap(void *addr, size_t offset, uint64_t flags, int fdflags) override;
+                int munmap(void *addr, int fdflags) override;
+                int ioctl(unsigned long request, uint64_t arg) override;
+                int stat(struct VFS::stat *st) override;
                 VFS::INode *lookup(const char *name) override;
                 bool add(VFS::INode *node) override;
                 bool remove(const char *name) override;

@@ -13,6 +13,7 @@ namespace NUtil {
     int printf(const char *format, ...);
     int vprintf(const char *format, va_list ap);
 
+    extern bool canmutex;
     // Forcibly open print lock -> For use with panic().
     void oprintlock(void);
 }

@@ -10,6 +10,9 @@ extern sys_close
 extern sys_read
 extern sys_write
 extern sys_seek
+extern sys_ioctl
+extern sys_dup
+extern sys_dup2
 
 MAXSYSCALLS equ 256
 
@@ -26,6 +29,9 @@ syscall_table:
     dq sys_read
     dq sys_write
     dq sys_seek
+    dq sys_ioctl
+    dq sys_dup
+    dq sys_dup2
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 
@@ -69,6 +75,7 @@ syscall_entry:
     mov es, ax
     ; GS has already been set by SWAPGS.
 
+    sti
     mov rdi, [rsp + 96] ; RAX, system call number (96 offset in stack).
     cmp rdi, MAXSYSCALLS ; Test system call number against the number of system calls.
     jae .invalid ; If the system call number exceeds the number of system calls, we should return an ENOSYS error code.
@@ -95,6 +102,7 @@ syscall_entry:
     mov qword [rsp + 96], -38 ; -38 = -ENOSYS. Correct error number store.
 
 .done:
+    cli
     ; Restore original state.
     pop r15
     pop r14

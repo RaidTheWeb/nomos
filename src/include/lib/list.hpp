@@ -7,6 +7,87 @@
 namespace NLib {
 
     template<typename T>
+    class CircularBuffer {
+        private:
+            T *buffer = NULL;
+            size_t capacity = 0;
+            size_t head = 0;
+            size_t tail = 0;
+            size_t count = 0;
+        public:
+            CircularBuffer(size_t size) {
+                this->capacity = size;
+                this->buffer = new T[size];
+            }
+
+            ~CircularBuffer(void) {
+                delete[] this->buffer;
+            }
+
+            T *data(void) {
+                return &this->buffer[this->head]; // Return data from offset.
+            }
+
+            void push(T item) {
+                if (this->count < this->capacity) {
+                    this->buffer[this->tail] = item;
+                    this->tail = (this->tail + 1) % this->capacity;
+                    this->count++;
+                }
+            }
+
+            T popback(void) {
+                if (this->count > 0) {
+                    T item = this->buffer[this->tail];
+                    this->tail = (this->tail - 1) % this->capacity;
+                    this->count--;
+                    return item;
+                }
+                return T();
+            }
+
+            T pop(void) {
+                if (this->count > 0) {
+                    T item = this->buffer[this->head];
+                    this->head = (this->head + 1) % this->capacity;
+                    this->count--;
+                    return item;
+                }
+                return T();
+            }
+
+            T peek(size_t idx) {
+                if (idx < this->count) {
+                    size_t actualidx = (this->head + idx) % this->capacity;
+                    return this->buffer[actualidx];
+                }
+                return T();
+            }
+
+            size_t size(void) {
+                return this->count;
+            }
+
+            size_t available(void) {
+                return this->capacity - this->count;
+            }
+
+            bool empty(void) {
+                return !this->count;
+            }
+
+            bool full(void) {
+                return this->count == this->capacity;
+            }
+
+            void clear(void) {
+                this->head = 0;
+                this->tail = 0;
+                this->count = 0;
+            }
+    };
+
+    template<typename T>
     class Vector {
         private:
             T *data = NULL;
@@ -112,7 +193,7 @@ namespace NLib {
             size_t load = 0;
 
             // FNV-1a hash function.
-            size_t hash(uint8_t *key) const {
+            size_t hash(uint8_t *key, size_t count) const {
                 const size_t prime = 16777619;
                 size_t hash = 2166136261u;
 
@@ -120,7 +201,7 @@ namespace NLib {
                     hash ^= (size_t)key[i];
                     hash *= prime;
                 }
-                return hash % this->bucketcount;
+                return hash % count;
             }
 
             void rehash(size_t newsize) {
@@ -131,7 +212,7 @@ namespace NLib {
                     struct entry *entry = this->buckets[i];
                     while (entry) {
                         struct entry *next = entry->next;
-                        size_t newidx = this->hash((uint8_t *)&entry->key);
+                        size_t newidx = this->hash((uint8_t *)&entry->key, newsize);
                         entry->next = newbuckets[newidx];
                         newbuckets[newidx] = entry;
                         entry = next;
@@ -164,7 +245,7 @@ namespace NLib {
                     this->rehash(this->bucketcount * 2); // Simply double the size.
                 }
 
-                size_t idx = this->hash((uint8_t *)&key);
+                size_t idx = this->hash((uint8_t *)&key, this->bucketcount);
                 struct entry *entry = this->buckets[idx];
 
                 // Loop through bucket to find an existing key.
@@ -185,7 +266,7 @@ namespace NLib {
             }
 
             bool remove(K key) {
-                size_t idx = this->hash((uint8_t *)&key);
+                size_t idx = this->hash((uint8_t *)&key, this->bucketcount);
                 struct entry **entry = &this->buckets[idx];
 
                 while (*entry) {
@@ -203,7 +284,7 @@ namespace NLib {
             }
 
             T *find(K key) {
-                size_t idx = this->hash((uint8_t *)&key);
+                size_t idx = this->hash((uint8_t *)&key, this->bucketcount);
                 struct entry *entry = this->buckets[idx];
 
                 while (entry) {
@@ -302,15 +383,16 @@ namespace NLib {
             size_t load = 0;
 
             // FNV-1a hash function.
-            size_t hash(const char *key) const {
+            size_t hash(const char *key, size_t count) const {
                 const size_t prime = 16777619;
                 size_t hash = 2166136261u;
 
-                for (size_t i = 0; i < strlen(key); i++) {
+                size_t len = strlen(key);
+                for (size_t i = 0; i < len; i++) {
                     hash ^= (size_t)key[i];
                     hash *= prime;
                 }
-                return hash % this->bucketcount;
+                return hash % count;
             }
 
             void rehash(size_t newsize) {
@@ -321,7 +403,7 @@ namespace NLib {
                     struct entry *entry = this->buckets[i];
                     while (entry) {
                         struct entry *next = entry->next;
-                        size_t newidx = this->hash(entry->key);
+                        size_t newidx = this->hash(entry->key, newsize);
                         entry->next = newbuckets[newidx];
                         newbuckets[newidx] = entry;
                         entry = next;
@@ -354,7 +436,7 @@ namespace NLib {
                     this->rehash(this->bucketcount * 2); // Simply double the size.
                 }
 
-                size_t idx = this->hash(key);
+                size_t idx = this->hash(key, this->bucketcount);
                 struct entry *entry = this->buckets[idx];
 
                 // Loop through bucket to find an existing key.
@@ -375,7 +457,7 @@ namespace NLib {
             }
 
             bool remove(const char *key) {
-                size_t idx = this->hash(key);
+                size_t idx = this->hash(key, this->bucketcount);
                 struct entry **entry = &this->buckets[idx];
 
                 while (*entry) {
@@ -393,7 +475,7 @@ namespace NLib {
             }
 
             T *find(const char *key) {
-                size_t idx = this->hash(key);
+                size_t idx = this->hash(key, this->bucketcount);
                 struct entry *entry = this->buckets[idx];
 
                 while (entry) {

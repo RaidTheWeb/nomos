@@ -130,6 +130,23 @@ namespace NFS {
             uint64_t st_ctime   = 0;
         };
 
+        enum pollevents {
+            POLLIN              = (1 << 0), // Data to read.
+            POLLPRI             = (1 << 1), // Urgent data to read.
+            POLLOUT             = (1 << 2), // Write can occur.
+            POLLERR             = (1 << 3), // Error.
+            POLLHUP             = (1 << 4), // Hang up.
+            POLLNVAL            = (1 << 5), // Invalid.
+            POLLRDNORM          = (1 << 6), // POLLIN.
+            POLLWRNORM          = (1 << 7)  // POLLOUT.
+        };
+
+        struct pollfd {
+            int fd;
+            short events;
+            short revents;
+        };
+
         class IFileSystem;
 
         class Path {
@@ -283,32 +300,42 @@ namespace NFS {
 
                 virtual ~INode(void) = default;
 
-                virtual ssize_t read(void *buf, size_t count, off_t offset) = 0;
-                virtual ssize_t write(const void *buf, size_t count, off_t offset) = 0;
+                virtual ssize_t read(void *buf, size_t count, off_t offset, int fdflags) = 0;
+                virtual ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) = 0;
                 virtual int open(int flags) {
                     (void)flags;
                     return 0;
                 }
-                virtual int close(void) {
+                virtual int close(int fdflags) {
+                    (void)fdflags;
                     return 0;
                 }
-                virtual int mmap(void *addr, size_t offset, uint64_t flags) {
+                virtual int mmap(void *addr, size_t offset, uint64_t flags, int fdflags) {
                     (void)addr;
                     (void)offset;
                     (void)flags;
+                    (void)fdflags;
                     return -EFAULT;
                 }
-                virtual int munmap(void *addr) {
+                virtual int munmap(void *addr, int fdflags) {
                     (void)addr;
+                    (void)fdflags;
                     return -EFAULT;
                 }
-                virtual int isatty(void) {
-                    return -ENOTTY;
-                }
-                virtual int ioctl(uint32_t request, uint64_t arg) {
+                virtual int ioctl(unsigned long request, uint64_t arg) {
                     (void)request;
                     (void)arg;
                     return -EINVAL;
+                }
+                virtual int poll(int events, int *revents, int fdflags) {
+                    (void)events;
+                    (void)revents;
+                    (void)fdflags;
+                    return -EINVAL;
+                }
+                virtual int stat(struct stat *st) {
+                    *st = this->getattr();
+                    return 0;
                 }
 
                 // Locate child by name.

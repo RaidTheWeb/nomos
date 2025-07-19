@@ -35,10 +35,7 @@ namespace NArch {
 
     // This function runs as a thread, post scheduler initialisation.
     void archthreadinit(void) {
-        NUtil::printf("Hello kernel thread!\n");
-
         kpostarch();
-
 
         NSched::exit();
     }
@@ -131,10 +128,6 @@ namespace NArch {
 
         PMM::setup();
 
-        uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
-        CPU::getbsp()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack) + (64 * 1024 * 1024);
-        NUtil::printf("kernel stack %p.\n", stack);
-
         // GDT needs to be initialised and loaded before the IDT.
         GDT::setup();
         GDT::reload();
@@ -192,6 +185,8 @@ namespace NArch {
         SMP::setup();
 
         CPU::init(); // Initialise BSP state.
+
+        NUtil::canmutex = true; // We're allowed to print mutex now.
 
         NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)archthreadinit);
         NSched::schedulethread(kthread);

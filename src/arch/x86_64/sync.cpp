@@ -4,6 +4,17 @@
 #include <mm/slab.hpp>
 
 namespace NArch {
+
+    void IRQSpinlock::acquire(void) {
+        this->state = CPU::get()->setint(false); // Disable interrupts. Stops preemption.
+        this->Spinlock::acquire(); // Raw acquire internal lock.
+    }
+
+    void IRQSpinlock::release(void) {
+        this->Spinlock::release(); // Raw release internal lock.
+        CPU::get()->setint(this->state); // Restore initial interrupt state.
+    }
+
     // XXX: This needs to be made thread local!
     void MCSSpinlock::initstate(struct state *state) {
         state->depth = 0;

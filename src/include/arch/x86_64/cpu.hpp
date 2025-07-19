@@ -101,6 +101,9 @@ namespace NArch {
             NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.
             size_t schedintr; // Incremented every scheduler interrupt. Used for time-based calculations, as we can approximate a scheduled * NSched::QUANTUMMS = milliseconds conversion.
 
+            size_t fpusize = 0; // Size of FPU storage. Determines how FPU storage will be allocated when needed.
+            bool hasxsave = false; // Does this CPU support XSAVE? (AVX-* systems).
+            uint64_t xsavemask = 0;
 
             bool setint(bool status) {
                 asm volatile("cli");

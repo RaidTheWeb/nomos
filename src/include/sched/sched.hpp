@@ -153,16 +153,18 @@ namespace NSched {
             NFS::VFS::FileDescriptorTable *fdtable = NULL;
             NFS::VFS::INode *cwd = NULL;
             // Effective UID and GID, manipulated by syscalls.
-            int euid;
-            int egid;
+            int euid = 0;
+            int egid = 0;
 
             // Saved UID and GID. Used for reversion.
-            int suid;
-            int sgid;
+            int suid = 0;
+            int sgid = 0;
 
             // Real UID and GID. Who launched the program?
-            int uid;
-            int gid;
+            int uid = 0;
+            int gid = 0;
+
+            uint64_t tty; // Device ID of running TTY. XXX: Derive from standard streams? They would typically point to the current TTY themselves.
 
             Process(struct NArch::VMM::addrspace *space) {
                 this->init(space, NULL);
@@ -200,6 +202,7 @@ namespace NSched {
             };
 
             struct NArch::CPU::context ctx; // CPU working context (save state).
+            struct NArch::CPU::extracontext xctx; // CPU extra context (save state).
         private:
             enum target targetmode = target::RELAXED;
             uint16_t target = 0xffff; // Target CPU affinity (ideal).
@@ -245,6 +248,10 @@ namespace NSched {
                 this->ctx = *ctx; // Copy context over old context. Updating it.
             }
 
+            void savexctx(void) {
+                NArch::CPU::savexctx(&this->xctx); // Ask architecture implementation to save its extra context.
+            }
+
             void init(Process *proc, size_t stacksize, void *entry, void *arg);
 
             Thread(Process *proc, size_t stacksize, void *entry, void *arg) {
@@ -286,6 +293,20 @@ namespace NSched {
 
     // Await scheduling. This is run on the BSP to jump into the scheduler.
     void await(void);
+
+    class Mutex {
+        private:
+            volatile uint32_t locked;
+            NLib::DoubleList<Thread *> waitqueue;
+            NArch::Spinlock waitqueuelock;
+        public:
+            Mutex(void) {
+                this->locked = 0;
+            }
+
+            void acquire(void);
+            void release(void);
+    };
 
     // Scheduler initialisation (on BSP).
     void setup(void);

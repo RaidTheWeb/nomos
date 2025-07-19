@@ -288,6 +288,10 @@ namespace NFS {
                 return -EBADF;
             }
 
+            if (oldfd == newfd) {
+                return newfd; // Don't even bother.
+            }
+
             if (newfd >= (int)this->fds.getsize()) {
                 if (!this->fds.resize(newfd + 1)) {
                     return -ENOMEM;
@@ -301,9 +305,9 @@ namespace NFS {
                 }
             }
 
-            // XXX: Special case handling for standard streams.
+            bool stdstream = (newfd == NSched::STDIN_FILENO) || (newfd == NSched::STDOUT_FILENO) || (newfd == NSched::STDERR_FILENO);
 
-            if (this->openfds.test(newfd)) {
+            if (this->openfds.test(newfd) && !stdstream) { // Don't bother closing original file descriptor if its a standard stream.
                 if (this->fds[newfd]->unref() == 0) { // Decrement reference within our table.
                     delete fds[newfd];
                 }
@@ -539,6 +543,22 @@ namespace NFS {
             return fd;
         }
 
+        extern "C" uint64_t sys_dup(int fd, int flags) {
+            NUtil::printf("sys_dup(%d, %d).\n", fd, flags);
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            return proc->fdtable->dup(fd);
+        }
+
+        extern "C" uint64_t sys_dup2(int fd, int flags, int newfd) {
+            NUtil::printf("sys_dup2(%d, %d, %d).\n", fd, flags, newfd);
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            return proc->fdtable->dup2(fd, newfd);
+        }
+
         extern "C" uint64_t sys_close(int fd) {
             NUtil::printf("sys_close(%d).\n", fd);
 
@@ -558,7 +578,7 @@ namespace NFS {
             }
 
             INode *node = desc->getnode();
-            int res = node->close(); // Trigger close hook.
+            int res = node->close(desc->getflags()); // Trigger close hook.
             node->unref();
             if (res < 0) {
                 return res;
@@ -614,7 +634,7 @@ namespace NFS {
                 return -EINVAL;
             }
 
-            ssize_t read = node->read(buf, count, desc->getoff());
+            ssize_t read = node->read(buf, count, desc->getoff(), desc->getflags());
             node->unref();
             if (read < 0) {
                 MARKER;
@@ -666,7 +686,7 @@ namespace NFS {
                 wroff = st.st_size; // We should begin at the end of the file.
             }
 
-            ssize_t written = node->write(buf, count, wroff);
+            ssize_t written = node->write(buf, count, wroff, desc->getflags());
             node->unref();
             if (written < 0) {
                 return written;
@@ -677,6 +697,42 @@ namespace NFS {
             }
 
             return written;
+        }
+
+        extern "C" uint64_t sys_ioctl(int fd, unsigned long request, uint64_t arg) {
+            NUtil::printf("sys_ioctl(%d, %lu, %p).\n", fd, request, arg);
+
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            if (!arg) {
+                return -EFAULT;
+            }
+
+            if (!NMem::UserCopy::valid((void *)arg, 1)) {
+                return -EFAULT;
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            INode *node = desc->getnode();
+
+            struct stat st = node->getattr();
+
+            if (!S_ISCHR(st.st_mode)) {
+                node->unref();
+                return -ENOTTY; // Not character special.
+            }
+            int ret = node->ioctl(request, arg);
+            node->unref();
+
+            return ret;
         }
 
         extern "C" uint64_t sys_seek(int fd, off_t off, int whence) {

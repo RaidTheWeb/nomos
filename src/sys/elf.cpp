@@ -116,7 +116,7 @@ namespace NSys {
                 return false;
             }
 
-            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff) != sizeof(struct pheader) * hdr->phcount) {
+            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != sizeof(struct pheader) * hdr->phcount) {
                 return false;
             }
 
@@ -156,7 +156,7 @@ namespace NSys {
                         return false;
                     }
 
-                    if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff) != (ssize_t)phdrs[i].fsize) {
+                    if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
                         // Failed. Free everything we've currently acquired.
                         NArch::VMM::unmaprange(space, phdrs[i].vaddr, phdrs[i].msize); // Unmap range in space.
                         delete[] phdrs;

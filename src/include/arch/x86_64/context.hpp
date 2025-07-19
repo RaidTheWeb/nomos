@@ -1,6 +1,7 @@
 #ifndef _ARCH__X86_64__CONTEXT_HPP
 #define _ARCH__X86_64__CONTEXT_HPP
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace NArch {
@@ -35,6 +36,16 @@ namespace NArch {
             uint64_t rsp;
             uint64_t ss;
         } __attribute__((packed));
+
+        // Architecture-specific extra context.
+        struct extracontext {
+            uintptr_t fsbase = 0;
+            void *fpustorage = NULL; // FPU state storage (variable size). Only allocated when needed.
+            bool mathused = false; // Did the thread use math at all? Determines how fpu context is saved.
+        };
+
+        void savexctx(struct extracontext *ctx);
+        void restorexctx(struct extracontext *ctx);
 
         extern "C" void ctx_swap(struct context *ctx);
     }

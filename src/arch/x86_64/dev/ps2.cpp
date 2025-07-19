@@ -2,11 +2,16 @@
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
 #include <dev/dev.hpp>
+#include <dev/kbd.hpp>
 #include <stddef.h>
 #include <util/kprint.hpp>
 
 namespace NDev {
     using namespace NArch;
+
+    namespace KBD {
+        uint8_t cur;
+    }
 
     static const uint16_t DATAPORT   = 0x60;
     static const uint16_t CMDPORT    = 0x64;
@@ -67,10 +72,13 @@ namespace NDev {
 
                 uint8_t scan = read();
                 if (scan & 0x80) { // Release scancode.
+                    KBD::cur = 0;
                     return;
                 }
 
-                NUtil::printf("KBD Scan 0x%02x.\n", scan);
+                KBD::cur = scan;
+
+                // NUtil::printf("KBD Scan 0x%02x.\n", scan);
             }
     };
 

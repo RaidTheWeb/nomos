@@ -10,12 +10,47 @@ namespace NArch {
             return &bspinst;
         }
 
+        void savexctx(struct extracontext *ctx) {
+            (*ctx).fsbase = rdmsr(MSRFSBASE);
+
+            if (ctx->mathused) {
+                if (CPU::get()->hasxsave) {
+                    uint64_t xsavemask = CPU::get()->xsavemask;
+                    asm volatile(
+                        "xsave (%0)"
+                        : : "r"(ctx->fpustorage),
+                        "a"(xsavemask & 0xffffffff), "d"(xsavemask >> 32)
+                    );
+                } else {
+                    asm volatile("fxsave %0" : "=m"(ctx->fpustorage));
+                }
+            }
+        }
+
+        void restorexctx(struct extracontext *ctx) {
+            wrmsr(MSRFSBASE, ctx->fsbase);
+
+            if (ctx->mathused) {
+                if (CPU::get()->hasxsave) {
+                    assert(((uintptr_t)ctx->fpustorage & 0x3f) == 0, "Misaligned region.\n");
+                    uint64_t xsavemask = CPU::get()->xsavemask;
+                    asm volatile(
+                        "xrstor (%0)"
+                        : : "r"(ctx->fpustorage), "a"(xsavemask), "d"(xsavemask >> 32)
+                    );
+                } else {
+                    asm volatile("fxrstor %0" : : "m"(ctx->fpustorage));
+                }
+            }
+        }
+
         extern "C" uint64_t sys_prctl(uint64_t option, uint64_t arg1) {
             switch (option) {
                 case 0x1002:
                     if (!arg1) {
                         return -EINVAL;
                     }
+
                     wrmsr(MSRFSBASE, arg1);
                     return 0;
                 default:
@@ -24,6 +59,7 @@ namespace NArch {
         }
 
         extern "C" void sys_debug(char *text) {
+            // XXX: Disable in "production".
             NUtil::printf("%s\n", text);
         }
 
@@ -32,7 +68,7 @@ namespace NArch {
 
         void init(void) {
             CPU::get()->kcr3 = VMM::kspace.pml4phy;
-            wrmsr(MSRKGSBASE, 0x01);
+            wrmsr(MSRKGSBASE, 0x01); // We need to initialise this GS base, even if we aren't going to use it (CPU won't be happy).
 
             uint64_t efer = rdmsr(MSREFER);
             efer |= 1; // Set SYSCALL/SYSRET bit.
@@ -50,14 +86,74 @@ namespace NArch {
             wrmsr(MSRFMASK, 0x200); // The interrupt enable bits should be cleared from RFLAGS before syscall work (prevents interrupts from getting in the way). It'll be restored afterwards.
 
 
+            uint32_t eax, ebx, ecx, edx;
+            asm volatile(
+                "cpuid"
+                : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                : "a"(1)
+            );
+
+            assert(edx & (1 << 24), "CPU does not support at least FXSAVE/FXRSTOR (required for FPU states).");
+
+            // Enable x87.
             uint64_t cr0 = rdcr0();
-            cr0 &= ~((uint64_t)1 << 2);
-            cr0 |= (uint64_t)1 << 1;
+            cr0 &= ~((uint64_t)1 << 2); // Clear EM. We don't want x87 emulation.
+            cr0 |= (uint64_t)1 << 1; // Set NE.
             wrcr0(cr0);
 
+            asm volatile("fninit"); // Initialise FPU.
+
+            // Enable SSE.
             uint64_t cr4 = rdcr4();
-            cr4 |= (uint64_t)3 << 9;
+            cr4 |= (uint64_t)(1 << 9) | (uint64_t)(1 << 10); // Set OSFXSR and OSXMMEXCPT to enable FPU state work.
             wrcr4(cr4);
+
+            if (ecx & (1 << 26)) { // Check if XSAVE/XRSTOR are supported by the CPU.
+                cr4 = rdcr4();
+                cr4 |= (uint64_t)1 << 18; // Enable OSXSAVE. Required before XGETBV/XSETBV.
+                wrcr4(cr4);
+
+                uint32_t xcr0l, xcr0h;
+                // Get current state of XCR0.
+                asm volatile("xgetbv" : "=a"(xcr0l), "=d"(xcr0h) : "c"(0) : "memory");
+
+                // Build XSAVE mask out of the CPU's - and our - supported features.
+
+                if (edx & (1 << 0)) { // x87.
+                    xcr0l |= (1 << 0);
+                }
+
+                if (edx & (1 << 25)) {
+                    xcr0l |= (1 << 1);
+                }
+
+                if (ecx & (1 << 28)) { // AVX supported.
+                    xcr0l |= (1 << 2);
+                }
+
+                // Set XCR0 register to enable support for our mask.
+                asm volatile("xsetbv" : : "a"(xcr0l), "d"(xcr0h), "c"(0) : "memory");
+
+                asm volatile(
+                    "cpuid"
+                    : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) // Acquire XSAVE region size.
+                    : "a"(0x0d), "ecx"(0)
+                );
+
+
+                CPU::get()->xsavemask = ((uint64_t)xcr0h << 32) | xcr0l;
+                CPU::get()->fpusize = ecx; // ECX contains the FPU size (according to CPU manual). Used by scheduler to lazy allocate for FPU state.
+                CPU::get()->hasxsave = true;
+                if (CPU::get() == CPU::getbsp()) {
+                    NUtil::printf("[arch/x86_64/cpu]: Using XSAVE for FPU states.\n");
+                }
+            } else { // XSAVE is not supported, we should use legacy mode.
+                CPU::get()->fpusize = 512; // Default is 512 bytes.
+                CPU::get()->hasxsave = false;
+                if (CPU::get() == CPU::getbsp()) {
+                    NUtil::printf("[arch/x86_64/cpu]: Using FXSAVE for FPU states.\n");
+                }
+            }
         }
     }
 }

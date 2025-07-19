@@ -75,8 +75,15 @@ void kpostarch(void) {
 
 
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
-        if (entry->magic == NDev::MAGIC) {
-            NUtil::printf("Discovered driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
+        if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE1) {
+            NUtil::printf("[nomos]: Discovered stage 1 driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
+            entry->create();
+        }
+    }
+
+    for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
+        if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE2) {
+            NUtil::printf("[nomos]: Discovered stage 2 driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
             entry->create();
         }
     }
@@ -96,7 +103,7 @@ void kpostarch(void) {
     assert(node, "Failed to locate file.\n");
 
     struct NSys::ELF::header elfhdr;
-    assert(node->read(&elfhdr, sizeof(elfhdr), 0) == sizeof(elfhdr), "Failed to read ELF header.\n");
+    assert(node->read(&elfhdr, sizeof(elfhdr), 0, 0) == sizeof(elfhdr), "Failed to read ELF header.\n");
 
     assert(NSys::ELF::verifyheader(&elfhdr), "Failed to validate header.\n");
 
@@ -112,12 +119,10 @@ void kpostarch(void) {
     NSched::Process *proc = new NSched::Process(uspace);
 
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
-    NUtil::printf("Thread is %p.\n", uthread);
 
     uintptr_t ustack = (uintptr_t)NArch::PMM::alloc(1 << 20); // Allocate 1MB stack.
     assert(ustack, "Failed to allocate memory for user stack.\n");
 
-    NUtil::printf("Start of stack %p.\n", ustack);
     uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Subtract 4096 byte guard page from absolute maximum of userspace.
 
     uintptr_t ustackbottom = ustacktop - (1 << 20); // Bottom of stack.
@@ -128,8 +133,6 @@ void kpostarch(void) {
     void *phystart = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
     assert(phystart, "Stack alignment failed.\n");
 
-    NUtil::printf("Stack prepared at %p\n", phystart);
-
     // Reserve stack location. We don't want to end up allocating into the stack region on requests for virtual memory.
     uspace->vmaspace->reserve(ustackbottom, ustacktop, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
 
@@ -139,9 +142,11 @@ void kpostarch(void) {
     NArch::VMM::maprange(uspace, ustackbottom, (uintptr_t)ustack, NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::USER | NArch::VMM::PRESENT, (1 << 20)); // Map range.
 
     uthread->ctx.rip = elfhdr.entryoff;
-    NUtil::printf("Entry at %p.\n", elfhdr.entryoff);
     uthread->ctx.rsp = (uint64_t)phystart;
 
+    // NLimine::console_write("\x1b[2J\x1b[H", 7);
+
+    NUtil::printf("[nomos]: Starting user init.\n");
     NSched::schedulethread(uthread); // Dispatch!
 }
 

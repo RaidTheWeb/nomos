@@ -53,7 +53,7 @@ namespace NFS {
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
 
-                        size_t count = node->write((void *)((uintptr_t)current + 512), fsize, 0);
+                        size_t count = node->write((void *)((uintptr_t)current + 512), fsize, 0, 0);
                         assert(count == fsize, "Failed to write VFS node data.\n");
                         break;
                     }
@@ -72,7 +72,7 @@ namespace NFS {
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
 
-                        size_t count = node->write(lname, sizeof(current->linkname), 0);
+                        size_t count = node->write(lname, sizeof(current->linkname), 0, 0);
                         assert(count, "Failed to write link to VFS node.\n");
                         break;
                     }

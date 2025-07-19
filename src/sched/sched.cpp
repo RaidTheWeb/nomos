@@ -4,13 +4,13 @@
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
 #endif
+#include <fs/devfs.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 #include <sched/sched.hpp>
 
 namespace NSched {
     using namespace NArch;
-
 
     void RBTree::_insert(struct node *node, int (*cmp)(struct node *, struct node *)) {
 
@@ -444,10 +444,12 @@ namespace NSched {
 #ifdef __x86_64__
         CPU::get()->intstatus = thread->ctx.rflags & 0x200; // Restore the interrupt status of the thread.
         CPU::get()->ist.rsp0 = (uint64_t)thread->stacktop;
+
 #endif
         __atomic_store_n(&thread->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
 
 
+        CPU::restorexctx(&thread->xctx); // Restore extra context.
         CPU::ctx_swap(&thread->ctx); // Restore context.
 
         __builtin_unreachable();
@@ -500,6 +502,7 @@ namespace NSched {
             assert(next != cpu->idlethread, "Next thread should NEVER be the idle thread (it is not supposed to be in the run queue).\n");
 
             if (prev != next && prev != cpu->idlethread) {
+                prev->savexctx();
                 prev->savectx(ctx); // Use the interrupt context to override the save state of the previous thread.
             }
         }
@@ -544,20 +547,21 @@ namespace NSched {
         if (space == &VMM::kspace) {
             this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
         } else { // Only userspace threads should bother creating file descriptor tables.
+            this->tty = NFS::DEVFS::makedev(4, 1);
             if (!fdtable) {
                 this->fdtable = new NFS::VFS::FileDescriptorTable();
-                NFS::VFS::INode *stdin = NFS::VFS::vfs.resolve("/dev/zero");
+                NFS::VFS::INode *stdin = NFS::VFS::vfs.resolve("/dev/tty");
                 assert(stdin, "Could not resolve standard input.\n");
                 stdin->unref();
 
                 this->fdtable->reserve(STDIN_FILENO, stdin, NFS::VFS::O_RDONLY);
 
-                NFS::VFS::INode *stdout = NFS::VFS::vfs.resolve("/dev/console");
+                NFS::VFS::INode *stdout = NFS::VFS::vfs.resolve("/dev/tty");
                 assert(stdout, "Could not resolve standard output.\n");
                 stdout->unref();
 
                 this->fdtable->reserve(STDOUT_FILENO, stdout, NFS::VFS::O_WRONLY | NFS::VFS::O_CLOEXEC);
-                NFS::VFS::INode *stderr = NFS::VFS::vfs.resolve("/dev/null");
+                NFS::VFS::INode *stderr = NFS::VFS::vfs.resolve("/dev/tty");
                 assert(stderr, "Could not resolve standard error.\n");
                 stderr->unref();
 
@@ -591,6 +595,32 @@ namespace NSched {
         APIC::sendipi(CPU::get()->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
 
         // At this point, we've either been rescheduled (if we were running) or marked dead.
+    }
+
+    void Mutex::acquire(void) {
+#ifdef __x86_64__
+        while (__sync_lock_test_and_set(&this->locked, 1)) {
+#endif
+            __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
+            assert(NArch::CPU::get()->currthread != NArch::CPU::get()->idlethread, "Mutex on idle thread.\n");
+            this->waitqueuelock.acquire();
+            this->waitqueue.pushback(NArch::CPU::get()->currthread);
+            this->waitqueuelock.release();
+            yield(); // Yield into suspend.
+            // We're back, try to reacquire, and if we CAN, we're out!
+        }
+    }
+
+    void Mutex::release(void) {
+#ifdef __x86_64__
+        __sync_lock_release(&this->locked);
+#endif
+        this->waitqueuelock.acquire();
+        if (!this->waitqueue.empty()) {
+            Thread *thread = this->waitqueue.pop();
+            schedulethread(thread);
+        }
+        this->waitqueuelock.release();
     }
 
     void exit(void) {
@@ -636,6 +666,18 @@ namespace NSched {
         this->ctx.rdi = (uint64_t)arg; // Pass argument in through RDI (System V ABI first argument).
 
         this->ctx.rflags = 0x200; // Enable interrupts.
+
+        if (!this->process->kernel) {
+            this->xctx.fpustorage = PMM::alloc(CPU::get()->fpusize);
+            assert(this->xctx.fpustorage, "Failed to allocate thread's FPU storage.\n");
+            this->xctx.fpustorage = NArch::hhdmoff(this->xctx.fpustorage); // Refer to via HHDM offset.
+            NLib::memset(this->xctx.fpustorage, 0, CPU::get()->fpusize); // Clear memory.
+
+            this->xctx.mathused = true;
+
+            // Initialise region.
+            asm volatile("xsave (%0)" : : "r"(this->xctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+        }
 #endif
     }
 

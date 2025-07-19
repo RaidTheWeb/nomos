@@ -34,9 +34,6 @@ namespace NArch {
         static void wakeup(struct limine_mp_info *info) {
             CPU::set((struct CPU::cpulocal *)info->extra_argument); // Set from initial argument.
 
-            uint8_t *stack = (uint8_t *)PMM::alloc(64 * 1024 * 1024);
-            CPU::get()->ist.rsp0 = (uint64_t)NArch::hhdmoff((void *)stack) + (64 * 1024 * 1024);
-
             GDT::reload(); // "Reload" GDT -> Initialise it on this CPU.
             Interrupts::reload(); // "Reload" IDT -> Initialise it on this CPU.
 

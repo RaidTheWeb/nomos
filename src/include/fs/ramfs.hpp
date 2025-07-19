@@ -28,8 +28,8 @@ namespace NFS {
                     }
                 }
 
-                ssize_t read(void *buf, size_t count, off_t offset) override;
-                ssize_t write(const void *buf, size_t count, off_t offset) override;
+                ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
+                ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
                 VFS::INode *lookup(const char *name) override;
                 bool add(VFS::INode *node) override;
                 bool remove(const char *name) override;

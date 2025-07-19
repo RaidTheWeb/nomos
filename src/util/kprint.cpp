@@ -1,10 +1,12 @@
 #ifdef __x86_64__
 #include <arch/limine/console.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/sync.hpp>
 #endif
 #include <ctype.h>
 #include <lib/sync.hpp>
+#include <sched/sched.hpp>
 #include <util/kprint.hpp>
 
 namespace NUtil {
@@ -328,20 +330,33 @@ flagbreak:
         return len;
     }
 
-    int vprintf(const char *format, va_list ap) {
-        NLib::ScopeSpinlock guard(&printlock);
+    static NSched::Mutex mutex;
+    bool canmutex = false;
 
+    int vprintf(const char *format, va_list ap) {
         char buffer[1024];
         size_t len = vsnprintf(buffer, sizeof(buffer), format, ap);
         len -= 1; // Back out on null termination for this.
 
+
+        if (canmutex && NArch::CPU::get()->currthread) {
+            mutex.acquire();
+        } else {
+            printlock.acquire();
+        }
+
 #ifdef __x86_64__
-        NLimine::console_write(buffer, len);
+        // NLimine::console_write(buffer, len);
 
         for (size_t i = 0; i < len; i++) {
             NArch::Serial::ports[0].write(buffer[i]);
         }
 #endif
+        if (canmutex && NArch::CPU::get()->currthread) {
+            mutex.release();
+        } else {
+            printlock.release();
+        }
         return len;
     }
 }

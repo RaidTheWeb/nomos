@@ -1,6 +1,7 @@
 #ifndef _DEV__DEV_HPP
 #define _DEV__DEV_HPP
 
+#include <fs/vfs.hpp>
 #include <lib/errno.hpp>
 #include <lib/list.hpp>
 #include <stdbool.h>
@@ -28,6 +29,8 @@ namespace NDev {
             DevDriver *driver = NULL;
 
             uint64_t id;
+
+            NFS::VFS::INode *ifnode = NULL; // Device node for interface. Set automatically during node creation.
 
             Device(uint64_t id, DevDriver *driver) {
                 this->id = id;
@@ -70,51 +73,57 @@ namespace NDev {
 
             virtual ~DevDriver(void) = default;
 
-            virtual ssize_t read(uint32_t minor, void *buf, size_t count, off_t offset) {
-                (void)minor;
+            virtual ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) {
+                (void)dev;
                 (void)buf;
                 (void)count;
                 (void)offset;
+                (void)fdflags;
                 return 0;
             }
-            virtual ssize_t write(uint32_t minor, const void *buf, size_t count, off_t offset) {
-                (void)minor;
+            virtual ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) {
+                (void)dev;
                 (void)buf;
                 (void)count;
                 (void)offset;
+                (void)fdflags;
                 return 0;
             }
 //            XXX: virtual int poll(uint32_t minor, ...)
-            virtual int mmap(uint32_t minor, void *addr, size_t offset, uint64_t flags) {
-                (void)minor;
+            virtual int mmap(uint64_t dev, void *addr, size_t offset, uint64_t flags, int fdflags) {
+                (void)dev;
                 (void)addr;
                 (void)offset;
                 (void)flags;
+                (void)fdflags;
                 return -EFAULT;
             }
-            virtual int munmap(uint32_t minor, void *addr) {
-                (void)minor;
+            virtual int munmap(uint64_t dev, void *addr, int fdflags) {
+                (void)dev;
                 (void)addr;
+                (void)fdflags;
                 return -EFAULT;
             }
-            virtual int isatty(uint32_t minor) {
-                (void)minor;
-                return -ENOTTY;
-            }
-            virtual int open(uint32_t minor, int flags) {
-                (void)minor;
+            virtual int open(uint64_t dev, int flags) {
+                (void)dev;
                 (void)flags;
                 return 0;
             }
-            virtual int close(uint32_t minor) {
-                (void)minor;
+            virtual int close(uint64_t dev, int fdflags) {
+                (void)dev;
+                (void)fdflags;
                 return 0;
             }
-            virtual int ioctl(uint32_t minor, uint32_t request, uint64_t arg) {
-                (void)minor;
+            virtual int ioctl(uint64_t dev, unsigned long request, uint64_t arg) {
+                (void)dev;
                 (void)request;
                 (void)arg;
                 return -EINVAL;
+            }
+            virtual int stat(uint64_t dev, struct NFS::VFS::stat *st) {
+                (void)dev;
+                (void)st;
+                return -123123123; // Tell device node to default to node attributes.
             }
     };
 
@@ -126,8 +135,14 @@ namespace NDev {
             GENERIC // Always instantiated, it will handle probing and such on its own (used for stuff like PS2 drivers).
         };
 
+        enum stage { // Incredibly rudimentary way to provide load order. XXX: Implement a proper system for this later.
+            STAGE1,
+            STAGE2
+        };
+
         const char *name;
         enum type type; // What type of driver are we registering?
+        enum stage stage = STAGE1; // When should we load the driver?
 
         union {
             struct {

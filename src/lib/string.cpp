@@ -121,7 +121,22 @@ namespace NLib {
     }
 
     int strcmp(const char *s1, const char *s2) {
-        return memcmp((void *)s1, (void *)s2, strlen(s1));
+        size_t len1 = strlen(s1);
+        size_t len2 = strlen(s2);
+        size_t cmplen = len1 < len2 ? len1 : len2;
+
+        int ret = memcmp((void *)s1, (void *)s2, cmplen);
+
+        if (!ret) {
+            // Handle length differences. These count as inequalities.
+            if (len1 < len2) {
+                return -1;
+            } else if (len1 > len2) {
+                return 1;
+            }
+        }
+
+        return ret;
     }
 
     int strncmp(const char *s1, const char *s2, size_t n) {
