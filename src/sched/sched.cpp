@@ -445,9 +445,12 @@ namespace NSched {
         CPU::get()->intstatus = thread->ctx.rflags & 0x200; // Restore the interrupt status of the thread.
         CPU::get()->ist.rsp0 = (uint64_t)thread->stacktop;
 
+        thread->fctx.mathused = false; // Start thread not having used maths (so we don't *have* to save the context during this quantum, unless the thread uses the FPU in this time).
+        uint64_t cr0 = CPU::rdcr0();
+        cr0 |= (1 << 3); // Set TS bit.
+        CPU::wrcr0(cr0);
 #endif
         __atomic_store_n(&thread->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
-
 
         CPU::restorexctx(&thread->xctx); // Restore extra context.
         CPU::ctx_swap(&thread->ctx); // Restore context.
@@ -502,6 +505,11 @@ namespace NSched {
             assert(next != cpu->idlethread, "Next thread should NEVER be the idle thread (it is not supposed to be in the run queue).\n");
 
             if (prev != next && prev != cpu->idlethread) {
+#ifdef __x86_64__
+                if (prev->fctx.mathused) {
+                    CPU::savefctx(&prev->fctx); // Always save FPU context when the thread used maths.
+                }
+#endif
                 prev->savexctx();
                 prev->savectx(ctx); // Use the interrupt context to override the save state of the previous thread.
             }
@@ -668,16 +676,17 @@ namespace NSched {
         this->ctx.rflags = 0x200; // Enable interrupts.
 
         if (!this->process->kernel) {
-            this->xctx.fpustorage = PMM::alloc(CPU::get()->fpusize);
-            assert(this->xctx.fpustorage, "Failed to allocate thread's FPU storage.\n");
-            this->xctx.fpustorage = NArch::hhdmoff(this->xctx.fpustorage); // Refer to via HHDM offset.
-            NLib::memset(this->xctx.fpustorage, 0, CPU::get()->fpusize); // Clear memory.
-
-            this->xctx.mathused = true;
+            this->fctx.fpustorage = PMM::alloc(CPU::get()->fpusize);
+            assert(this->fctx.fpustorage, "Failed to allocate thread's FPU storage.\n");
+            this->fctx.fpustorage = NArch::hhdmoff(this->fctx.fpustorage); // Refer to via HHDM offset.
+            NLib::memset(this->fctx.fpustorage, 0, CPU::get()->fpusize); // Clear memory.
 
             if (CPU::get()->hasxsave) {
+                uint64_t cr0 = CPU::rdcr0();
+                asm volatile("clts");
                 // Initialise region.
-                asm volatile("xsave (%0)" : : "r"(this->xctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+                asm volatile("xsave (%0)" : : "r"(this->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+                CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
             }
         }
 #endif
@@ -745,6 +754,22 @@ namespace NSched {
         for (;;) {
             asm volatile("hlt");
         }
+    }
+
+    void handlelazyfpu(void) {
+#ifdef __x86_64__
+        // Lazily restore FPU context on-demand. This will also get the scheduler to store changes to our context when we swap tasks.
+
+        uint64_t cr0 = CPU::rdcr0();
+        if (cr0 & (1 << 3)) {
+            asm volatile("clts"); // Clear TS.
+
+            CPU::restorefctx(&CPU::get()->currthread->fctx); // Restore context.
+            CPU::get()->currthread->fctx.mathused = true; // Mark as used, so the scheduler knows to save the context later.
+            return;
+        }
+#endif
+        assert(false, "Invalid FPU lazy load trigger!\n");
     }
 
     extern "C" uint64_t sys_exit(int status) {

@@ -56,13 +56,14 @@ namespace NArch {
             }
     };
 
-    // Special class of spinlock that blocks disables interrupts while holding the lock. NOTE: Do NOT use in thread-thread synchronisation cases, only for thread-interrupt synchronisation cases.
-    class IRQSpinlock : public Spinlock {
+    // Special wrapper class for spinlocks that blocks and disables interrupts while holding the lock. NOTE: Do NOT use in thread-thread synchronisation cases, only for thread-interrupt synchronisation cases.
+    class IRQSpinlock {
         private:
             bool state;
+            NArch::Spinlock *lock;
         public:
-            IRQSpinlock(void) : Spinlock() {
-
+            IRQSpinlock(NArch::Spinlock *lock) {
+                this->lock = lock;
             }
 
             void acquire(void);

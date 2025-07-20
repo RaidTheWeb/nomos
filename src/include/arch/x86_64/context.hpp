@@ -40,12 +40,17 @@ namespace NArch {
         // Architecture-specific extra context.
         struct extracontext {
             uintptr_t fsbase = 0;
+        };
+
+        struct fpucontext {
             void *fpustorage = NULL; // FPU state storage (variable size). Only allocated when needed.
             bool mathused = false; // Did the thread use math at all? Determines how fpu context is saved.
         };
 
         void savexctx(struct extracontext *ctx);
+        void savefctx(struct fpucontext *ctx);
         void restorexctx(struct extracontext *ctx);
+        void restorefctx(struct fpucontext *ctx);
 
         extern "C" void ctx_swap(struct context *ctx);
     }

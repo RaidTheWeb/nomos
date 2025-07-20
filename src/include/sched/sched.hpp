@@ -203,6 +203,7 @@ namespace NSched {
 
             struct NArch::CPU::context ctx; // CPU working context (save state).
             struct NArch::CPU::extracontext xctx; // CPU extra context (save state).
+            struct NArch::CPU::fpucontext fctx; // CPU fpu context (save state).
         private:
             enum target targetmode = target::RELAXED;
             uint16_t target = 0xffff; // Target CPU affinity (ideal).
@@ -307,6 +308,9 @@ namespace NSched {
             void acquire(void);
             void release(void);
     };
+
+    // Handler called by architecture-specific interrupt handler, will trigger when we need to handle a lazy FPU load.
+    void handlelazyfpu(void);
 
     // Scheduler initialisation (on BSP).
     void setup(void);

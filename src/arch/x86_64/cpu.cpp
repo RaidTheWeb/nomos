@@ -12,24 +12,28 @@ namespace NArch {
 
         void savexctx(struct extracontext *ctx) {
             (*ctx).fsbase = rdmsr(MSRFSBASE);
+        }
 
-            if (ctx->mathused) {
-                if (CPU::get()->hasxsave) {
-                    uint64_t xsavemask = CPU::get()->xsavemask;
-                    asm volatile(
-                        "xsave (%0)"
-                        : : "r"(ctx->fpustorage),
-                        "a"(xsavemask & 0xffffffff), "d"(xsavemask >> 32)
-                    );
-                } else {
-                    asm volatile("fxsave %0" : "=m"(ctx->fpustorage));
-                }
+        void savefctx(struct fpucontext *ctx) {
+            if (CPU::get()->hasxsave) {
+                uint64_t xsavemask = CPU::get()->xsavemask;
+                asm volatile(
+                    "xsave (%0)"
+                    : : "r"(ctx->fpustorage),
+                    "a"(xsavemask & 0xffffffff), "d"(xsavemask >> 32)
+                );
+            } else {
+                asm volatile("fxsave %0" : "=m"(ctx->fpustorage));
             }
+
+            ctx->mathused = true;
         }
 
         void restorexctx(struct extracontext *ctx) {
             wrmsr(MSRFSBASE, ctx->fsbase);
+        }
 
+        void restorefctx(struct fpucontext *ctx) {
             if (ctx->mathused) {
                 if (CPU::get()->hasxsave) {
                     assert(((uintptr_t)ctx->fpustorage & 0x3f) == 0, "Misaligned region.\n");
@@ -102,6 +106,7 @@ namespace NArch {
             wrcr0(cr0);
 
             asm volatile("fninit"); // Initialise FPU.
+            asm volatile("clts");
 
             // Enable SSE.
             uint64_t cr4 = rdcr4();

@@ -92,15 +92,20 @@ namespace NArch {
         void exception_handler(struct isr *isr, struct CPU::context *ctx) {
             (void)ctx;
             char errbuffer[2048];
-            if ((isr->id & 0xffffffff) == 14) {
+            if ((isr->id & 0xffffffff) == 14) { // #PF
                 uintptr_t addr = 0;
                 asm volatile(
                     "mov %%cr2, %0"
                     : "=r"(addr) : : "memory"
                 );
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s.\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor");
-            } else if ((isr->id & 0xffffffff) == 13) {
+            } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+            } else if ((isr->id & 0xffffffff) == 7) { // #NM
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "#NM at %p.\n", ctx->rip);
+                NLimine::console_write(errbuffer, NLib::strlen(errbuffer));
+                NSched::handlelazyfpu();
+                return;
             } else {
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
             }
