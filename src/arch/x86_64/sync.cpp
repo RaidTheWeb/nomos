@@ -1,9 +1,52 @@
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/sync.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 
 namespace NArch {
+
+    void Spinlock::acquire(void) {
+        if (SMP::initialised && CPU::get()->currthread) {
+            __atomic_add_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
+        }
+        while (true) {
+            if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) { // Try to exchange, if it goes through with success, we now own the lock.
+                break; // Success!
+            }
+
+            // Otherwise, wait on it.
+
+            size_t backoff = BACKOFFMIN;
+            do {
+                for (size_t i = 0; i < backoff; i++) {
+                    asm volatile("pause"); // Pause to avoid consuming crazy amounts of power during contention. Backoff is used to reduce contention.
+                }
+
+                backoff = (backoff << 1) | 1;
+                if (backoff > BACKOFFMAX) {
+                    backoff = BACKOFFMAX;
+                }
+            } while (this->locked);
+        }
+    }
+
+    bool Spinlock::trylock(void) {
+        if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) {
+            if (SMP::initialised && CPU::get()->currthread) {
+                __atomic_add_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void Spinlock::release(void) {
+        __atomic_store_n(&this->locked, 0, memory_order_release);
+        if (SMP::initialised && CPU::get()->currthread) {
+            __atomic_sub_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
+        }
+    }
 
     void IRQSpinlock::acquire(void) {
         this->state = CPU::get()->setint(false); // Disable interrupts. Stops preemption.
@@ -16,7 +59,6 @@ namespace NArch {
         CPU::get()->setint(this->state); // Restore initial interrupt state.
     }
 
-    // XXX: This needs to be made thread local!
     void MCSSpinlock::initstate(struct state *state) {
         state->depth = 0;
         state->node = new struct mcsnode;

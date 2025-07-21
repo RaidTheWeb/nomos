@@ -1,4 +1,5 @@
 #include <arch/x86_64/apic.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
 #include <dev/dev.hpp>
@@ -58,12 +59,15 @@ namespace NDev {
 
                 writecmd(0xae); // Enable PS/2 port 1.
 
+                NArch::CPU::get()->currthread->disablemigrate(); // Guard to prevent the thread from being migrated to a different CPU halfway through registering an interrupt handler on it.
+
                 uint8_t vec = Interrupts::allocvec(); // Allocate vector for keyboard handler.
 
                 // Register ISR for the keyboard handler.
                 Interrupts::regisr(vec, kbdhandler, true);
 
-                APIC::setirq(1, vec, false, 0); // Unmask IRQ1 for keyboard handler.
+                APIC::setirq(1, vec, false, NArch::CPU::get()->id); // Unmask IRQ1 for keyboard handler.
+                NArch::CPU::get()->currthread->enablemigrate();
             }
 
             static void kbdhandler(struct Interrupts::isr *isr, struct CPU::context *ctx) {

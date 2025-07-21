@@ -113,8 +113,7 @@ namespace NArch {
             NMem::Virt::VMASpace *vmaspace;
 
             size_t ref;
-
-            Spinlock lock; // Queued spinlocking, to prevent race conditions on page table modifications. XXX: Fast enough to consider normal spinlocking?
+            Spinlock lock;
         };
 
         // (Unlocked) Resolve physical address of a virtual address.

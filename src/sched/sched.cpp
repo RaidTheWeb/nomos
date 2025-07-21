@@ -351,6 +351,10 @@ namespace NSched {
             // Atomically load the load of the CPU. We want to be avoiding using spinlocks, so we don't occupy the instance's state.
             uint64_t load = __atomic_load_n(&SMP::cpulist[i]->loadweight, memory_order_seq_cst);
 
+            if (load > ourload * 2) { // Early exit for severely overloaded CPU.
+                return SMP::cpulist[i];
+            }
+
             if (load > maxload && load > ourload + STEALTHRESHOLD) { // If this is the biggest load thus far, *AND* exceeds our threshold, we'll keep this in mind for stealing from.
                 maxload = load; // Update maximum load thus far, for comparison against others.
                 busiest = SMP::cpulist[i]; // Thus far, this is our busiest CPU.
@@ -400,20 +404,27 @@ namespace NSched {
     Thread *steal(void) {
         struct CPU::cpulocal *busiest = getstealbusiest(); // Get a handle on the busiest CPU.
 
-        busiest = NULL;
+
         if (!busiest) {
             return NULL; // We're done here, there's nothing we can do.
         }
 
         busiest->runqueue.lock.acquire(); // We have multiple things we want to be doing, and don't want any race conditions during our work.
-        struct RBTree::node *node = busiest->runqueue._last(); // Grab node that is the last to be run (typically, higher virtual runtime).
+        struct RBTree::node *node = busiest->runqueue._first(); // Grab node that is the last to be run (typically, higher virtual runtime).
         if (!node) {
             busiest->runqueue.lock.release();
             return NULL; // We're done here, only one node is in the run queue (it's probably running right now, even).
         }
         Thread *stolen = RBTree::getentry<Thread>(node);
+        if (__atomic_load_n(&stolen->locksheld, memory_order_seq_cst) > 0 || stolen->migratedisabled) { // "Stealable" threads either don't currently hold a spinlock, or have migration enabled.
+            busiest->runqueue.lock.release();
+            return NULL;
+        }
+
         busiest->runqueue._erase(node); // Remove this node from the list.
         busiest->runqueue.lock.release();
+
+        updateload(busiest);
 
         stolen->cid = CPU::get()->id; // Update CID.
         return stolen; // XXX: Worry about the steal() function stealing from a thread that is referencing a different CPU during operation. Solution: Only steal non-suspended threads.
@@ -539,6 +550,7 @@ namespace NSched {
         // We haven't changed anything. We were just given our old thread, this happens most commonly when running the idle thread.
         // It'd be a waste to attempt to context switch when we're working on the same code.
 
+        cpu->setint(true); // Although it'll be re-enabled during the context switch, we may have lost track of the interrupt state here. So, we should explicitly reenable it before rescheduling.
         APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
 
         // If it's the same thread, we'll just be dumped right back to where we are.
@@ -617,12 +629,14 @@ namespace NSched {
             yield(); // Yield into suspend.
             // We're back, try to reacquire, and if we CAN, we're out!
         }
+        __atomic_add_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
     }
 
     void Mutex::release(void) {
 #ifdef __x86_64__
         __sync_lock_release(&this->locked);
 #endif
+        __atomic_sub_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
         this->waitqueuelock.acquire();
         if (!this->waitqueue.empty()) {
             Thread *thread = this->waitqueue.pop();
@@ -652,15 +666,13 @@ namespace NSched {
         this->stacksize = stacksize;
 
         // Allocate thread ID.
-        this->id = __atomic_add_fetch(&pidcounter, 1, memory_order_seq_cst);
+        this->id = __atomic_add_fetch(&this->process->tidcounter, 1, memory_order_seq_cst);
 
         // Zero context.
         NLib::memset(&this->ctx, 0, sizeof(this->ctx));
 
         // Initialise context:
 #ifdef __x86_64__
-        // XXX: These would be different segments for userspace:
-
         uint64_t code = this->process->kernel ? 0x08 : 0x23;
         uint64_t data = this->process->kernel ? 0x10 : 0x1b;
         this->ctx.cs = code; // Kernel Code.
@@ -725,11 +737,14 @@ namespace NSched {
         await(); // Jump into scheduler.
     }
 
+    bool initialised; // Is the scheduler working?
+
     void setup(void) {
         // Create PID 0 for kernel threading. Uses kernel address space so that the process has access to the entire memory map.
         kprocess = new Process(&VMM::kspace);
 
         Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process. We need not set any affinity logic, as this thread is never actually *scheduled*.
+
 
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(16 * PAGESIZE))); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
         CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
@@ -754,6 +769,21 @@ namespace NSched {
         for (;;) {
             asm volatile("hlt");
         }
+    }
+
+    extern "C" uint64_t sys_gettid(void) {
+        NUtil::printf("sys_gettid().\n");
+        return CPU::get()->currthread->id;
+    }
+
+    extern "C" uint64_t sys_getpid(void) {
+        NUtil::printf("sys_getpid().\n");
+        return CPU::get()->currthread->process->id;
+    }
+
+    extern "C" uint64_t sys_getppid(void) {
+        NUtil::printf("sys_getppid().\n");
+        return 1;
     }
 
     void handlelazyfpu(void) {

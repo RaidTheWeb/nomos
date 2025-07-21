@@ -50,12 +50,12 @@ namespace NArch {
         };
 
         struct isr *regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi) {
-            bool old = CPU::get()->setint(false); // Clear. XXX: Should be only clearing if not already cleared (record interrupt state for current CPU).
+            bool old = CPU::get()->setint(false); // Clear.
 
             struct isr *isr = &CPU::get()->isrtable[vec];
             isr->eoi = eoi;
             isr->func = func;
-            isr->id = ((uint64_t)CPU::get()->lapicid << 32) | vec; // XXX: Encode ISR ID.
+            isr->id = ((uint64_t)CPU::get()->lapicid << 32) | vec;
 
             CPU::get()->setint(old); // Restore.
             return isr;
@@ -102,8 +102,6 @@ namespace NArch {
             } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
             } else if ((isr->id & 0xffffffff) == 7) { // #NM
-                NUtil::snprintf(errbuffer, sizeof(errbuffer), "#NM at %p.\n", ctx->rip);
-                NLimine::console_write(errbuffer, NLib::strlen(errbuffer));
                 NSched::handlelazyfpu();
                 return;
             } else {

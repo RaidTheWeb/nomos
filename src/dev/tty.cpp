@@ -247,6 +247,8 @@ static char asciitable[] = {
             // /dev/tty0 represents the global currently active VT (CTRL+ALT+F# stuff).
             // /dev/tty1-63 are virtual consoles. Kind of assumes that this is for a seated user. /dev/ttyS# does as well, but does it through serial terminals.
 
+            // XXX: Implement VT system for /dev/tty0. Simply builds on top of existing /dev/tty#, but can be switched through with keyboard events.
+
             static const uint32_t MAJOR = 4; // TTY major. Actual virtual consoles.
             static const uint32_t MINMINOR = 1;
             static const uint32_t MAXMINOR = 63; // Ends at /dev/tty63, past this are the /dev/ttyS# devices, which this driver does NOT implement.
@@ -444,7 +446,6 @@ static char asciitable[] = {
                     }
                 }
 
-                // XXX: Implement ioctls.
                 return -EINVAL;
             }
     };

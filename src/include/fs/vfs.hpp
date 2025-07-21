@@ -269,7 +269,7 @@ namespace NFS {
                     return this->components.back();
                 }
 
-                // XXX: Caller is expected to free result.
+                // NOTE: Caller is expected to free result.
                 const char *dirname(void) {
                     if (this->components.empty()) {
                         return this->absolute ? "/" : "";

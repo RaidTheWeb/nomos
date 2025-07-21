@@ -693,7 +693,7 @@ namespace NFS {
             }
 
             if (!(desc->getflags() & O_APPEND)) {
-                desc->setoff(wroff + written); // New offset should be here. XXX: Useless? We already rely on st_size.
+                desc->setoff(wroff + written); // New offset should be here.
             }
 
             return written;

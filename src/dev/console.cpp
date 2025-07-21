@@ -16,7 +16,6 @@ namespace NDev {
         private:
             // Syscon simply just aliases a TTY, but provides additional functionality specific to a system "console".
             // TTY that syscon aliases can be determined by command line options.
-            // XXX: Dependency resolution. What if a driver relies on another already having been initialised? syscon needs tty to have been initialised to be able to properly interpret redirection arguments.
 
             static const uint64_t DEVICEID = DEVFS::makedev(5, 1); // /dev/console device id.
             VFS::INode *targetnode = NULL;
@@ -39,7 +38,7 @@ namespace NDev {
                 if (!target) {
                     // Well. What now? Default to /dev/tty0?
                     // Technically, redirects don't care about whether the target is a TTY or not, we could just send reads and writes to /dev/null, to disable kernel logging.
-                    target = "tty1"; // Default to tty0.
+                    target = "tty1"; // Default to tty0. XXX: Actually implement VT handling through /dev/tty0.
                 }
                 char path[1024];
                 NUtil::snprintf(path, sizeof(path), "/dev/%s", target);

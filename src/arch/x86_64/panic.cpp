@@ -3,7 +3,6 @@
 
 namespace NArch {
     void panic(const char *msg) {
-
         APIC::lapicstop(); // Prevent any scheduling work from jumping a CPU out of the panic state.
         if (SMP::initialised) { // If we have other CPUs to stop:
             // Halt all other CPUs.
@@ -13,6 +12,7 @@ namespace NArch {
         CPU::get()->setint(false); // Disable interrupts. We don't want to be woken up.
 
         NUtil::oprintlock();
+        NUtil::canmutex = false; // Prevent usage of mutexes during panic.
 
         NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: %s", msg);
         for (;;) {

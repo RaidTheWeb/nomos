@@ -150,6 +150,7 @@ namespace NSched {
             struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space.
             bool kernel = false;
             size_t id; // Process ID.
+            size_t tidcounter = 0; // Thread ID counter.
             NFS::VFS::FileDescriptorTable *fdtable = NULL;
             NFS::VFS::INode *cwd = NULL;
             // Effective UID and GID, manipulated by syscalls.
@@ -164,7 +165,7 @@ namespace NSched {
             int uid = 0;
             int gid = 0;
 
-            uint64_t tty; // Device ID of running TTY. XXX: Derive from standard streams? They would typically point to the current TTY themselves.
+            uint64_t tty; // Device ID of process' controlling TTY.
 
             Process(struct NArch::VMM::addrspace *space) {
                 this->init(space, NULL);
@@ -218,6 +219,9 @@ namespace NSched {
             size_t cid = 0; // Current CPU ID. What CPU owns this right now?
             size_t lastcid = 0; // Last CPU ID. What CPU owned it before?
 
+            bool migratedisabled = false; // Outright prevent migration of this thread. NOTE: Useful for critical sections that use per-CPU data (i.e. driver interrupt handler registration).
+            size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
+
             // Called every timeslice, updates weighted vruntime for later scheduling prioritisation.
             void setvruntime(uint64_t delta) {
                 uint64_t weight = NICEWEIGHTS[this->nice + 20];
@@ -227,6 +231,14 @@ namespace NSched {
             // Set how nice the thread will be to other threads during scheduling. Higher niceness levels will schedule less often.
             void setnice(int nice) {
                 this->nice = (nice < -20) ? -20 : (nice > 19) ? 19 : nice;
+            }
+
+            void enablemigrate(void) {
+                this->migratedisabled = false;
+            }
+
+            void disablemigrate(void) {
+                this->migratedisabled = true;
             }
 
             int getnice(void) {
@@ -311,6 +323,8 @@ namespace NSched {
 
     // Handler called by architecture-specific interrupt handler, will trigger when we need to handle a lazy FPU load.
     void handlelazyfpu(void);
+
+    extern bool initialised;
 
     // Scheduler initialisation (on BSP).
     void setup(void);

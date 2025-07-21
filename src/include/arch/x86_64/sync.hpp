@@ -23,37 +23,9 @@ namespace NArch {
                 this->locked = 0;
             }
 
-            void acquire(void) {
-                while (true) {
-                    if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) { // Try to exchange, if it goes through with success, we now own the lock.
-                        break; // Success!
-                    }
-
-                    // Otherwise, wait on it.
-
-                    size_t backoff = BACKOFFMIN;
-                    do {
-                        for (size_t i = 0; i < backoff; i++) {
-                            asm volatile("pause"); // Pause to avoid consuming crazy amounts of power during contention. Backoff is used to reduce contention.
-                        }
-
-                        backoff = (backoff << 1) | 1;
-                        if (backoff > BACKOFFMAX) {
-                            backoff = BACKOFFMAX;
-                        }
-                    } while (this->locked);
-                }
-            }
-
-            bool trylock(void) {
-                // Only *attempt* to acquire the lock.
-                return __atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0;
-            }
-
-            void release(void) {
-                // Release the lock.
-                __atomic_store_n(&this->locked, 0, memory_order_release);
-            }
+            void acquire(void);
+            bool trylock(void);
+            void release(void);
     };
 
     // Special wrapper class for spinlocks that blocks and disables interrupts while holding the lock. NOTE: Do NOT use in thread-thread synchronisation cases, only for thread-interrupt synchronisation cases.

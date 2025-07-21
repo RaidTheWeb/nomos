@@ -13,6 +13,9 @@ extern sys_seek
 extern sys_ioctl
 extern sys_dup
 extern sys_dup2
+extern sys_gettid
+extern sys_getpid
+extern sys_getppid
 
 MAXSYSCALLS equ 256
 
@@ -32,6 +35,9 @@ syscall_table:
     dq sys_ioctl
     dq sys_dup
     dq sys_dup2
+    dq sys_gettid
+    dq sys_getpid
+    dq sys_getppid
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 
