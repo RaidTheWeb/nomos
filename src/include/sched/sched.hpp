@@ -2,11 +2,14 @@
 #define _SCHED__SCHED_HPP
 
 #ifdef __x86_64__
+#include <arch/x86_64/barrier.hpp>
 #include <arch/x86_64/context.hpp>
 #include <arch/x86_64/sync.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
 #include <fs/vfs.hpp>
+#include <sched/jobctrl.hpp>
+#include <sched/signal.hpp>
 #include <util/kmarker.hpp>
 #include <stddef.h>
 
@@ -96,6 +99,9 @@ namespace NSched {
             // Get next node (Unlocked).
             struct node *_next(struct node *node);
 
+            // Get previous node (Unlocked).
+            struct node *_prev(struct node *node);
+
             // Get last node (Unlocked).
             struct node *_last(void);
 
@@ -131,6 +137,11 @@ namespace NSched {
                 return this->_next(node);
             }
 
+            struct node *prev(struct node *node) {
+                NLib::ScopeSpinlock guard(&this->lock);
+                return this->_prev(node);
+            }
+
             // Count the number of nodes within the Red-Black tree.
             size_t count(void);
     };
@@ -147,10 +158,11 @@ namespace NSched {
         private:
             void init(struct NArch::VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable);
         public:
+            // XXX: Free allocations made with mmap.
             struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space.
             bool kernel = false;
             size_t id; // Process ID.
-            size_t tidcounter = 0; // Thread ID counter.
+            size_t tidcounter = 1; // Thread ID counter.
             NFS::VFS::FileDescriptorTable *fdtable = NULL;
             NFS::VFS::INode *cwd = NULL;
             // Effective UID and GID, manipulated by syscalls.
@@ -165,6 +177,17 @@ namespace NSched {
             int uid = 0;
             int gid = 0;
 
+            NArch::Spinlock lock;
+
+            Process *parent = NULL;
+            NLib::DoubleList<Process *> children;
+
+            ProcessGroup *pgrp = NULL;
+            Session *session = NULL;
+
+            size_t threadcount = 0;
+            NLib::DoubleList<Thread *> threads;
+
             uint64_t tty; // Device ID of process' controlling TTY.
 
             Process(struct NArch::VMM::addrspace *space) {
@@ -177,6 +200,8 @@ namespace NSched {
 
             ~Process(void);
     };
+
+    extern NLib::KVHashMap<size_t, Process *> *pidtable;
 
     extern Process *kprocess; // Kernel process.
 
@@ -213,6 +238,10 @@ namespace NSched {
             int nice = 0; // -20 to +19, used for virtual runtime weighting. Lower values mean higher priority.
 
         public:
+            struct signal signal;
+            struct NArch::CPU::context sctx; // Signal working context.
+            bool rescheduling = false;
+
             enum state tstate = state::READY; // Current state of thread.
             struct RBTree::node node; // Red-Black tree node for this thread.
             size_t id = 0; // Thread ID.
@@ -226,19 +255,23 @@ namespace NSched {
             void setvruntime(uint64_t delta) {
                 uint64_t weight = NICEWEIGHTS[this->nice + 20];
                 this->vruntime += (delta * 1024) / weight; // Lower nice levels will accumulate vruntime slower, leading to them being scheduled more often.
+                NArch::CPU::writemb();
             }
 
             // Set how nice the thread will be to other threads during scheduling. Higher niceness levels will schedule less often.
             void setnice(int nice) {
                 this->nice = (nice < -20) ? -20 : (nice > 19) ? 19 : nice;
+                NArch::CPU::writemb();
             }
 
             void enablemigrate(void) {
+                NArch::CPU::writemb();
                 this->migratedisabled = false;
             }
 
             void disablemigrate(void) {
                 this->migratedisabled = true;
+                NArch::CPU::writemb();
             }
 
             int getnice(void) {
@@ -306,6 +339,9 @@ namespace NSched {
 
     // Await scheduling. This is run on the BSP to jump into the scheduler.
     void await(void);
+
+    // Force CPU of thread to reschedule the thread.
+    void reschedule(Thread *thread);
 
     class Mutex {
         private:

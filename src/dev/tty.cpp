@@ -5,8 +5,10 @@
 
 #include <dev/dev.hpp>
 #include <dev/kbd.hpp>
+#include <dev/input/input.hpp>
 #include <dev/tty.hpp>
 #include <fs/devfs.hpp>
+#include <lib/signal.hpp>
 #include <mm/ucopy.hpp>
 #include <sched/sched.hpp>
 
@@ -46,13 +48,238 @@ namespace NDev {
 
     }
 
-static char asciitable[] = {
-       0, '\033', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\r', 0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '\r', 0, '/', 0, 0, '\r', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
+    const char asciitable[Input::key::KMAX] = {
+        '\0',   // RSVD
+        '\0',   // UNKNOWN
+        '\x1B', // KESC
+        '\0',   // KF1 (no ASCII)
+        '\0',   // KF2
+        '\0',   // KF3
+        '\0',   // KF4
+        '\0',   // KF5
+        '\0',   // KF6
+        '\0',   // KF7
+        '\0',   // KF8
+        '\0',   // KF9
+        '\0',   // KF10
+        '\0',   // KF11
+        '\0',   // KF12
+        '`',    // KGRAVE
+        '1',    // K1
+        '2',    // K2
+        '3',    // K3
+        '4',    // K4
+        '5',    // K5
+        '6',    // K6
+        '7',    // K7
+        '8',    // K8
+        '9',    // K9
+        '0',    // K0
+        '-',    // KMINUS
+        '=',    // KEQUALS
+        '\b',   // KBACKSPACE
+        '\t',   // KTAB
+        'q',    // KQ
+        'w',    // KW
+        'e',    // KE
+        'r',    // KR
+        't',    // KT
+        'y',    // KY
+        'u',    // KU
+        'i',    // KI
+        'o',    // KO
+        'p',    // KP
+        '[',    // KLEFTBRACKET
+        ']',    // KRIGHTBRACKET
+        '\\',   // KBACKSLASH
+        '\0',   // KCAPSLOCK
+        'a',    // KA
+        's',    // KS
+        'd',    // KD
+        'f',    // KF
+        'g',    // KG
+        'h',    // KH
+        'j',    // KJ
+        'k',    // KK
+        'l',    // KL
+        ';',    // KSEMICOLON
+        '\'',   // KAPOSTROPHE
+        '\n',   // KENTER
+        '\0',   // KLSHIFT
+        'z',    // KZ
+        'x',    // KX
+        'c',    // KC
+        'v',    // KV
+        'b',    // KB
+        'n',    // KN
+        'm',    // KM
+        ',',    // KCOMMA
+        '.',    // KDOT
+        '/',    // KSLASH
+        '\0',   // KRSHIFT
+        '\0',   // KLCTRL
+        '\0',   // KSUPER
+        '\0',   // KLALT
+        ' ',    // KSPACE
+        '\0',   // KRALT
+        '\0',   // KRCTRL
+        '\0',   // KLEFT (arrow)
+        '\0',   // KUP
+        '\0',   // KDOWN
+        '\0',   // KRIGHT
+        '\0',   // KPRNTSCR
+        '\0',   // KINSERT
+        '\0',   // KDELETE
+        '\0',   // KPAGEUP
+        '\0',   // KPAGEDOWN
+        '\0',   // KHOME
+        '\0',   // KEND
+        '\0',   // KNUMLOCK
+        '\0',   // KSCROLLLOCK
+        '0',    // KKPAD0
+        '1',    // KKPAD1
+        '2',    // KKPAD2
+        '3',    // KKPAD3
+        '4',    // KKPAD4
+        '5',    // KKPAD5
+        '6',    // KKPAD6
+        '8',    // KKPAD8
+        '9',    // KKPAD9
+        '*',    // KKPADMUL
+        '-',    // KKPADSUB
+        '+',    // KKPADADD
+        '/',    // KKPADDIV
+        '.',    // KKPADDOT
+        '\n',   // KKPADENTER
+    };
+
+    const char asciitableshift[Input::key::KMAX] = {
+        '\0',   // RSVD
+        '\0',   // UNKNOWN
+        '\x1B', // KESC
+        '\0',   // KF1 (no ASCII)
+        '\0',   // KF2
+        '\0',   // KF3
+        '\0',   // KF4
+        '\0',   // KF5
+        '\0',   // KF6
+        '\0',   // KF7
+        '\0',   // KF8
+        '\0',   // KF9
+        '\0',   // KF10
+        '\0',   // KF11
+        '\0',   // KF12
+        '~',    // KGRAVE
+        '!',    // K1
+        '@',    // K2
+        '#',    // K3
+        '$',    // K4
+        '%',    // K5
+        '^',    // K6
+        '&',    // K7
+        '*',    // K8
+        '(',    // K9
+        ')',    // K0
+        '_',    // KMINUS
+        '+',    // KEQUALS
+        '\b',   // KBACKSPACE
+        '\t',   // KTAB
+        'Q',    // KQ
+        'W',    // KW
+        'E',    // KE
+        'R',    // KR
+        'T',    // KT
+        'Y',    // KY
+        'U',    // KU
+        'I',    // KI
+        'O',    // KO
+        'P',    // KP
+        '{',    // KLEFTBRACKET
+        '}',    // KRIGHTBRACKET
+        '|',   // KBACKSLASH
+        '\0',   // KCAPSLOCK
+        'A',    // KA
+        'S',    // KS
+        'D',    // KD
+        'F',    // KF
+        'G',    // KG
+        'H',    // KH
+        'J',    // KJ
+        'K',    // KK
+        'L',    // KL
+        ':',    // KSEMICOLON
+        '"',    // KAPOSTROPHE
+        '\n',   // KENTER
+        '\0',   // KLSHIFT
+        'Z',    // KZ
+        'X',    // KX
+        'C',    // KC
+        'V',    // KV
+        'B',    // KB
+        'N',    // KN
+        'M',    // KM
+        '<',    // KCOMMA
+        '>',    // KDOT
+        '?',    // KSLASH
+        '\0',   // KRSHIFT
+        '\0',   // KLCTRL
+        '\0',   // KSUPER
+        '\0',   // KLALT
+        ' ',    // KSPACE
+        '\0',   // KRALT
+        '\0',   // KRCTRL
+        '\0',   // KLEFT (arrow)
+        '\0',   // KUP
+        '\0',   // KDOWN
+        '\0',   // KRIGHT
+        '\0',   // KPRNTSCR
+        '\0',   // KINSERT
+        '\0',   // KDELETE
+        '\0',   // KPAGEUP
+        '\0',   // KPAGEDOWN
+        '\0',   // KHOME
+        '\0',   // KEND
+        '\0',   // KNUMLOCK
+        '\0',   // KSCROLLLOCK
+        '0',    // KKPAD0
+        '1',    // KKPAD1
+        '2',    // KKPAD2
+        '3',    // KKPAD3
+        '4',    // KKPAD4
+        '5',    // KKPAD5
+        '6',    // KKPAD6
+        '8',    // KKPAD8
+        '9',    // KKPAD9
+        '*',    // KKPADMUL
+        '-',    // KKPADSUB
+        '+',    // KKPADADD
+        '/',    // KKPADDIV
+        '.',    // KKPADDOT
+        '\n',   // KKPADENTER
+    };
 
     void TTY::process(char c, void (*writefn)(const char *, size_t)) {
         bool canwrite = writefn != NULL;
 
+
+        if (termios.lflag & ISIG) {
+            int signal = -1;
+            if (c == this->termios.cc.vintr) {
+                signal = SIGINT;
+                NUtil::printf("Interrupt.\n");
+            } else if (c == this->termios.cc.vquit) {
+                signal = SIGQUIT;
+                NUtil::printf("Quit.\n");
+            } else if (c == this->termios.cc.vsusp) {
+                signal = SIGTSTP;
+                NUtil::printf("Suspend.\n");
+            }
+
+            if (signal >= 0) {
+                NSched::signalpgrp(this->fpgrp, signal);
+                return;
+            }
+        }
 
         if (termios.lflag & ICANON) {
             if (c == this->termios.cc.verase) {
@@ -131,7 +358,7 @@ static char asciitable[] = {
                 // POLLIN. We've got data! Canonical mode only does this if it finds a line.
             }
 
-            if (c >= 32 && c <= 126) { // Add if printable.
+            // if (c >= 32 && c <= 126) { // Add if printable.
                 NLib::ScopeSpinlock guard(&this->linelock);
                 this->linebuffer.push(c);
                 if ((this->termios.lflag & ECHO) && !((this->termios.lflag & ECHONL) && c == '\n')) {
@@ -141,7 +368,7 @@ static char asciitable[] = {
                     NLib::ScopeSpinlock guard(&this->outlock);
                     this->outbuffer.push(c);
                 }
-            }
+            // }
         } else {
             if (canwrite && this->termios.lflag & ECHO) {
                 writefn(&c, 1);
@@ -166,6 +393,12 @@ static char asciitable[] = {
     }
 
     ssize_t TTY::read(char *buf, size_t count, int fdflags) {
+        NSched::Thread *thread = NArch::CPU::get()->currthread;
+        if (thread->process->pgrp != this->fpgrp) {
+            NSched::signalthread(thread, SIGTTIN);
+            return -EIO;
+        }
+
         if (!count) {
             return 0;
         }
@@ -228,6 +461,15 @@ static char asciitable[] = {
 
     ssize_t TTY::write(const char *buf, size_t count, int fdflags, void (*writefn)(const char *, size_t)) {
         (void)fdflags;
+
+        NSched::Thread *thread = NArch::CPU::get()->currthread;
+        this->fpgrp = thread->process->pgrp;
+
+        if (thread->process->pgrp != this->fpgrp) {
+            NSched::signalthread(thread, SIGTTOU);
+            return -EIO;
+        }
+
         if (writefn) {
             writefn(buf, count);
         }
@@ -239,7 +481,14 @@ static char asciitable[] = {
         return count;
     }
 
-    TTYDevice *ttys[63];
+    static TTYDevice *ttys[63];
+    static size_t currentvt = 1; // Current VT index.
+
+    static struct Input::eventhandler handler;
+    static bool capslock = false;
+    static bool shifted = false;
+    static bool ctrl = false;
+    static bool alted = false;
 
     class TTYDriver : public DevDriver {
         private:
@@ -248,6 +497,10 @@ static char asciitable[] = {
             // /dev/tty1-63 are virtual consoles. Kind of assumes that this is for a seated user. /dev/ttyS# does as well, but does it through serial terminals.
 
             // XXX: Implement VT system for /dev/tty0. Simply builds on top of existing /dev/tty#, but can be switched through with keyboard events.
+            // - Expected to save the state of the entire screen between VT swaps.
+            // - Only active VT will have writefn() valid.
+            //
+            // - Maintain multiple flanterm contexts, then full refresh before restoring a copy.
 
             static const uint32_t MAJOR = 4; // TTY major. Actual virtual consoles.
             static const uint32_t MINMINOR = 1;
@@ -296,22 +549,109 @@ static char asciitable[] = {
                     assert(VFS::vfs.create(path, st), "Failed to create device node."); // Create device node. This will automatically assign the TTYDevice to the node, and give the TTYDevice reference to its node.
                 }
 
-                NSched::Thread *thread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)activevtthread);
-
-                NSched::schedulethread(thread);
+                handler.connect = NULL;
+                handler.disconnect = NULL;
+                handler.evsubscription = Input::event::KEY; // Subscribe to keyboard events.
+                handler.event = event;
+                Input::registerhandler(&handler); // Register handler.
             }
 
-            static void activevtthread(void) {
-                // XXX: Actual event system for keyboard events.
-                for (;;) {
-                    if (KBD::cur != 0) {
-                        ttys[0]->tty->process(asciitable[KBD::cur], NLimine::console_write);
-                        KBD::cur = 0;
-                    }
-                    asm volatile("pause");
+            static void event(uint16_t type, uint16_t code, int32_t value) {
+                assert(type == Input::event::KEY, "Invalid event type received.\n");
+
+                if (code == Input::key::KLSHIFT || code == Input::key::KRSHIFT) {
+                    shifted = value == 1;
+                    return;
+                } else if (code == Input::key::KLCTRL || code == Input::key::KRCTRL) {
+                    ctrl = value == 1;
+                    return;
+                } else if (code == Input::key::KCAPSLOCK && value == 1) {
+                    capslock = !capslock; // Toggle.
+                    return;
+                } else if (code == Input::key::KLALT || code == Input::key::KRALT) {
+                    alted = value == 1;
+                    return;
                 }
 
-                __builtin_unreachable();
+
+                if (value == 1) { // Pressed.
+
+                    char ascii = '\0';
+                    if (ctrl) { // Handle control sequences.
+
+                        if (alted) {
+                            if (code >= Input::key::KF1 && code <= Input::key::KF9) {
+                                // XXX: VT Switching.
+                                // currentvt = 1 + (code - Input::key::KF1);
+                                return;
+                            }
+                        }
+
+                        if ((asciitable[code] >= 'a' && asciitable[code] <= 'z') || (asciitable[code] >= 'A' && asciitable[code] <= '\\')) {
+
+                            ascii = asciitable[code] >= 'a' ? asciitable[code] - 0x60 : asciitable[code] - 0x40;
+                            // Send to TTY.
+                            ttys[currentvt - 1]->tty->process(ascii, NLimine::console_write);
+                        }
+                        return;
+                    }
+
+                    const char *esccode = NULL;
+                    switch (code) {
+                        case Input::key::KHOME:
+                            esccode = "\x1b[1~";
+                            break;
+                        case Input::key::KEND:
+                            esccode = "\x1b[4~";
+                            break;
+                        case Input::key::KDELETE:
+                            esccode = "\x1b[3~";
+                            break;
+                        case Input::key::KINSERT:
+                            esccode = "\x1b[2~";
+                            break;
+                        case Input::key::KPAGEUP:
+                            esccode = "\x1b[5~";
+                            break;
+                        case Input::key::KPAGEDOWN:
+                            esccode = "\x1b[6~";
+                            break;
+                        case Input::key::KLEFT:
+                            esccode = "\x1b[D";
+                            break;
+                        case Input::key::KRIGHT:
+                            esccode = "\x1b[C";
+                            break;
+                        case Input::key::KUP:
+                            esccode = "\x1b[A";
+                            break;
+                        case Input::key::KDOWN:
+                            esccode = "\x1b[B";
+                            break;
+                        default:
+                            goto notspecial; // Clearly not a special key that emits an escape code.
+                    }
+
+                    // Write escape code to TTY.
+                    for (size_t i = 0; i < NLib::strlen(esccode); i++) {
+                        ttys[currentvt - 1]->tty->process(esccode[i], NLimine::console_write);
+                    }
+                    return;
+
+notspecial:
+                    if (code < Input::key::KMAX) {
+
+                        bool upshift = shifted;
+
+                        if (asciitable[code] >= 'a' && asciitable[code] <= 'z') {
+                            upshift ^= capslock; // Capslock should only apply to alphabetical characters. Apply it if we aren't already uppercase.
+                        }
+                        ascii = upshift ? asciitableshift[code] : asciitable[code];
+                    }
+                    if (ascii != '\0') {
+                        ttys[currentvt - 1]->tty->process(ascii, NLimine::console_write);
+                    }
+                }
             }
 
             VFS::INode *getctty(void) {
@@ -334,7 +674,12 @@ static char asciitable[] = {
                     ifnode->unref();
                     return 0;
                 } else if (dev == CURVTDEVICEID) {
+                    assert((currentvt - 1) < MAXTTYS, "Current VT exceeds number of TTYs.\n");
 
+                    TTYDevice *tty = ttys[currentvt - 1];
+                    tty->ifnode->ref();
+                    *st = tty->ifnode->getattr();
+                    tty->ifnode->unref();
                 }
                 return -123123123; // Default to node fill of our stat.
             }
@@ -342,12 +687,14 @@ static char asciitable[] = {
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {
                 if (dev == CURDEVICEID) { // Device is /dev/tty
                     VFS::INode *ifnode = this->getctty();
-                    // NUtil::printf("/dev/tty was read. Redirecting to /dev/%s.\n", ifnode->getname());
                     ssize_t ret = ifnode->read(buf, count, offset, fdflags); // Pass operation to CTTY node.
                     ifnode->unref();
                     return ret;
                 } else if (dev == CURVTDEVICEID) { // Device is /dev/tty0
-                    ;
+                    assert((currentvt - 1) < MAXTTYS, "Current VT exceeds number of TTYs.\n");
+
+                    TTYDevice *tty = ttys[currentvt - 1];
+                    return tty->tty->read((char *)buf, count, fdflags);
                 } else { // Device is /dev/tty1-63
                     // Here, we could be coming from direct access, or through /dev/tty.
                     uint32_t num = DEVFS::minor(dev) - 1;
@@ -361,16 +708,19 @@ static char asciitable[] = {
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 if (dev == CURDEVICEID) {
                     VFS::INode *ifnode = this->getctty();
-                    // NUtil::printf("/dev/tty was written to. Redirecting to /dev/%s.\n", ifnode->getname());
                     ssize_t ret = ifnode->write(buf, count, offset, fdflags);
                     ifnode->unref();
                     return ret;
                 } else if (dev == CURVTDEVICEID) {
-                    ;
+                    return write(DEVFS::makedev(MAJOR, currentvt), buf, count, offset, fdflags);
                 } else {
                     // Bypass tty write handler, because we don't need any output buffering (instant output).
-                    NLimine::console_write((const char *)buf, count);
-                    return count;
+                    uint32_t num = DEVFS::minor(dev) - 1;
+
+                    TTYDevice *tty = ttys[num];
+
+                    return tty->tty->write((const char *)buf, count, fdflags, DEVFS::minor(dev) == currentvt ? NLimine::console_write : NULL);
+
                 }
                 return 0;
             }
@@ -383,7 +733,7 @@ static char asciitable[] = {
                     ifnode->unref();
                     return ret;
                 } else if (dev == CURVTDEVICEID) {
-                    ;
+                    return ioctl(DEVFS::makedev(MAJOR, currentvt), request, arg);
                 } else {
                     uint32_t num = DEVFS::minor(dev) - 1;
 

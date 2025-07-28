@@ -202,6 +202,24 @@ namespace NSched {
         return parent;
     }
 
+    struct RBTree::node *RBTree::_prev(struct node *node) {
+
+        if (node->left) {
+            struct node *n = node->left;
+            while (n->right) {
+                n = node->right;
+            }
+            return n;
+        }
+
+        struct node *parent = node->getparent();
+        while (parent && node == parent->left) {
+            node = parent;
+            parent = parent->getparent();
+        }
+        return parent;
+    }
+
     void RBTree::rebalance(struct node *node) {
 
         while (node != this->root && node->getparent()->getcolour() == colour::RED) {
@@ -343,6 +361,8 @@ namespace NSched {
 
     // Attempts to locate a busier CPU (considering STEALTHRESHOLD) to steal tasks from. This is used for load balancing.
     static struct CPU::cpulocal *getstealbusiest(void) {
+        // XXX: Calculate within the same NUMA node, to avoid cross-node migrations.
+
         uint64_t maxload = 0;
         struct CPU::cpulocal *busiest = NULL;
         uint64_t ourload = __atomic_load_n(&CPU::get()->loadweight, memory_order_seq_cst);
@@ -366,6 +386,8 @@ namespace NSched {
 
     // Attempts to locate the most idle CPU. This is used for scheduling, and for the target of load balancing.
     static struct CPU::cpulocal *getidlest(void) {
+        // XXX: Calculate within the same NUMA node, to avoid cross-node migrations.
+
         uint64_t minload = __UINT64_MAX__; // Start at theoretical maximum, so any lower load will be chosen first.
         struct CPU::cpulocal *idlest = NULL;
 
@@ -398,19 +420,65 @@ namespace NSched {
         if (cpu->runqueue.count() <= LOADTHRESHOLD) {
             return; // We're done here.
         }
+
+        // Migrate our tasks to other CPUs to mitigate load.
+        struct CPU::cpulocal *target = getidlest();
+        if (!target) {
+            return;
+        }
+        size_t quota = (cpu->runqueue.count() - LOADTHRESHOLD) / 4; // Target should be given a quarter of our work.
+
+
+        // Lock ordering to prevent cyclic deadlocks.
+        if (cpu->id < target->id) {
+            cpu->runqueue.lock.acquire();
+            target->runqueue.lock.acquire();
+        } else {
+            target->runqueue.lock.acquire();
+            cpu->runqueue.lock.acquire();
+        }
+
+        struct RBTree::node *node = cpu->runqueue._last();
+        while (node && quota > 0) { // If we have work to migrate, and a quota to fulfill, keep working.
+            Thread *stolen = RBTree::getentry<Thread>(node);
+            struct RBTree::node *prev = cpu->runqueue._prev(node);
+
+            if (__atomic_load_n(&stolen->locksheld, memory_order_seq_cst) > 0 || stolen->migratedisabled) {
+                node = prev; // Skip nodes we can't migrate.
+                continue;
+            }
+            cpu->runqueue._erase(node);
+            stolen->cid = target->id;
+
+            NArch::CPU::writemb(); // Ensure writes are seen.
+            cpu->runqueue._insert(node, vruntimecmp);
+            quota--;
+
+            node = prev;
+        }
+
+        if (cpu->id < target->id) {
+            target->runqueue.lock.release();
+            cpu->runqueue.lock.release();
+        } else {
+            cpu->runqueue.lock.release();
+            target->runqueue.lock.release();
+        }
+
+        updateload(target);
+        updateload(cpu);
     }
 
     // Get a hold of a thread from the busiest CPU, migrating it (but not adding it to the new run queue).
     Thread *steal(void) {
         struct CPU::cpulocal *busiest = getstealbusiest(); // Get a handle on the busiest CPU.
 
-
         if (!busiest) {
             return NULL; // We're done here, there's nothing we can do.
         }
 
         busiest->runqueue.lock.acquire(); // We have multiple things we want to be doing, and don't want any race conditions during our work.
-        struct RBTree::node *node = busiest->runqueue._first(); // Grab node that is the last to be run (typically, higher virtual runtime).
+        struct RBTree::node *node = busiest->runqueue._last(); // Grab node with highest runtime (least deserving of being run), and incur migration penalty.
         if (!node) {
             busiest->runqueue.lock.release();
             return NULL; // We're done here, only one node is in the run queue (it's probably running right now, even).
@@ -427,7 +495,7 @@ namespace NSched {
         updateload(busiest);
 
         stolen->cid = CPU::get()->id; // Update CID.
-        return stolen; // XXX: Worry about the steal() function stealing from a thread that is referencing a different CPU during operation. Solution: Only steal non-suspended threads.
+        return stolen;
     }
 
     Thread *nextthread(void) {
@@ -495,12 +563,17 @@ namespace NSched {
         updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
 
         // Load Balance on an interval:
-        if (!(curintr % 4)) { // Every fourth schedule interrupt:
+        if (!(curintr % 8)) { // Every fourth schedule interrupt:
             loadbalance(cpu);
         }
 
         Thread *prev = cpu->currthread; // Currently running thread.
         Thread *next = NULL; // What we're planning to schedule next.
+
+        if (prev->rescheduling) { // Handle migration re-enable on reschedule.
+            __atomic_store_n(&prev->rescheduling, false, memory_order_seq_cst);
+            prev->enablemigrate();
+        }
 
         {
             NLib::ScopeSpinlock guard(&cpu->runqueue.lock); // Lock run queue, so we can gather and remove the next thread.
@@ -508,6 +581,7 @@ namespace NSched {
                 if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::RUNNING) { // Thread is still "runnable".
 
                     __atomic_store_n(&prev->tstate, Thread::state::SUSPENDED, memory_order_release);
+                    NArch::CPU::writemb(); // Ensure writes are seen.
                     cpu->runqueue._insert(&prev->node, vruntimecmp); // Shove it back onto the run queue for this CPU. It'll be ran later.
                 }
             }
@@ -557,8 +631,9 @@ namespace NSched {
     }
 
 
-    static size_t pidcounter = 0;
+    static size_t pidcounter = 0; // Because kernel process is the first process made, it'll be PID0. The first user process (init) will be PID1!
     Process *kprocess = NULL; // Kernel process.
+    NLib::KVHashMap<size_t, Process *> *pidtable = NULL;
 
     void Process::init(struct VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
         // Each new process should be initialised with an atomically incremented PID.
@@ -590,6 +665,8 @@ namespace NSched {
                 this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
             }
         }
+
+        pidtable->insert(this->id, this);
     }
 
     Process::~Process(void) {
@@ -604,6 +681,34 @@ namespace NSched {
         if (ref == 0) {
             delete this->addrspace;
         }
+
+        pidtable->remove(this->id);
+
+        if (this->fdtable) {
+            delete this->fdtable;
+        }
+
+        if (this->cwd) {
+            this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
+        }
+
+        if (this->parent) {
+            NSched::signalproc(this->parent, SIGCHLD); // Signal parent that child exited.
+
+            if (children.size()) {
+                // XXX: Reparent now "zombie" processes to init process.
+            }
+        }
+    }
+
+    void reschedule(Thread *thread) {
+        thread->disablemigrate(); // Prevent migration during operation.
+
+        // Re-enable migration during reschedule.
+        __atomic_store_n(&thread->rescheduling, true, memory_order_seq_cst);
+
+        // Send IPI to owning CPU.
+        APIC::sendipi(NArch::SMP::cpulist[thread->cid]->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
     }
 
     void yield(void) {
@@ -657,6 +762,12 @@ namespace NSched {
     void Thread::init(Process *proc, size_t stacksize, void *entry, void *arg) {
         this->process = proc;
 
+        proc->lock.acquire();
+        proc->threads.push(this);
+        proc->lock.release();
+
+        __atomic_add_fetch(&proc->threadcount, 1, memory_order_seq_cst); // Add to thread count.
+
         // Initialise stack within HHDM, from page allocated memory. Stacks need to be unique for each thread.
         this->stack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(stacksize)));
         assert(this->stack, "Failed to allocate thread stack.\n");
@@ -706,6 +817,11 @@ namespace NSched {
 
     void Thread::destroy(void) {
         PMM::free(hhdmsub(this->stack)); // Free stack.
+
+        __atomic_sub_fetch(&this->process->threadcount, 1, memory_order_seq_cst);
+        if (__atomic_load_n(&this->process->threadcount, memory_order_seq_cst) == 0) {
+            delete this->process;
+        }
     }
 
     void schedulethread(Thread *thread) {
@@ -724,9 +840,13 @@ namespace NSched {
         Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process.
         CPU::get()->idlethread = idlethread; // Assign to this CPU.
 
-        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(16 * PAGESIZE))); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
-        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
+        CPU::get()->schedstack = (uint8_t *)PMM::alloc(16 * PAGESIZE); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
+
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
+
+        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
+
+        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
 
         CPU::get()->currthread = idlethread; // We start as the idle thread, even though we might not actually be running it.
 
@@ -740,15 +860,20 @@ namespace NSched {
     bool initialised; // Is the scheduler working?
 
     void setup(void) {
+        pidtable = new NLib::KVHashMap<size_t, Process *>();
+
         // Create PID 0 for kernel threading. Uses kernel address space so that the process has access to the entire memory map.
         kprocess = new Process(&VMM::kspace);
 
         Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process. We need not set any affinity logic, as this thread is never actually *scheduled*.
 
+        CPU::get()->schedstack = (uint8_t *)PMM::alloc(16 * PAGESIZE); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
 
-        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(16 * PAGESIZE))); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
-        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
+
+        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
+
+        CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
 
 
         CPU::get()->idlethread = idlethread; // Assign to BSP.
@@ -783,7 +908,10 @@ namespace NSched {
 
     extern "C" uint64_t sys_getppid(void) {
         NUtil::printf("sys_getppid().\n");
-        return 1;
+        if (CPU::get()->currthread->process->parent) {
+            return CPU::get()->currthread->process->parent->id;
+        }
+        return 0; // Default to no parent PID.
     }
 
     void handlelazyfpu(void) {
@@ -803,7 +931,7 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_exit(int status) {
-        NUtil::printf("Exit %d.\n", status);
+        NUtil::printf("sys_exit(%d).\n", status);
         exit(); // Exit.
         return 0;
     }

@@ -1,4 +1,6 @@
 
+extern signal_checkpending
+
 extern sys_exit
 extern sys_prctl
 extern sys_debug
@@ -109,6 +111,9 @@ syscall_entry:
 
 .done:
     cli
+
+    call signal_checkpending
+
     ; Restore original state.
     pop r15
     pop r14

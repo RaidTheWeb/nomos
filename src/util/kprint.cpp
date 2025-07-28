@@ -339,11 +339,11 @@ flagbreak:
         len -= 1; // Back out on null termination for this.
 
 
-        if (canmutex && NArch::CPU::get()->currthread) {
-            mutex.acquire();
-        } else {
+        // if (canmutex && NArch::CPU::get()->currthread) {
+            // mutex.acquire();
+        // } else {
             printlock.acquire();
-        }
+        // }
 
 #ifdef __x86_64__
         // NLimine::console_write(buffer, len);
@@ -352,11 +352,11 @@ flagbreak:
             NArch::Serial::ports[0].write(buffer[i]);
         }
 #endif
-        if (canmutex && NArch::CPU::get()->currthread) {
-            mutex.release();
-        } else {
+        // if (canmutex && NArch::CPU::get()->currthread) {
+            // mutex.release();
+        // } else {
             printlock.release();
-        }
+        // }
         return len;
     }
 }

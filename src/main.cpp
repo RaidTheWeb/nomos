@@ -11,6 +11,7 @@
 #endif
 
 #include <dev/dev.hpp>
+#include <dev/input/input.hpp>
 
 #include <cxxruntime.hpp>
 #include <fs/devfs.hpp>
@@ -116,8 +117,26 @@ void kpostarch(void) {
     (void)ent;
     assert(NSys::ELF::loadfile(&elfhdr, node, uspace, &ent), "Failed to load ELF.\n");
 
+    // PROCESS
     NSched::Process *proc = new NSched::Process(uspace);
 
+    // PGRP
+    NSched::ProcessGroup *pgrp = new NSched::ProcessGroup();
+    pgrp->id = proc->id;
+    pgrp->procs.push(proc);
+
+    // SESSION
+    NSched::Session *session = new NSched::Session();
+    session->id = proc->id;
+    session->ctty = NFS::DEVFS::makedev(4, 1);
+    session->pgrps.push(pgrp);
+
+    pgrp->session = session;
+
+    proc->session = session;
+    proc->pgrp = pgrp;
+
+    // THREAD
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
 
     uintptr_t ustack = (uintptr_t)NArch::PMM::alloc(1 << 20); // Allocate 1MB stack.
@@ -144,7 +163,7 @@ void kpostarch(void) {
     uthread->ctx.rip = elfhdr.entryoff;
     uthread->ctx.rsp = (uint64_t)phystart;
 
-    // NLimine::console_write("\x1b[2J\x1b[H", 7);
+    NLimine::console_write("\x1b[2J\x1b[H", 7);
 
     NUtil::printf("[nomos]: Starting user init.\n");
     NSched::schedulethread(uthread); // Dispatch!

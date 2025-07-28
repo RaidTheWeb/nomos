@@ -240,7 +240,7 @@ namespace NLib {
                 delete[] this->buckets;
             }
 
-            void insert(K key, T &val) {
+            void insert(K key, T val) {
                 if (this->itemcount >= this->load) { // If we have too many items, we'll want to rehash for more buckets.
                     this->rehash(this->bucketcount * 2); // Simply double the size.
                 }

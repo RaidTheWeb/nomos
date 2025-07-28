@@ -1,6 +1,7 @@
 #include <dev/dev.hpp>
 #include <lib/list.hpp>
 #include <sched/event.hpp>
+#include <sched/jobctrl.hpp>
 
 namespace NDev {
     class TTY {
@@ -110,6 +111,11 @@ namespace NDev {
             NArch::Spinlock outlock;
             NLib::CircularBuffer<char> linebuffer;
             NArch::Spinlock linelock;
+
+            // Job control structures:
+            NSched::ProcessGroup *fpgrp = NULL; // Foreground process group.
+            NSched::Session *session = NULL;
+            NArch::Spinlock ctrllock;
 
             TTY(void);
 

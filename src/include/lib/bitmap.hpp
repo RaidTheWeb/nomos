@@ -36,13 +36,29 @@ namespace NLib {
 
                 size_t oldfullsize = (this->size + BITSPERWORD - 1) / BITSPERWORD;
                 size_t newfullsize = (newsize + BITSPERWORD - 1) / BITSPERWORD;
+
+                size_t oldsize = this->size;
                 this->data = (uint64_t *)NMem::allocator.realloc(this->data, sizeof(uint64_t) * newfullsize);
-                if (oldfullsize < newfullsize) {
-                    // Clear newly allocated bits (ensures zero).
-                    NLib::memset((void *)((uintptr_t)this->data + oldfullsize), 0, newfullsize - oldfullsize);
-                }
+
                 if (!this->data) {
                     return false;
+                }
+
+                if (newsize > oldsize) {
+                    // Clear bits beyond old size in last word.
+                    if (oldsize > 0) {
+                        size_t lastold = (oldsize - 1) / BITSPERWORD;
+                        size_t bitsinlast = oldsize % BITSPERWORD;
+
+                        if (bitsinlast != 0) {
+                            this->data[lastold] &= (1ull << bitsinlast) - 1;
+                        }
+                    }
+
+                    // Clear full words.
+                    if (oldfullsize < newfullsize) {
+                        NLib::memset((void *)((uintptr_t)this->data + oldfullsize), 0, sizeof(uint64_t) * (newfullsize - oldfullsize));
+                    }
                 }
 
                 this->size = newsize;
@@ -77,6 +93,7 @@ namespace NLib {
 
                 size_t word = idx / BITSPERWORD;
                 size_t bit = idx % BITSPERWORD;
+
                 return (this->data[word] & (1ull << bit)) != 0;
             }
 
