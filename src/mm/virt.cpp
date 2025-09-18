@@ -292,6 +292,16 @@ namespace NMem {
             this->traverse(root->right, callback);
         }
 
+        void VMASpace::traversedata(struct vmanode *root, void (*callback)(struct vmanode *node, void *data), void *data) {
+            if (!root) {
+                return; // We're done here.
+            }
+
+            this->traversedata(root->left, callback, data);
+            callback(root, data);
+            this->traversedata(root->right, callback, data);
+        }
+
         void VMASpace::validate(struct vmanode *root, uintptr_t *last) {
             if (!root) {
                 return; // We're done here.

@@ -1,5 +1,7 @@
 #include <arch/limine/requests.hpp>
+#include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
@@ -17,6 +19,100 @@ extern void *_rodata_end;
 namespace NArch {
     namespace VMM {
         struct addrspace kspace;
+
+
+        void waittlbshootdown(uint32_t caller, size_t expected) {
+            uint64_t timeout = 1000000; // Arbitrary number of "cycles" to wait before declaring that the TLB shootdown failed.
+
+            for (size_t i = 0; i < SMP::awakecpus; i++) {
+                if (SMP::cpulist[i]->id == caller) {
+                    continue; // Skip the calling CPU.
+                }
+
+                while (__atomic_load_n(&SMP::cpulist[i]->tlblocal.completion, memory_order_acquire) < expected) {
+                    if (--timeout == 0) {
+                        panic("Timeout on TLB shootdown.");
+                        break;
+                    }
+                    asm volatile ("pause");
+                }
+            }
+        }
+
+        void doshootdown(enum CPU::shootdown type, uintptr_t start, uintptr_t end) {
+            uint32_t caller = 0;
+            if (SMP::initialised && SMP::awakecpus >= 2) {
+
+                caller = CPU::get()->id;
+
+                __atomic_fetch_add(&CPU::tlbglobal.activereqs, 1, memory_order_acquire);
+
+                for (size_t i = 0; i < SMP::awakecpus; i++) {
+                    if (SMP::cpulist[i]->id == caller) {
+                        continue;
+                    }
+
+                    struct CPU::tlblocal *state = &SMP::cpulist[i]->tlblocal;
+                    state->type = type;
+                    state->start = start;
+                    state->end = end;
+                    __atomic_store_n(&state->pending, true, memory_order_release);
+                }
+
+                APIC::sendipi(0, 0xfc, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPIOTHER); // Send TLB shootdown to all other CPUs.
+            }
+
+            // Handle for ourselves.
+            switch (type) {
+                case CPU::TLBSHOOTDOWN_SINGLE:
+                    invlpg(start);
+                    break;
+                case CPU::TLBSHOOTDOWN_FULL:
+                    flushtlb();
+                    break;
+                case CPU::TLBSHOOTDOWN_RANGE:
+                    invlrange(start, end - start);
+                    break;
+                default:
+                    break;
+            }
+
+            if (SMP::initialised && SMP::awakecpus >= 2) {
+                waittlbshootdown(caller, 1); // Wait for pending TLB shootdown.
+                __atomic_fetch_sub(&CPU::tlbglobal.activereqs, 1, memory_order_release);
+            }
+        }
+
+        void tlbshootdown(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+            (void)isr;
+            (void)ctx;
+
+            struct CPU::cpulocal *cpu = CPU::get();
+            struct CPU::tlblocal *state = &cpu->tlblocal;
+
+            if (!__atomic_load_n(&state->pending, memory_order_acquire)) { // Don't even bother without a pending operation.
+                return;
+            }
+
+            switch (state->type) {
+                case CPU::TLBSHOOTDOWN_SINGLE:
+                    invlpg(state->start);
+                    break;
+                case CPU::TLBSHOOTDOWN_RANGE:
+                    invlrange(state->start, state->end - state->start);
+                    break;
+                case CPU::TLBSHOOTDOWN_FULL:
+                    flushtlb();
+                    break;
+                case CPU::TLBSHOOTDOWN_NONE:
+                    break;
+            }
+
+            // Mark as done.
+            __atomic_fetch_add(&state->completion, 1, memory_order_release);
+            __atomic_store_n(&state->pending, false, memory_order_release);
+        }
+
 
         struct pagetable *walk(uint64_t entry) {
             // Walk down into the next entry.
@@ -63,6 +159,79 @@ namespace NArch {
             }
         }
 
+        struct dupwork {
+            struct addrspace *src;
+            struct addrspace *dest;
+        };
+
+        static inline uint64_t vmatovmm(uint64_t vma) {
+            return 0 |
+                PRESENT | COW | // Mark as present, and using CoW.
+                (vma & NMem::Virt::VIRT_USER ? USER : 0) |
+                (vma & NMem::Virt::VIRT_NX ? NOEXEC : 0) |
+                (vma & NMem::Virt::VIRT_RW ? 0 : 0); // Omit write.
+        }
+
+        static void dupvmanode(struct NMem::Virt::vmanode *node, void *data) {
+            struct dupwork *work = (struct dupwork *)data;
+
+            if (node->used) { // We should only attempt to duplicate stuff we've used.
+
+                work->dest->vmaspace->reserve(node->start, node->end, node->flags);
+
+                size_t size = node->end - node->start;
+
+                for (size_t i = 0; i < size; i += PAGESIZE) {
+
+                    uintptr_t phys = _virt2phys(work->src, node->start + i);
+
+                    // Remap to CoW for both source and destination (we want them to make their own distinct copies on write).
+                    _mappage(work->dest, node->start + i, phys, vmatovmm(node->flags));
+                    _mappage(work->src, node->start + i, phys, vmatovmm(node->flags));
+                }
+            }
+        }
+
+        struct addrspace *forkcontext(struct addrspace *src) {
+            assert(src, "Invalid source.\n");
+
+            NLib::ScopeSpinlock sguard(&src->lock);
+
+            struct addrspace *dest = new struct VMM::addrspace;
+            NLib::ScopeSpinlock dguard(&dest->lock);
+
+            dest->ref = 1;
+            dest->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
+            assert(dest->pml4, "Failed to allocate memory for user space PML4.\n");
+            dest->pml4phy = (uintptr_t)dest->pml4;
+            dest->pml4 = (struct VMM::pagetable *)hhdmoff(dest->pml4);
+            NLib::memset(dest->pml4, 0, PAGESIZE);
+
+            dest->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000);
+
+            struct dupwork work {
+                .src = src,
+                .dest = dest
+            };
+
+            for (size_t i = 0; i < 512; i++) {
+                uint64_t entry = src->pml4->entries[i];
+
+                if (!entry || !(entry & PRESENT)) {
+                    dest->pml4->entries[i] = 0;
+                    continue;
+                }
+
+                if (!(entry & USER)) {
+                    dest->pml4->entries[i] = src->pml4->entries[i];
+                }
+            }
+
+            src->vmaspace->traversedata(src->vmaspace->getroot(), dupvmanode, &work);
+
+            return dest;
+        }
+
         void clonecontext(struct addrspace *space, struct pagetable **pt) {
             assert(pt != NULL, "Invalid destination for clone.\n");
 
@@ -85,7 +254,7 @@ namespace NArch {
             }
 
             asm volatile("sfence" : : : "memory");
-            flushtlb();
+            doshootdown(CPU::TLBSHOOTDOWN_FULL, 0, 0);
         }
 
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt) {
@@ -209,7 +378,7 @@ namespace NArch {
             // At the end of all the indirection:
             pt->entries[ptidx] = (phys & ADDRMASK) | flags;
 
-            invlpg(virt);
+            doshootdown(CPU::TLBSHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
             return true;
         }
 
@@ -217,7 +386,7 @@ namespace NArch {
             uint64_t *pte = _resolvepte(space, virt);
             if (pte) {
                 *pte = 0; // Blank page table entry, so that it now points NOWHERE.
-                invlpg(virt); // Invalidate, so that the CPU will know that it's lost this page.
+                doshootdown(CPU::TLBSHOOTDOWN_SINGLE, virt, virt + PAGESIZE); // Invalidate, so that the CPU will know that it's lost this page.
             }
         }
 
@@ -240,8 +409,13 @@ namespace NArch {
             size = end - virt;
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
-                _unmappage(space, virt + i);
+                uint64_t *pte = _resolvepte(space, virt + i);
+                if (pte) {
+                    *pte = 0;
+                }
             }
+
+            doshootdown(CPU::TLBSHOOTDOWN_RANGE, virt, end);
         }
 
         static inline uint8_t convertflags(uint64_t flags) {
@@ -322,7 +496,7 @@ namespace NArch {
 
             if (!_maprange(space, (uintptr_t)region, (uintptr_t)phys, prottovmm(prot), size)) {
                 space->vmaspace->free(region, size);
-                PMM::free(phys);
+                PMM::free(phys, size);
                 return -ENOMEM;
             }
 

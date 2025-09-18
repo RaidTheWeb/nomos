@@ -13,9 +13,54 @@ namespace NDev {
     __attribute__((used))
     static const uint32_t MAGIC = 0x419af8b2;
 
+    struct devinfo {
+        enum type {
+            PCI,
+            USB
+        };
+
+        enum type type;
+
+        union {
+            struct {
+                // PCI generic info, only for *very* general devices.
+                uint8_t pciclass;
+                uint8_t pcisubclass;
+                uint8_t pciprogif;
+                uint8_t pcirev;
+
+                uint16_t vendor; // Vendor ID.
+                uint16_t device; // Device ID.
+
+                uint8_t seg;
+                uint8_t bus;
+                uint8_t slot;
+                uint8_t func;
+
+                bool msisupport;
+                bool msixsupport;
+                uint16_t msioff;
+                uint16_t msixoff;
+                bool pciesupport;
+                uint16_t pcieoff;
+            } pci;
+            struct {
+                // USB generic info, for generic devices (eg. storage devices, mice, and keyboards).
+                uint8_t usbclass;
+                uint8_t usbsubclass;
+
+                uint16_t usbver;
+                uint16_t devver; // Specific device revision.
+
+                uint16_t vendor; // Vendor ID.
+                uint16_t product; // Product ID.
+            } usb;
+        } info;
+    };
+
     class Driver {
         public:
-
+            bool probe(void);
     };
 
     class BusDriver : public Driver {
@@ -179,6 +224,7 @@ namespace NDev {
     struct regentry {
         uint32_t magic;
         Driver *(*create)(void);
+        Driver *instance = NULL;
         struct reginfo *info;
     } __attribute__((aligned(16)));
 

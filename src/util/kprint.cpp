@@ -1,6 +1,7 @@
 #ifdef __x86_64__
 #include <arch/limine/console.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/e9.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/sync.hpp>
 #endif
@@ -332,6 +333,11 @@ flagbreak:
 
     static NSched::Mutex mutex;
     bool canmutex = false;
+    static bool consolewrite = true;
+
+    void dropwrite(void) {
+        consolewrite = false;
+    }
 
     int vprintf(const char *format, va_list ap) {
         char buffer[1024];
@@ -342,20 +348,27 @@ flagbreak:
         // if (canmutex && NArch::CPU::get()->currthread) {
             // mutex.acquire();
         // } else {
+        if (consolewrite) {
             printlock.acquire();
-        // }
+        }
 
 #ifdef __x86_64__
-        // NLimine::console_write(buffer, len);
-
-        for (size_t i = 0; i < len; i++) {
-            NArch::Serial::ports[0].write(buffer[i]);
+        if (consolewrite) {
+            NLimine::console_write(buffer, len);
         }
+
+        // for (size_t i = 0; i < len; i++) {
+            // NArch::Serial::ports[0].write(buffer[i]);
+        // }
+
+        NArch::E9::puts(buffer);
 #endif
         // if (canmutex && NArch::CPU::get()->currthread) {
             // mutex.release();
         // } else {
+        if (consolewrite) {
             printlock.release();
+        }
         // }
         return len;
     }

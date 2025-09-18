@@ -3,10 +3,16 @@
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/panic.hpp>
+#include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <util/kprint.hpp>
 
 namespace NArch {
+    namespace VMM {
+        // Perform a TLB shootdown, also handles the TLB work on the calling CPU.
+        extern void doshootdown(enum CPU::shootdown type, uintptr_t start, uintptr_t end);
+    }
+
     namespace Interrupts {
         // Reference ISR table from assembly. This is for stubs, not handlers.
         extern "C" const uint64_t isr_table[256];
@@ -98,6 +104,43 @@ namespace NArch {
                     "mov %%cr2, %0"
                     : "=r"(addr) : : "memory"
                 );
+
+                if (ctx->cs == 0x23) { // User.
+                    struct VMM::addrspace *space = NArch::CPU::get()->currthread->process->addrspace;
+                    uint64_t *pte = VMM::resolvepte(space, addr);
+
+                    if (!pte || !(*pte & VMM::PRESENT)) {
+                        // NSched::deliversignal(NArch::CPU::get()->currthread, SIGSEGV);
+                        // return;
+                        goto pffault;
+                    }
+
+
+                    if (ctx->err & (1 << 1) && (*pte) & VMM::COW) {
+                        void *newpage = PMM::alloc(PAGESIZE);
+                        if (!newpage) {
+                            NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL);
+                            return;
+                        }
+
+                        // Resolve physical page from old address space.
+                        void *oldpage = (void *)(*pte & VMM::ADDRMASK);
+                        NLib::memcpy(hhdmoff(newpage), hhdmoff(oldpage), PAGESIZE);
+
+                        space->lock.acquire();
+                        uint64_t newpte = (uint64_t)newpage | (*pte & ~VMM::ADDRMASK);
+                        newpte |= VMM::WRITEABLE;
+                        newpte &= ~VMM::COW;
+                        *pte = newpte;
+                        space->lock.release();
+
+                        NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
+                        return;
+                    }
+                }
+pffault:
+
+
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s.\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor");
             } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);

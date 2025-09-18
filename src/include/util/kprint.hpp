@@ -16,6 +16,8 @@ namespace NUtil {
     extern bool canmutex;
     // Forcibly open print lock -> For use with panic().
     void oprintlock(void);
+    // Drop writing to framebuffer console -> Pre-init.
+    void dropwrite(void);
 }
 
 #endif

@@ -4,6 +4,7 @@
 #include <arch/x86_64/acpi.hpp>
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/arch.hpp>
+#include <arch/x86_64/e9.hpp>
 #include <arch/x86_64/gdt.hpp>
 #include <arch/x86_64/hpet.hpp>
 #include <arch/x86_64/interrupts.hpp>
@@ -22,6 +23,7 @@
 #include <util/kprint.hpp>
 
 #define EARLYSERIAL 0
+#define EARLYE9 0
 
 extern void kpostarch(void);
 
@@ -99,8 +101,10 @@ namespace NArch {
             char vendorfn[32];
             if (!NLib::strcmp(vendor, "KVMKVMKVM\0\0\0")) {
                 NUtil::snprintf(vendorfn, sizeof(vendorfn), "QEMU/KVM");
+                NArch::E9::enabled = true;
             } else if (!NLib::strcmp(vendor, "TCGTCGTCGTCG")) {
                 NUtil::snprintf(vendorfn, sizeof(vendorfn), "QEMU");
+                NArch::E9::enabled = true;
             } else if (!NLib::strcmp(vendor, "VMwareVMware")) {
                 NUtil::snprintf(vendorfn, sizeof(vendorfn), "VMware");
             } else if (!NLib::strcmp(vendor, "VBoxVBoxVBox")) {
@@ -192,6 +196,7 @@ namespace NArch {
         NSched::schedulethread(kthread);
 
         NUtil::printf("[arch/x86_64]: Jump into scheduler on kernel main.\n");
+        NUtil::dropwrite(); // We're past the useful information. Use only debugging outputs from here.
 
         NSched::await(); // End here. Any work afterwards occurs within the kernel thread.
     }

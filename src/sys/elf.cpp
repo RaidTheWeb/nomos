@@ -152,7 +152,7 @@ namespace NSys {
                     )) {
                         // Failed. Free everything we've currently acquired.
                         delete[] phdrs;
-                        NArch::PMM::free(phys);
+                        NArch::PMM::free(phys, phdrs[i].msize);
                         return false;
                     }
 
@@ -160,7 +160,7 @@ namespace NSys {
                         // Failed. Free everything we've currently acquired.
                         NArch::VMM::unmaprange(space, phdrs[i].vaddr, phdrs[i].msize); // Unmap range in space.
                         delete[] phdrs;
-                        NArch::PMM::free(phys);
+                        NArch::PMM::free(phys, phdrs[i].msize);
                         return false;
                     }
 

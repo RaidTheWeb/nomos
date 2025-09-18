@@ -599,6 +599,32 @@ namespace NLib {
                     node = node->next;
                 }
             }
+
+            class Iterator {
+                private:
+                    struct node *node = NULL;
+                public:
+                    Iterator(struct node *node) {
+                        this->node = node;
+                    }
+
+                    T *get(void) {
+                        return &node->data;
+                    }
+
+                    bool valid(void) {
+                        return this->node;
+                    }
+
+                    void next(void) {
+                        this->node = node->next;
+                    }
+            };
+
+
+            Iterator begin(void) {
+                return Iterator(this->head);
+            }
     };
 
     template <typename T>

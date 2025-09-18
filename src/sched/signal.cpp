@@ -54,7 +54,7 @@ namespace NSched {
             enum dflactions action = actions[sig];
             switch (action) {
                 case DFL_TERMINATE:
-                    NUtil::printf("SIGINT.\n");
+                    NUtil::printf("Terminated via signal.\n");
                     exit();
                     break;
                 case DFL_STOP:

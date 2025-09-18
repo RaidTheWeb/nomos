@@ -86,15 +86,22 @@ namespace NMem {
                 // Find the node that contains a specific desired region.
                 struct vmanode *containing(struct vmanode *root, uintptr_t start, uintptr_t end);
 
-                // Traverse nodes in order, calling callback.
-                void traverse(struct vmanode *root, void (*callback)(struct vmanode *node));
-
                 // Validate nodes.
                 void validate(struct vmanode *root, uintptr_t *last);
 
                 // Find adjacent nodes.
                 void findadj(struct vmanode *root, struct vmanode *target, struct vmanode **prev, struct vmanode **next);
+
             public:
+                struct vmanode *getroot(void) {
+                    return this->root;
+                }
+
+                // Traverse nodes in order, calling callback.
+                void traverse(struct vmanode *root, void (*callback)(struct vmanode *node));
+
+                void traversedata(struct vmanode *root, void (*callback)(struct vmanode *node, void *data), void *data);
+
                 // Allocate an aligned region within address space.
                 void *alloc(size_t size, uint8_t flags);
 

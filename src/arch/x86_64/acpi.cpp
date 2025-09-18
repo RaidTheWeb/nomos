@@ -28,21 +28,26 @@ void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *str, ...) {
 void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
     using namespace NArch::VMM;
     using namespace NMem::Virt;
+
+    NLib::ScopeSpinlock guard(&kspace.lock);
     uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, VIRT_RW | VIRT_NX);
-    NArch::VMM::maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NLib::alignup(length, NArch::PAGESIZE));
+    NArch::VMM::_maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NLib::alignup(length, NArch::PAGESIZE));
     size_t offset = phys - NLib::aligndown(phys, NArch::PAGESIZE);
     return (void *)(virt + offset);
 }
 
 void uacpi_kernel_unmap(void *ptr, uacpi_size length) {
     using namespace NArch::VMM;
-    NArch::VMM::unmaprange(&NArch::VMM::kspace, (uintptr_t)ptr, NLib::alignup(length, NArch::PAGESIZE));
+    NLib::ScopeSpinlock guard(&kspace.lock);
+
+    NArch::VMM::_unmaprange(&kspace, (uintptr_t)ptr, NLib::alignup(length, NArch::PAGESIZE));
     kspace.vmaspace->free(ptr, length);
 }
 
 namespace NArch {
     namespace ACPI {
         struct table madt = { NULL, NULL, false };
+        struct table mcfg = { NULL, NULL, false };
         struct acpi_hpet *hpet = NULL;
 
         size_t countentries(struct table *table, uint8_t type) {
@@ -110,6 +115,18 @@ namespace NArch {
             } else {
                 NUtil::printf("[arch/x86_64/acpi]: HPET not present.\n");
                 hpet = NULL;
+            }
+
+            uacpi_table pci;
+            res = uacpi_table_find_by_signature(ACPI_MCFG_SIGNATURE, &pci);
+
+            if (res == UACPI_STATUS_OK) {
+                mcfg.start = (struct acpi_entry_hdr *)((uintptr_t)pci.ptr + sizeof(struct acpi_mcfg));
+                mcfg.end = (struct acpi_entry_hdr *)((uintptr_t)pci.ptr + ((struct acpi_mcfg *)pci.ptr)->hdr.length);
+                mcfg.initialised = true;
+                NUtil::printf("[arch/x86_64/acpi]: MCFG initialised.\n");
+            } else {
+                NUtil::printf("[arch/x86_64/acpi]: MCFG not present.\n");
             }
         }
     }

@@ -230,6 +230,7 @@ namespace NSched {
             struct NArch::CPU::context ctx; // CPU working context (save state).
             struct NArch::CPU::extracontext xctx; // CPU extra context (save state).
             struct NArch::CPU::fpucontext fctx; // CPU fpu context (save state).
+            struct NArch::CPU::context sysctx; // Syscall context (not real context, but provides original values before system call).
         private:
             enum target targetmode = target::RELAXED;
             uint16_t target = 0xffff; // Target CPU affinity (ideal).

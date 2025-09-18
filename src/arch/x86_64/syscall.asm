@@ -1,4 +1,5 @@
 
+extern sched_savesysstate
 extern signal_checkpending
 
 extern sys_exit
@@ -18,6 +19,10 @@ extern sys_dup2
 extern sys_gettid
 extern sys_getpid
 extern sys_getppid
+extern sys_getpgid
+extern sys_setpgid
+extern sys_setsid
+extern sys_fork
 
 MAXSYSCALLS equ 256
 
@@ -40,6 +45,10 @@ syscall_table:
     dq sys_gettid
     dq sys_getpid
     dq sys_getppid
+    dq sys_getpgid
+    dq sys_setpgid
+    dq sys_setsid
+    dq sys_fork
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 
@@ -56,35 +65,60 @@ syscall_entry:
 
     ; RAX now contains the user stack, and RSP contains the kernel stack.
 
-    push rax ; User RSP. Dump here, so that on exit, we can restore the user stack.
-    push r11 ; RFLAGS (stored in r11).
-    push rcx ; User RIP.
+    ; Build a context struct for pre-system call state.
 
-    mov rax, [gs:0x8] ; Restore original RAX (containing system call number).
-    ; Save original register state, so we can use later.
-    push rax ; System call number (for indexing into table). (96)
+    push qword 0x1b ; User SS (208)
+    push rax ; User RSP. Dump here, so that on exit, we can restore the user stack. (200)
+    push r11 ; RFLAGS (stored in r11). (192)
+    push qword 0x23 ; User CS (184)
+    push rcx ; User RIP. (176)
+    push qword 0 ; Zero error. (168)
 
-    push rdi ; (88)
-    push rsi ; (80)
-    push rdx ; (72)
-    push r8 ; (64)
-    push r9 ; (56)
-    push r10 ; (48)
-    push rbx ; (40)
-    push rbp ; (32)
-    push r12 ; (24)
-    push r13 ; (16)
-    push r14 ; (8)
-    push r15 ; (0)
+    push rbp ; (160)
 
-    ; Load kernel data. SYSCALL already loads kernel code for us, but we need to load kernel data ourselves.
+    push qword 0 ; Zero IRQ. (152)
+
+    push rsi ; (144)
+    push rdi ; (136)
+    push r15 ; (128)
+    push r14 ; (120)
+    push r13 ; (112)
+    push r12 ; (104)
+    push qword 0 ; R11 (clobbered) (96)
+    push r10 ; (88)
+    push r9 ; (80)
+    push r8 ; (72)
+    push rdx ; (64)
+    push qword 0 ; RCX (clobbered) (56)
+    push rbx ; (48)
+
+    mov rax, [gs:0x8] ; Restore system call number.
+    push rax ; (40)
+
+    mov rax, ds
+    push rax ; (32)
+
+    mov rax, es
+    push rax ; (24)
+
+    mov rax, fs
+    push rax ; (16)
+
+    mov rax, gs
+    push rax ; (8)
+
+    mov rax, cr2
+    push rax ; (0)
+
     mov ax, 0x10
     mov ds, ax
     mov es, ax
-    ; GS has already been set by SWAPGS.
+
+    mov rdi, rsp
+    call sched_savesysstate ; Save context before syscall.
 
     sti
-    mov rdi, [rsp + 96] ; RAX, system call number (96 offset in stack).
+    mov rdi, [rsp + 40] ; RAX, system call number (40 offset in stack).
     cmp rdi, MAXSYSCALLS ; Test system call number against the number of system calls.
     jae .invalid ; If the system call number exceeds the number of system calls, we should return an ENOSYS error code.
 
@@ -94,54 +128,62 @@ syscall_entry:
     jz .invalid ; If this system call entry has not been set, we jump to invalid handler.
 
     ; Set up arguments.
-    mov rdi, [rsp + 88] ; Retrieve RDI. Argument 1.
-    mov rsi, [rsp + 80] ; Retrieve RSI. Argument 2.
-    mov rdx, [rsp + 72] ; Retrieve RDX. Argument 3.
-    mov rcx, [rsp + 48] ; Retrieve R10 (in place of RCX, as RCX is clobbered by SYSCALL). Argument 4.
-    mov r8, [rsp + 64] ; Retrieve R8. Argument 5.
-    mov r9, [rsp + 56] ; Retrieve R9. Argument 6.
+    mov rdi, [rsp + 136] ; Retrieve RDI. Argument 1.
+    mov rsi, [rsp + 144] ; Retrieve RSI. Argument 2.
+    mov rdx, [rsp + 64] ; Retrieve RDX. Argument 3.
+    mov rcx, [rsp + 88] ; Retrieve R10 (in place of RCX, as RCX is clobbered by SYSCALL). Argument 4.
+    mov r8, [rsp + 72] ; Retrieve R8. Argument 5.
+    mov r9, [rsp + 80] ; Retrieve R9. Argument 6.
 
     call rax ; Call table entry.
 
-    mov [rsp + 96], rax ; Store return value from function (RAX) into RAX's location on the stack. This is so that when we restore the original state later, we set RAX with the return value.
+    mov [rsp + 40], rax ; Store return value from function (RAX) into RAX's location on the stack. This is so that when we restore the original state later, we set RAX with the return value.
     jmp .done
 
 .invalid:
-    mov qword [rsp + 96], -38 ; -38 = -ENOSYS. Correct error number store.
+    mov qword [rsp + 40], -38 ; -38 = -ENOSYS. Correct error number store.
 
 .done:
     cli
 
     call signal_checkpending
 
-    ; Restore original state.
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    pop r10
-    pop r9
-    pop r8
-    pop rdx
-    pop rsi
-    pop rdi
+    add rsp, 24 ; Skip segments (we only want ES onwards).
+
     pop rax
+    mov es, rax
 
-    mov rcx, [rsp + 16] ; Grab user RSP.
-    xchg rsp, rcx ; Swap back to user stack. RCX now contains the kernel stack
+    pop rax
+    mov ds, rax
 
-    ; Push frame for transition across to userspace.
-    push qword [rcx + 16] ; System call stack (old state).
-    push qword [rcx + 8] ; RFLAGS
-    push qword [rcx] ; RIP
+    pop rax
+    pop rbx
+    add rsp, 8 ; Skip RCX
+    pop rdx
+    pop r8
+    pop r9
+    pop r10
+    add rsp, 8 ; Skip R11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+
+    pop rdi
+    pop rsi
+
+    add rsp, 8 ; Skip IRQ
+
+    pop rbp
+
+    add rsp, 8 ; Skip Error
+
+    pop rcx
+    add rsp, 8 ; Skip CS.
+    pop r11
+    pop rsp ; Restore user RSP. We're back!
 
     swapgs ; Swap back to user GS.
-
-    ; Pop frame off of user stack.
-    pop rcx ; RIP
-    pop r11 ; Restore RFLAGS.
-    pop rsp ; Restore stack.
+    lfence
 
     o64 sysret ; Return to user mode.

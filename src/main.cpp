@@ -12,6 +12,7 @@
 
 #include <dev/dev.hpp>
 #include <dev/input/input.hpp>
+#include <dev/pci.hpp>
 
 #include <cxxruntime.hpp>
 #include <fs/devfs.hpp>
@@ -78,16 +79,19 @@ void kpostarch(void) {
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE1) {
             NUtil::printf("[nomos]: Discovered stage 1 driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
-            entry->create();
+
+            entry->instance = entry->create();
         }
     }
 
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE2) {
             NUtil::printf("[nomos]: Discovered stage 2 driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
-            entry->create();
+            entry->instance = entry->create();
         }
     }
+
+    NDev::PCI::init(); // Initialise PCI.
 
     const char *initramfs = NArch::cmdline.get("initramfs");
     if (initramfs) { // Exists, load it.
@@ -139,6 +143,7 @@ void kpostarch(void) {
     // THREAD
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
 
+    // XXX: Be able to pass allocation to thread, so it knows to remove it on free.
     uintptr_t ustack = (uintptr_t)NArch::PMM::alloc(1 << 20); // Allocate 1MB stack.
     assert(ustack, "Failed to allocate memory for user stack.\n");
 

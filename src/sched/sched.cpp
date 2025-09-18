@@ -423,7 +423,7 @@ namespace NSched {
 
         // Migrate our tasks to other CPUs to mitigate load.
         struct CPU::cpulocal *target = getidlest();
-        if (!target) {
+        if (!target || cpu == target) { // Don't try to load balance to ourselves! We'd just end up deadlocking.
             return;
         }
         size_t quota = (cpu->runqueue.count() - LOADTHRESHOLD) / 4; // Target should be given a quarter of our work.
@@ -528,6 +528,7 @@ namespace NSched {
         uint64_t cr0 = CPU::rdcr0();
         cr0 |= (1 << 3); // Set TS bit.
         CPU::wrcr0(cr0);
+
 #endif
         __atomic_store_n(&thread->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
 
@@ -562,13 +563,15 @@ namespace NSched {
 
         updateload(cpu); // Update current CPU load. For load balancing and scheduling tasks.
 
+
         // Load Balance on an interval:
-        if (!(curintr % 8)) { // Every fourth schedule interrupt:
+        if (!(curintr % 4)) { // Every fourth schedule interrupt:
             loadbalance(cpu);
         }
 
         Thread *prev = cpu->currthread; // Currently running thread.
         Thread *next = NULL; // What we're planning to schedule next.
+
 
         if (prev->rescheduling) { // Handle migration re-enable on reschedule.
             __atomic_store_n(&prev->rescheduling, false, memory_order_seq_cst);
@@ -620,7 +623,6 @@ namespace NSched {
 
         __atomic_store_n(&next->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
 
-
         // We haven't changed anything. We were just given our old thread, this happens most commonly when running the idle thread.
         // It'd be a waste to attempt to context switch when we're working on the same code.
 
@@ -633,11 +635,12 @@ namespace NSched {
 
     static size_t pidcounter = 0; // Because kernel process is the first process made, it'll be PID0. The first user process (init) will be PID1!
     Process *kprocess = NULL; // Kernel process.
+    NArch::Spinlock pidtablelock;
     NLib::KVHashMap<size_t, Process *> *pidtable = NULL;
 
     void Process::init(struct VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
         // Each new process should be initialised with an atomically incremented PID.
-        this->id = __atomic_add_fetch(&pidcounter, 1, memory_order_seq_cst);
+        this->id = __atomic_fetch_add(&pidcounter, 1, memory_order_seq_cst);
         this->addrspace = space;
         if (space == &VMM::kspace) {
             this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
@@ -666,23 +669,27 @@ namespace NSched {
             }
         }
 
+        pidtablelock.acquire();
         pidtable->insert(this->id, this);
+        pidtablelock.release();
     }
 
     Process::~Process(void) {
 
         // Dereference address space and free it if there's nothing on it.
 
-        this->addrspace->lock.acquire();
-        this->addrspace->ref--;
-        size_t ref = this->addrspace->ref;
-        this->addrspace->lock.release();
+        // this->addrspace->lock.acquire();
+        // this->addrspace->ref--;
+        // size_t ref = this->addrspace->ref;
+        // this->addrspace->lock.release();
 
-        if (ref == 0) {
-            delete this->addrspace;
-        }
+        // if (ref == 0) {
+            // delete this->addrspace;
+        // }
 
+        pidtablelock.acquire();
         pidtable->remove(this->id);
+        pidtablelock.release();
 
         if (this->fdtable) {
             delete this->fdtable;
@@ -777,7 +784,7 @@ namespace NSched {
         this->stacksize = stacksize;
 
         // Allocate thread ID.
-        this->id = __atomic_add_fetch(&this->process->tidcounter, 1, memory_order_seq_cst);
+        this->id = __atomic_fetch_add(&this->process->tidcounter, 1, memory_order_seq_cst);
 
         // Zero context.
         NLib::memset(&this->ctx, 0, sizeof(this->ctx));
@@ -816,7 +823,7 @@ namespace NSched {
     }
 
     void Thread::destroy(void) {
-        PMM::free(hhdmsub(this->stack)); // Free stack.
+        PMM::free(hhdmsub(this->stack), this->stacksize); // Free stack.
 
         __atomic_sub_fetch(&this->process->threadcount, 1, memory_order_seq_cst);
         if (__atomic_load_n(&this->process->threadcount, memory_order_seq_cst) == 0) {
@@ -894,6 +901,204 @@ namespace NSched {
         for (;;) {
             asm volatile("hlt");
         }
+    }
+
+    extern "C" __attribute__((no_caller_saved_registers)) void sched_savesysstate(struct NArch::CPU::context *state) {
+        NArch::CPU::get()->currthread->sysctx = *state;
+        NArch::CPU::get()->intstatus = true;
+    }
+
+    extern "C" uint64_t sys_fork(void) {
+        NUtil::printf("sys_fork().\n");
+
+        Process *current = NArch::CPU::get()->currthread->process;
+
+        NLib::ScopeSpinlock guard(&current->lock);
+
+        Process *child = new Process(VMM::forkcontext(current->addrspace), current->fdtable->fork());
+        if (!child) {
+            return -ENOMEM;
+        }
+
+        child->cwd = current->cwd;
+        if (child->cwd) {
+            child->cwd->ref(); // Add new reference.
+        }
+
+        // Clone for permissions.
+        child->euid = current->euid;
+        child->egid = current->egid;
+        child->suid = current->suid;
+        child->sgid = current->sgid;
+        child->uid = current->uid;
+        child->gid = current->gid;
+
+        // Establish child<->parent relationship between processes.
+        child->parent = current;
+        current->children.push(child);
+
+        child->session = current->session;
+        child->pgrp = current->pgrp;
+
+        child->pgrp->procs.push(child);
+
+        Thread *cthread = new Thread(child, NSched::DEFAULTSTACKSIZE);
+        if (!cthread) {
+            return -ENOMEM;
+        }
+
+#ifdef __x86_64__
+        cthread->ctx = NArch::CPU::get()->currthread->sysctx; // Initialise using system call context.
+
+        cthread->ctx.rax = 0; // Override return to indicate this is the child.
+
+
+        // Save extra contexts.
+        NArch::CPU::savexctx(&cthread->xctx);
+        if (NArch::CPU::get()->currthread->fctx.mathused) {
+            NArch::CPU::savefctx(&cthread->fctx);
+        }
+
+
+#endif
+        // XXX: Copy signals?
+
+        NSched::schedulethread(cthread);
+
+        return child->id;
+    }
+
+    extern "C" uint64_t sys_setsid(void) {
+        NUtil::printf("sys_setsid().\n");
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        NLib::ScopeSpinlock guard(&current->lock);
+
+        current->pgrp->lock.acquire();
+        if (current->pgrp->id == current->id) {
+            current->pgrp->lock.release();
+            return -EPERM; // Can't create a new session as group leader.
+        }
+        current->pgrp->lock.release();
+
+        // We must create a new session.
+        Session *session = new Session();
+        if (!session) {
+            return -ENOMEM;
+        }
+        session->id = current->id;
+        session->ctty = 0;
+
+        // And a new session needs a new process group to be connected to it.
+        NSched::ProcessGroup *pgrp = new ProcessGroup();
+        pgrp->id = current->id;
+        pgrp->procs.push(current);
+        pgrp->session = session;
+
+        session->pgrps.push(pgrp);
+
+        current->pgrp = pgrp;
+        current->session = session;
+
+        return session->id;
+    }
+
+    extern "C" uint64_t sys_setpgid(int pid, int pgid) {
+        NUtil::printf("sys_setpgid(%d, %d).\n", pid, pgid);
+
+        if (pgid < 0) {
+            return -EINVAL;
+        }
+
+        // XXX: Refcount process to prevent it from being freed during work.
+        NLib::ScopeSpinlock guard1(&pidtablelock);
+
+        Process *proc = NULL;
+        Process *current = NArch::CPU::get()->currthread->process;
+
+        if (pid != 0) { // Non-zero PID means we should actually find one.
+            Process **pproc = pidtable->find(pid);
+            if (!pproc) {
+                return -ESRCH;
+            }
+            proc = *pproc;
+        } else { // Zero PID means we should default to our current process.
+            proc = current;
+        }
+
+        NLib::ScopeSpinlock guard2(&proc->lock);
+
+        if (!(current->session == proc->session && (current == proc->parent || proc == current))) {
+            return -EPERM; // We're not allowed to manipulate processes outside our session, or those where we aren't the parent of the process.
+        }
+
+        proc->pgrp->lock.acquire();
+        if (proc->pgrp->id == proc->id) {
+            proc->pgrp->lock.release();
+            return -EPERM; // We can't set the process group of a process that is already the leader of its own process group (we'd lose reference to the process group).
+        }
+        proc->pgrp->lock.release();
+
+        ProcessGroup *newpgrp = NULL;
+        bool canfree = false;
+        if (pgid) {
+            Process **op = pidtable->find(pgid); // Attempt to find the process that leads this process group.
+            if (!op) {
+                return -EINVAL;
+            }
+
+            newpgrp = (*op)->pgrp;
+            newpgrp->lock.acquire();
+            if (newpgrp->session != proc->session) { // New process group should *also* be in the current session.
+                newpgrp->lock.release();
+                return -EPERM;
+            }
+        } else { // Zero PGID. Create a new one.
+            newpgrp = new ProcessGroup();
+            if (!newpgrp) {
+                return -ENOMEM;
+            }
+            newpgrp->id = proc->id; // Make sure that this process is the leader.
+            newpgrp->session = proc->session;
+            canfree = true;
+            newpgrp->lock.acquire();
+        }
+
+        // Only attempt to add a process that isn't currently waiting to exit (zero threads).
+        if (__atomic_load_n(&proc->threadcount, memory_order_seq_cst)) {
+            proc->pgrp = newpgrp; // Update process' process group (joins a new one as leader, or joins existing one).
+            newpgrp->procs.push(proc);
+            newpgrp->lock.release();
+        } else {
+            if (canfree) {
+                newpgrp->lock.release();
+                delete newpgrp;
+            }
+
+            return -ESRCH;
+        }
+
+        return 0;
+    }
+
+    extern "C" uint64_t sys_getpgid(int pid) {
+        NUtil::printf("sys_getpgid(%d).\n", pid);
+
+        NLib::ScopeSpinlock guard(&pidtablelock);
+
+        if (!pid) {
+            // Return current process' process group ID.
+            return NArch::CPU::get()->currthread->process->pgrp->id;
+        }
+
+        Process **pproc = pidtable->find(pid);
+        if (!pproc) {
+            return -ESRCH;
+        }
+
+        Process *proc = *pproc;
+        // Return the process group of whatever we found.
+        return proc->pgrp->id;
     }
 
     extern "C" uint64_t sys_gettid(void) {

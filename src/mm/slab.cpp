@@ -158,7 +158,7 @@ namespace NMem {
             }
 
             // Metadata start is the start of the page, therefore, we can just shove the location of the metadata into the PMM to free it.
-            NArch::PMM::free(NArch::hhdmsub(meta));
+            NArch::PMM::free(NArch::hhdmsub(meta), size);
         }
     }
 

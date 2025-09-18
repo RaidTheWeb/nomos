@@ -2,6 +2,7 @@
 #define _ARCH__X86_64__VMM_HPP
 
 #include <arch/limine/requests.hpp>
+#include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <lib/sync.hpp>
 #include <mm/virt.hpp>
@@ -94,6 +95,9 @@ namespace NArch {
         static const uint64_t DIRTY = (1 << 6); // RSVD
         static const uint64_t HUGE = (1 << 7); // 4MiB page enable.
         static const uint64_t GLOBAL = (1 << 8); // Does not invalidate TLB entry for this page when changing CR3 register (changing page tables).
+
+        static const uint64_t COW = (1 << 9); // Copy-on-write flag (Nomos-specific).
+
         static const uint64_t NOEXEC = (1ul << 63); // Disables execution on this section of memory.
         static const uint64_t ADDRMASK = 0x000FFFFFFFFFF000; // Standard bitmask for extracting the physical address from an underlying page table entry.
         static const uint64_t ADDRMASK2MB = 0x000FFFFFFFE00000; // Bitmask for addresses from 2MB page table entries.
@@ -190,6 +194,10 @@ namespace NArch {
         void clonecontext(struct addrspace *space, struct pagetable **pt);
         void uclonecontext(struct addrspace *src, struct addrspace **dest);
         void enterucontext(struct pagetable *pt, struct addrspace *space);
+
+        struct addrspace *forkcontext(struct addrspace *src);
+
+        void tlbshootdown(struct Interrupts::isr *isr, struct CPU::context *ctx);
 
         // Maps kernel regions according to start and end of individual sections.
         void mapkernel(void *start, void *end, uint64_t flags);

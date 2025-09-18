@@ -44,6 +44,8 @@ namespace NArch {
 
             // Register an interrupt handler for a panic vector.
             Interrupts::regisr(0xfd, halt, false);
+            // Register interrupt handler for tlb shotodown.
+            Interrupts::regisr(0xfc, VMM::tlbshootdown, true);
 
             CPU::init(); // Initialise CPU (Specifics).
 
@@ -55,7 +57,10 @@ namespace NArch {
         }
 
         void setup(void) {
-            // Interrupts::regisr(0xfd, halt, false);
+            Interrupts::regisr(0xfd, halt, false);
+            // Register interrupt handler for tlb shootdown.
+            Interrupts::regisr(0xfc, VMM::tlbshootdown, true);
+
             struct limine_mp_response *mpresp = NLimine::mpreq.response;
 
             struct CPU::cpulocal *phycpus = (struct CPU::cpulocal *)PMM::alloc(NLib::alignup(sizeof(struct CPU::cpulocal) * mpresp->cpu_count, PAGESIZE)); // We'll never free this.

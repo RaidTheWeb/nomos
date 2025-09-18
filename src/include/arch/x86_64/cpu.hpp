@@ -76,6 +76,31 @@ namespace NArch {
         static const uint32_t MSRGSBASE     = 0xc0000101; // GS.
         static const uint32_t MSRKGSBASE    = 0xc0000102; // Kernel GS.
 
+        enum shootdown : uint8_t {
+            TLBSHOOTDOWN_NONE,
+            TLBSHOOTDOWN_SINGLE,
+            TLBSHOOTDOWN_RANGE,
+            TLBSHOOTDOWN_FULL
+        };
+
+        // Local TLB shootdown state.
+        struct tlblocal {
+            bool pending; // Atomic. Are we working on this?
+
+            // Private states:
+            enum shootdown type;
+            uint64_t start;
+            uint64_t end;
+
+            size_t completion; // Atomic. How much have we done?
+        };
+
+        struct tlbglobal {
+            size_t activereqs; // Should be referenced atomically.
+        };
+
+        extern struct tlbglobal tlbglobal;
+
         struct cpulocal {
             // Place current thread pointer at the start of the CPU struct, so the offset is easier within the system call assembly.
             NSched::Thread *currthread = NULL; // Currently running thread, if any.
@@ -96,6 +121,8 @@ namespace NArch {
             uint32_t lapicid;
             uint64_t lapicfreq = 0;
             bool intstatus = false; // Interrupts enabled?
+
+            struct tlblocal tlblocal;
 
             uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
             NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.

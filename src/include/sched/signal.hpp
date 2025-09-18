@@ -34,6 +34,8 @@ namespace NSched {
     class ProcessGroup;
     class Process;
 
+    void deliversignal(Thread *thread, uint8_t sig);
+
     int signalproc(Process *proc, uint8_t sig);
     int signalpgrp(ProcessGroup *pgrp, uint8_t sig);
     int signalthread(Thread *thread, uint8_t sig);

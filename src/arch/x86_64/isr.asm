@@ -41,10 +41,10 @@ isr_common:
 
     swapgs
     lfence
-    mov rax, [gs:0x18] ; Swap to kernel CR3.
+    ; mov rax, [gs:0x18] ; Swap to kernel CR3.
 
-    mov cr3, rax
-    lfence
+    ; mov cr3, rax
+    ; lfence
 
     pop rax
 
@@ -144,11 +144,10 @@ isr_common:
     mov rax, [rax] ; Load address space pointer.
     mov rax, [rax + 8] ; Load physical PML4 of current thread into temp.
 
-    lfence
-    mov cr3, rax
-    lfence
-
+    ; lfence
+    ; mov cr3, rax
     swapgs
+    lfence
 
     pop rax
 .ret: ; If this is a kernel thread, we're already in the kernel CR3, no work.

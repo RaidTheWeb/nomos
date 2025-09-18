@@ -48,6 +48,7 @@ namespace NDev {
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {
                 (void)offset;
+                (void)fdflags;
                 uint32_t minor = DEVFS::minor(dev);
 
                 switch (minor) {
@@ -68,6 +69,7 @@ namespace NDev {
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 (void)buf;
                 (void)offset;
+                (void)fdflags;
                 uint64_t minor = DEVFS::minor(dev);
 
                 if (minor == FULLMINOR) {

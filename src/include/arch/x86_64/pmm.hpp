@@ -19,6 +19,17 @@ namespace NArch {
     static const uint64_t CANARY = 0x4fc0ffee2dead9f5; // Magic "canary" to be stored at the start of free entries, to check for UAF errors.
 
     namespace PMM {
+        // Phyical page metadata.
+        class PageMeta {
+            public:
+                size_t refcount = 0;
+                uint64_t flags = 0;
+
+                void ref(void);
+                void unref(void);
+                void free(void);
+        };
+
         struct block {
             uint64_t canary; // Canary for UAF checks.
             struct block *next; // Reference next block in linked list.
@@ -28,6 +39,8 @@ namespace NArch {
             uintptr_t addr; // Base address for allocation region.
             size_t size; // Size of allocation region.
             struct block *freelist[ALLOCLEVEL]; // References to linked list that reference blocks, for each buddy allocation level.
+
+            PageMeta *meta; // Associated page meta array.
         };
 
         struct bzone {
@@ -35,18 +48,17 @@ namespace NArch {
 
             size_t size; // Size of allocation region.
             uint8_t *bitmap; // Associated bitmap for this region.
+
+            PageMeta *meta; // Associated page metadata array.
         };
 
-        struct bheader {
-            uint64_t magic; // Magic for ensuring we're working with an allocation that has actually been made.
-            uint64_t size; // Size of allocation.
-        };
+        PageMeta *phystometa(uintptr_t phys);
 
         extern size_t alloci;
         void setup(void);
 
         void *alloc(size_t size);
-        void free(void *ptr);
+        void free(void *ptr, size_t size = 0);
     }
 }
 
