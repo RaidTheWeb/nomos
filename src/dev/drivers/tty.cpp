@@ -6,7 +6,7 @@
 #include <dev/dev.hpp>
 #include <dev/kbd.hpp>
 #include <dev/input/input.hpp>
-#include <dev/tty.hpp>
+#include <dev/drivers/tty.hpp>
 #include <fs/devfs.hpp>
 #include <lib/signal.hpp>
 #include <mm/ucopy.hpp>

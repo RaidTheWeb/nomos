@@ -60,7 +60,9 @@ namespace NDev {
 
     class Driver {
         public:
-            bool probe(void);
+            virtual void probe(struct devinfo info) {
+                (void)info;
+            }
     };
 
     class BusDriver : public Driver {
@@ -170,6 +172,18 @@ namespace NDev {
                 (void)st;
                 return -123123123; // Tell device node to default to node attributes.
             }
+
+            virtual void probe(struct devinfo info) {
+                (void)info;
+            }
+    };
+
+    enum pciflags {
+        PCI_MATCHCLASS      = (1 << 0),
+        PCI_MATCHSUBCLASS   = (1 << 1),
+        PCI_MATCHPROGIF     = (1 << 2),
+        PCI_MATCHVENDOR     = (1 << 3), // Match a specific vendor.
+        PCI_MATCHDEVICE     = (1 << 4), // Match a specific vendor+device.
     };
 
     struct reginfo {

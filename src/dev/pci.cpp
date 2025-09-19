@@ -52,6 +52,80 @@ namespace NDev {
             }
 
             NUtil::printf("[dev/pci]: Discovered PCI device %04x:%04x\n", dev.info.pci.vendor, dev.info.pci.device);
+
+            uint16_t status = read(&dev, 0x6, 2);
+
+            if (status & (1 << 4)) { // Has a capabilities list.
+                uint8_t ptr = read(&dev, 0x34, 1); // Offset of capabilities list within PCI struct.
+                while (ptr) {
+                    uint8_t cap = read(&dev, ptr, 1); // Read in a capability.
+
+                    if (cap == 5) { // MSI.
+                        dev.info.pci.msisupport = true;
+                        dev.info.pci.msioff = ptr;
+                        break;
+                    } else if (cap == 16) { // PCIe.
+                        dev.info.pci.pciesupport = true;
+                        dev.info.pci.pcieoff = ptr;
+                        break;
+                    } else if (cap == 17) { // MSI-X.
+                        dev.info.pci.msixsupport = true;
+                        dev.info.pci.msixoff = ptr;
+                        break;
+                    }
+
+                    ptr = read(&dev, ptr + 1, 1);
+                }
+
+            }
+
+            for (struct regentry *entry = (NDev::regentry *)__drivers_start; (uintptr_t)entry < (uintptr_t)__drivers_end; entry++) {
+                if (entry->magic == NDev::MAGIC && entry->info->type == reginfo::PCI) {
+
+                    uint8_t flags = entry->info->match.pci.flags;
+
+                    if (flags & PCI_MATCHDEVICE) {
+                        if (entry->info->match.pci.vendor != dev.info.pci.vendor) {
+                            continue;
+                        }
+
+                        bool match = false;
+                        for (size_t i = 0; i < entry->info->match.pci.devcount; i++) {
+                            uint16_t device = entry->info->match.pci.devices[i];
+                            if (dev.info.pci.device == device) {
+                                match = true;
+                            }
+                        }
+
+                        if (!match) {
+                            continue;
+                        }
+
+                        entry->instance->probe(dev);
+                    } else if (flags & PCI_MATCHVENDOR) {
+                        if (entry->info->match.pci.vendor != dev.info.pci.vendor) {
+                            continue;
+                        }
+
+                        entry->instance->probe(dev);
+                    } else {
+                        if ((flags & PCI_MATCHCLASS) && (entry->info->match.pci.pciclass != dev.info.pci.pciclass)) {
+                            continue;
+                        }
+
+                        if ((flags & PCI_MATCHSUBCLASS) && (entry->info->match.pci.pcisubclass != dev.info.pci.pcisubclass)) {
+                            continue;
+                        }
+
+                        if ((flags & PCI_MATCHPROGIF) && (entry->info->match.pci.pciprogif != dev.info.pci.pciprogif)) {
+                            continue;
+                        }
+
+                        entry->instance->probe(dev);
+                    }
+
+                }
+            }
         }
 
         void scanslot(uint8_t bus, uint8_t slot) {
@@ -109,6 +183,64 @@ namespace NDev {
                     scanbus(i);
                 }
             }
+        }
+
+        void unmapbar(struct bar bar) {
+            if (bar.mmio) { // Only unmap MMIO BARs.
+                NLib::ScopeSpinlock guard(&NArch::VMM::kspace.lock);
+                NArch::VMM::_unmaprange(&NArch::VMM::kspace, bar.base, bar.len);
+                NArch::VMM::kspace.vmaspace->free((void *)bar.base, bar.len);
+            }
+        }
+
+        struct bar getbar(struct devinfo *dev, uint8_t idx) {
+            struct bar bar = { };
+            bar.base = 0;
+            bar.len = 0;
+            bar.mmio = false;
+
+            if (idx > 5) { // Invalid BAR#.
+                return bar;
+            }
+
+            uint16_t baroff = 0x10 + idx * sizeof(uint32_t); // Acquire offset for desired BAR.
+
+            uint32_t baselo = read(dev, baroff, 4);
+
+            // Acquire size by writing ~0 to the register, then reading.
+            write(dev, baroff, ~0, 4);
+            uint32_t sizelo = read(dev, baroff, 4);
+
+            write(dev, baroff, baselo, 4); // Write original value of base to register (restore).
+
+            if (!(baselo & (1 << 0))) { // If the first bit is zero, this is an MMIO bar.
+                bar.mmio = true;
+
+                int type = (baselo >> 1) & 0x3;
+
+                bar.base = baselo & 0xfffffff0;
+                if (type == 2) { // Type 2 is 64-bit, this means we should combine with the next BAR.
+                    uint32_t basehi = read(dev, baroff + 4, 4);
+                    bar.base |= ((uint64_t)basehi << 32);
+                }
+
+
+                bar.len = ~(sizelo & ~0b1111) + 1;
+                NArch::VMM::kspace.lock.acquire();
+                uintptr_t virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(bar.len, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
+                assert(NArch::VMM::_maprange(
+                    &NArch::VMM::kspace, virt, bar.base,
+                    NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, bar.len)
+                , "Failed to map PCI MMIO space.\n");
+                NArch::VMM::kspace.lock.release();
+
+                bar.base = virt; // Update BAR with virtual mapped address.
+            } else { // First bit is one, this is an I/O bar.
+                bar.base = baselo & ~0b11; // Remove first two bits (marker and reserved).
+                bar.len = ~(sizelo & ~0b11) + 1; // And add one, for actual size.
+            }
+
+            return bar;
         }
 
 

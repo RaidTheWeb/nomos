@@ -1,3 +1,6 @@
+#ifndef _DEV__DRIVERS__TTY_HPP
+#define _DEV__DRIVERS__TTY_HPP
+
 #include <dev/dev.hpp>
 #include <lib/list.hpp>
 #include <sched/event.hpp>
@@ -140,3 +143,5 @@ namespace NDev {
             }
     };
 }
+
+#endif

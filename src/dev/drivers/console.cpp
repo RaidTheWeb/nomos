@@ -4,7 +4,7 @@
 
 #include <dev/dev.hpp>
 #include <arch/limine/console.hpp>
-#include <dev/tty.hpp>
+#include <dev/drivers/tty.hpp>
 #include <fs/devfs.hpp>
 #include <mm/ucopy.hpp>
 
