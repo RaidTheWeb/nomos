@@ -121,6 +121,7 @@ namespace NArch {
 
         extern IoApic *ioapics;
         extern uintptr_t lapicaddr;
+        extern uintptr_t lapicphy;
 
         // Read from Local APIC register.
         static inline uint32_t readlapic(uint32_t reg) {

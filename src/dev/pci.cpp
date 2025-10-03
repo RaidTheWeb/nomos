@@ -1,6 +1,8 @@
 
 #ifdef __x86_64__
 #include <arch/x86_64/acpi.hpp>
+#include <arch/x86_64/apic.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
 
@@ -60,15 +62,15 @@ namespace NDev {
                 while (ptr) {
                     uint8_t cap = read(&dev, ptr, 1); // Read in a capability.
 
-                    if (cap == 5) { // MSI.
+                    if (cap == 0x05) { // MSI.
                         dev.info.pci.msisupport = true;
                         dev.info.pci.msioff = ptr;
                         break;
-                    } else if (cap == 16) { // PCIe.
+                    } else if (cap == 0x10) { // PCIe.
                         dev.info.pci.pciesupport = true;
                         dev.info.pci.pcieoff = ptr;
                         break;
-                    } else if (cap == 17) { // MSI-X.
+                    } else if (cap == 0x11) { // MSI-X.
                         dev.info.pci.msixsupport = true;
                         dev.info.pci.msixoff = ptr;
                         break;
@@ -191,6 +193,190 @@ namespace NDev {
                 NArch::VMM::_unmaprange(&NArch::VMM::kspace, bar.base, bar.len);
                 NArch::VMM::kspace.vmaspace->free((void *)bar.base, bar.len);
             }
+        }
+
+        void maskvector(struct devinfo *dev, uint8_t idx) {
+            if (dev->info.pci.msixsupport) {
+                uint32_t bir = read(dev, dev->info.pci.msixoff + MSIXTABLE, 4);
+
+                uint8_t idx = bir & 0x7;
+                uint32_t off = bir & ~0x7;
+
+                struct PCI::bar bar = getbar(dev, idx); // MSI-X info is contained within the specified BAR.
+
+                struct msixentry *table = (struct msixentry *)(bar.base + off);
+                table[idx].vc |= (1 << 0); // Flip mask bit to mask.
+
+                asm volatile("sfence" : : : "memory"); // Barrier to ensure write.
+                unmapbar(bar);
+            } else if (dev->info.pci.msisupport) {
+                uint16_t ctrl = read(dev, dev->info.pci.msioff + MSICTRLREG, 2);
+
+                if (!(ctrl & MSICTRLMASK)) {
+                    NUtil::printf("[dev/pci]: Device does not support MSI masking.\n");
+                    return;
+                }
+
+                uint32_t bits = read(dev, dev->info.pci.msioff + MSIMASKREG, 4);
+                bits |= (1 << idx); // Flip bit to mask.
+                write(dev, dev->info.pci.msioff + MSIMASKREG, bits, 4);
+            }
+
+            // XXX: Legacy IRQ support.
+        }
+
+        void unmaskvector(struct devinfo *dev, uint8_t idx) {
+            if (dev->info.pci.msixsupport) {
+                uint32_t bir = read(dev, dev->info.pci.msixoff + MSIXTABLE, 4);
+
+                uint8_t idx = bir & 0x7;
+                uint32_t off = bir & ~0x7;
+
+                struct PCI::bar bar = getbar(dev, idx); // MSI-X info is contained within the specified BAR.
+
+                struct msixentry *table = (struct msixentry *)(bar.base + off);
+                table[idx].vc &= ~(1 << 0); // Flip mask bit to unmask.
+
+                asm volatile("sfence" : : : "memory"); // Barrier to ensure write.
+                unmapbar(bar);
+            } else if (dev->info.pci.msisupport) {
+                uint16_t ctrl = read(dev, dev->info.pci.msioff + MSICTRLREG, 2);
+
+                if (!(ctrl & MSICTRLMASK)) {
+                    NUtil::printf("[dev/pci]: Device does not support MSI masking.\n");
+                    return;
+                }
+
+                uint32_t bits = read(dev, dev->info.pci.msioff + MSIMASKREG, 4);
+                bits &= ~(1 << idx); // Flip bit to unmask.
+                write(dev, dev->info.pci.msioff + MSIMASKREG, bits, 4);
+            }
+
+            // XXX: Legacy IRQ support.
+        }
+
+        int enablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors) {
+            if (dev->info.pci.msixsupport) { // Prioritise MSI-X.
+                uint16_t msixctrl = read(dev, dev->info.pci.msixoff + MSIXCTRLREG, 2);
+
+                if (msixctrl & MSIXCTRLEN) {
+                    // Disable controller if it's already enabled.
+                    write(dev, dev->info.pci.msixoff + MSIXCTRLREG, msixctrl & ~MSIXCTRLEN, 2);
+                }
+
+                uint16_t size = (msixctrl & MSIXTABLESIZEMASK) + 1;
+
+                if (count == 0 || count > size) {
+                    NUtil::printf("[dev/pci]: Device does not support the requested number of MSI-X vectors.\n");
+                    return -1;
+                }
+
+                uint32_t bir = read(dev, dev->info.pci.msixoff + MSIXTABLE, 4);
+
+                uint8_t idx = bir & 0x7;
+                uint32_t off = bir & ~0x7;
+                NUtil::printf("Table is on BAR%u at %p.\n", idx, off);
+
+                struct PCI::bar bar = getbar(dev, idx); // MSI-X info is contained within the specified BAR.
+
+                struct msixentry *table = (struct msixentry *)(bar.base + off);
+
+                for (size_t i = 0; i < count; i++) {
+                    vectors[i] = NArch::Interrupts::allocvec();
+
+                    table[i].addrlo = NArch::APIC::lapicphy | (NArch::CPU::get()->lapicid << 12);
+                    table[i].addrhi = (NArch::APIC::lapicphy >> 32) & 0xffffffff;
+                    table[i].data = vectors[i]; // Specify the vector.
+                    table[i].vc = 0; // Begin unmasked.
+                    NUtil::printf("[dev/pci]: Sending MSI-X IRQ %u to %u at %p.\n", i, vectors[i], table[i].addrlo);
+                }
+
+
+                asm volatile("sfence" : : : "memory"); // Barrier to ensure commit.
+
+                msixctrl &= ~MSIXCTRLFUNCMASK;
+                msixctrl |= MSIXCTRLEN; // Enable controller.
+                write(dev, dev->info.pci.msixoff + MSIXCTRLREG, msixctrl, 2);
+
+                unmapbar(bar);
+
+                NUtil::printf("[dev/pci]: MSI-X enabled with vectors %u to %u.\n", vectors[0], vectors[0] + count - 1);
+                return 0;
+            } else if (dev->info.pci.msisupport) {
+                uint16_t msictrl = read(dev, dev->info.pci.msioff + MSICTRLREG, 2);
+
+                uint8_t mmc = (msictrl & MSIMMMASK) >> MSIMMSHIFT;
+                uint8_t maxvec = 1 << mmc;
+
+                if (count > maxvec) {
+                    NUtil::printf("[dev/pci]: Device does not support the requested number of MSI vectors.\n");
+                    return -1;
+                }
+
+                for (size_t i = 0; i < count; i++) {
+                    vectors[i] = NArch::Interrupts::allocvec();
+                }
+
+                uint8_t mmeval = 0;
+                switch (count) {
+                    case 1:
+                        mmeval = 0;
+                        break;
+                    case 2:
+                        mmeval = 1;
+                        break;
+                    case 4:
+                        mmeval = 2;
+                        break;
+                    case 8:
+                        mmeval = 3;
+                        break;
+                    case 16:
+                        mmeval = 4;
+                        break;
+                    case 32:
+                        mmeval = 5;
+                        break;
+                    default:
+                        return -1;
+                }
+
+                msictrl &= ~MSICTRLEN; // Disable controller.
+                write(dev, dev->info.pci.msioff + MSICTRLREG, msictrl, 2);
+
+                union {
+                    struct {
+                        uint32_t rsvd0 : 2;
+                        uint32_t mode : 1;
+                        uint32_t hint : 1;
+                        uint32_t rsvd1 : 8;
+                        uint32_t dest : 8;
+                        uint32_t addr : 12;
+                    };
+                    uint32_t raw;
+                } msiaddr;
+                msiaddr.addr = NArch::APIC::lapicphy;
+                msiaddr.dest = 0; // Target CPU0.
+                msiaddr.hint = 0;
+                msiaddr.mode = 0;
+
+                write(dev, dev->info.pci.msioff + MSIADDRLOREG, msiaddr.raw, 4);
+                if (msictrl & MSICTRL64) { // If we support 64-bit, shove the higher half of the LAPIC address here.
+                    write(dev, dev->info.pci.msioff + MSIADDRHIREG, (NArch::APIC::lapicphy >> 32) & 0xffffffff, 4);
+                }
+
+                uint16_t data = vectors[0];
+                write(dev, dev->info.pci.msioff + MSIDATAREG, data, 2); // Write base vector.
+
+                msictrl &= ~MSIMMMASK;
+                msictrl |= (mmeval << MSIMMSHIFT); // Overwrite with new MME value.
+                msictrl |= MSICTRLEN; // Reenable controller.
+                write(dev, dev->info.pci.msioff + MSICTRLREG, msictrl, 2);
+                NUtil::printf("[dev/pci]: MSI enabled with vectors %u to %u.\n", vectors[0], vectors[0] + count - 1);
+                return 0;
+            }
+
+            return -1; // XXX: Legacy IRQ support.
         }
 
         struct bar getbar(struct devinfo *dev, uint8_t idx) {

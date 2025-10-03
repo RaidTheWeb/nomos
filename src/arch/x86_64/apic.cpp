@@ -13,6 +13,7 @@ namespace NArch {
         IoApic *ioapics = NULL;
         static size_t numioapic;
         uintptr_t lapicaddr = 0;
+        uintptr_t lapicphy = 0;
 
         void sendipi(uint8_t cpu, uint8_t vec, uint8_t delivery, uint8_t mode, uint8_t dest) {
             writelapic(LAPICICRHI, (uint32_t)cpu << 24); // Load in the target CPU.
@@ -201,6 +202,8 @@ namespace NArch {
                 lapicaddr = addroverride->address; // If the ACPI tables specify an override for the base address, we should use it instead.
                 NUtil::printf("[arch/x86_64/apic]: 64-bit LAPIC address override: %p.\n", lapicaddr);
             }
+
+            lapicphy = lapicaddr;
 
             // Memory map whatever address we're going to be using, or else it won't let us!
             uintptr_t virt = (uintptr_t)VMM::kspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW);

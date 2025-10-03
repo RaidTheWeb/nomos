@@ -12,6 +12,39 @@ namespace NDev {
             bool mmio;
         };
 
+        static constexpr uint8_t MSICTRLREG = 0x02;
+        static constexpr uint8_t MSIADDRLOREG = 0x04;
+        static constexpr uint8_t MSIADDRHIREG = 0x08;
+        static constexpr uint8_t MSIDATAREG = 0x08;
+        static constexpr uint8_t MSIMASKREG = 0x0c;
+        static constexpr uint8_t MSIPENDINGREG = 0x10;
+
+        static constexpr uint16_t MSICTRL64 = (1 << 7);
+        static constexpr uint16_t MSICTRLMASK = (1 << 8);
+        static constexpr uint16_t MSICTRLEN = (1 << 0);
+        static constexpr uint16_t MSIMMMASK = 0x0070;
+        static constexpr uint16_t MSIMMSHIFT = 4;
+
+        static constexpr uint8_t MSIXCTRLREG = 0x02;
+        static constexpr uint8_t MSIXTABLE = 0x04;
+        static constexpr uint8_t MSIXPBA = 0x08;
+
+        static constexpr uint16_t MSIXCTRLEN = (1 << 15);
+        static constexpr uint16_t MSIXCTRLFUNCMASK = (1 << 14);
+        static constexpr uint16_t MSIXTABLESIZEMASK = 0x07ff;
+
+        struct msixentry {
+            uint32_t addrlo;
+            uint32_t addrhi;
+            uint32_t data;
+            uint32_t vc; // Vector control.
+        } __attribute__((packed));
+
+        void maskvector(struct devinfo *dev, uint8_t idx);
+        void unmaskvector(struct devinfo *dev, uint8_t idx)
+;
+        int enablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors);
+
         uint32_t read(struct devinfo *dev, uint32_t off, int size);
         void write(struct devinfo *dev, uint32_t off, uint32_t val, int size);
         struct bar getbar(struct devinfo *dev, uint8_t idx);
