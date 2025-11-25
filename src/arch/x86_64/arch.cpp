@@ -173,6 +173,7 @@ namespace NArch {
         assert(*((uint8_t *)virtptr) == 0xab, "VMA allocator + VMM mapping self-test failed.\n");
         VMM::unmappage(&VMM::kspace, test);
         VMM::kspace.vmaspace->free(virtptr, 4096);
+        PMM::free(p, 4096);
 
         ACPI::setup(); // Initialise uACPI and load relevant tables.
 

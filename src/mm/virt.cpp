@@ -159,6 +159,7 @@ namespace NMem {
                 root->start = tmp->start;
                 root->end = tmp->end;
                 root->used = tmp->used;
+                root->flags = tmp->flags;
 
                 root->right = this->remove(root->right, tmp->start);
             }
@@ -177,6 +178,7 @@ namespace NMem {
             node->height = 1;
             node->left = NULL;
             node->right = NULL;
+            node->flags = 0;
             return node;
         }
 
@@ -246,7 +248,6 @@ namespace NMem {
                 this->dump();
             }
             assertarg(node, "OOM for VMA allocation of size %lu and %lu alignment.\n", size, NArch::PAGESIZE);
-
 
             struct vmanode *nodes[3];
             size_t count = 0;
@@ -334,6 +335,12 @@ namespace NMem {
 
         static void printnode(struct vmanode *node) {
             NUtil::printf("[%p->%p] %s\n", node->start, node->end, node->used ? "Used" : "Free");
+            // Print flags.
+            NUtil::printf(" Flags: %s%s%s\n",
+                (node->flags & NMem::Virt::VIRT_RW) ? "RW" : "RO",
+                (node->flags & NMem::Virt::VIRT_USER) ?"|USER" : "",
+                (node->flags & NMem::Virt::VIRT_NX) ? "|NX" : ""
+            );
         }
 
         void VMASpace::dump(void) {
@@ -369,14 +376,17 @@ namespace NMem {
             size_t count = 0;
 
             if (node->start < start) {
+                // If the node starts before our reserved region, we need to create a free node for that region.
                 nodes[count++] = this->newnode(node->start, start, false);
             }
 
+            // Create node for reserved region.
             nodes[count] = this->newnode(start, end, true);
             nodes[count]->flags = flags;
             count++;
 
             if (end < node->end) {
+                // If the node ends after our reserved region, we need to create a free node for that region.
                 nodes[count++] = this->newnode(end, node->end, false);
             }
 
@@ -395,7 +405,7 @@ namespace NMem {
             }
 
             uintptr_t start = NLib::aligndown((uintptr_t)ptr, NArch::PAGESIZE);
-            uintptr_t end = start + NLib::alignup(size, NArch::PAGESIZE);
+            uintptr_t end = NLib::alignup(start + size, NArch::PAGESIZE);
 
             struct vmanode *tofree = NULL;
             struct vmanode *current = this->root;

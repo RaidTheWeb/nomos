@@ -29,7 +29,7 @@ namespace NSched {
         node->packcolour(colour::RED);
 
         if (parent) {
-            if (!parent->getparent()) { // Get grandparent.
+            if (!parent->getparent()) {
                 this->rebalance(node);
             }
         } else {
@@ -451,7 +451,7 @@ namespace NSched {
             stolen->cid = target->id;
 
             NArch::CPU::writemb(); // Ensure writes are seen.
-            cpu->runqueue._insert(node, vruntimecmp);
+            target->runqueue._insert(node, vruntimecmp);
             quota--;
 
             node = prev;

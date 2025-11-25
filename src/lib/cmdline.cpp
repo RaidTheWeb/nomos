@@ -19,65 +19,92 @@ namespace NLib {
     }
 
     void CmdlineParser::setup(char *cmd) {
-        char workingbuf[1024];
+        if (!cmd) {
+            return;
+        }
+
+        char workingbuf[2048]; // XXX: Consider non-fixed size buffer?
         // Pad end with space for parsing.
         NUtil::snprintf(workingbuf, sizeof(workingbuf), "%s ", cmd);
         char *cmdline = &workingbuf[0];
-
 
         char namebuf[CmdlineParser::maxsize];
         NLib::memset(namebuf, 0, sizeof(namebuf));
         char valuebuf[CmdlineParser::maxsize];
         NLib::memset(valuebuf, 0, sizeof(valuebuf));
 
-        size_t writeidx = 0;
+        size_t nameidx = 0;
+        size_t valueidx = 0;
 
-        bool parsingtext = false;
-        while (*cmdline && writeidx < CmdlineParser::maxsize) {
-            switch (*cmdline) {
-                case '"': {
-                    if (parsingtext) {
-                        valuebuf[writeidx] = '\0';
-                        writeidx = 0;
-                        parsingtext = false;
-                        // String completed, set value.
-                        this->addpair(namebuf, valuebuf);
-                    } else {
+        enum {
+            NAME,
+            VALUE,
+            QUOTEDVALUE
+        };
+        int state = NAME;
 
-                        namebuf[writeidx] = '\0';
-                        // Start parsing text.
-                        writeidx = 0;
-                        parsingtext = true;
-                    }
-                    break;
-                }
-                case '=': {
-                    // Set value.
-                    break;
-                }
-                case ' ': {
-                    if (!parsingtext) {
-                        if (writeidx > 0) {// Only break off if it's at least one character.
-                            // This means that we break off the variable name, with no value set.
-                            NUtil::sprintf(valuebuf, "true");
-                            namebuf[writeidx] = '\0';
+        while (*cmdline) {
+            char c = *cmdline;
+
+            switch (state) {
+                case NAME: // Generic name parsing until we encounter value sets.
+                    if (c == ' ') {
+                        if (nameidx > 0) { // We have a name, but it's got no value. This is basically just a hecking "flag".
+                            namebuf[nameidx] = '\0';
+                            NUtil::snprintf(valuebuf, sizeof(valuebuf), "true");
                             this->addpair(namebuf, valuebuf);
-                            writeidx = 0; // Reset write index, so we can start on the next argument.
+                            nameidx = 0;
+                            NLib::memset(namebuf, 0, sizeof(namebuf));
                         }
-                        break; // In both cases, move on.
-                    }
-                    // Fall through on parsing text.
-                }
-                default:
-                    if (parsingtext) {
-                        // Add to value.
-                        valuebuf[writeidx++] = *cmdline;
+                        // Otherwise ignore extra spaces
+                    } else if (c == '=') {
+                        namebuf[nameidx] = '\0';
+                        valueidx = 0;
+                        NLib::memset(valuebuf, 0, sizeof(valuebuf));
+                        state = VALUE; // Expect a value after this.
                     } else {
-                        // Start parsing variable name.
-                        namebuf[writeidx++] = *cmdline;
+                        if (nameidx + 1 < sizeof(namebuf)) {
+                            namebuf[nameidx++] = c;
+                        }
+                    }
+                    break;
+
+                case VALUE: // Accepts until space.
+                    if (c == '"') {
+                        valueidx = 0;
+                        state = QUOTEDVALUE;
+                    } else if (c == ' ') {
+                        valuebuf[valueidx] = '\0';
+                        this->addpair(namebuf, valuebuf);
+                        nameidx = 0;
+                        valueidx = 0;
+                        NLib::memset(namebuf, 0, sizeof(namebuf));
+                        NLib::memset(valuebuf, 0, sizeof(valuebuf));
+                        state = NAME;
+                    } else {
+                        if (valueidx + 1 < sizeof(valuebuf)) {
+                            valuebuf[valueidx++] = c;
+                        }
+                    }
+                    break;
+
+                case QUOTEDVALUE: // Accepts spaces until closing quote.
+                    if (c == '"') {
+                        valuebuf[valueidx] = '\0';
+                        this->addpair(namebuf, valuebuf);
+                        nameidx = 0;
+                        valueidx = 0;
+                        NLib::memset(namebuf, 0, sizeof(namebuf));
+                        NLib::memset(valuebuf, 0, sizeof(valuebuf));
+                        state = NAME;
+                    } else {
+                        if (valueidx + 1 < sizeof(valuebuf)) {
+                            valuebuf[valueidx++] = c;
+                        }
                     }
                     break;
             }
+
             cmdline++;
         }
         return;

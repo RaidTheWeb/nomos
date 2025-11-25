@@ -71,6 +71,7 @@ namespace NDev {
 
     class DevDriver;
 
+    // "Device" as represented in a VFS->driver abstraction.
     class Device {
         public:
             DevDriver *driver = NULL;
@@ -85,6 +86,7 @@ namespace NDev {
             }
     };
 
+    // Registry that matches major-minor device IDs in st_rdev to Device instances.
     class DeviceRegistry {
         private:
             NLib::KVHashMap<uint64_t, Device *> map;
@@ -170,7 +172,7 @@ namespace NDev {
             virtual int stat(uint64_t dev, struct NFS::VFS::stat *st) {
                 (void)dev;
                 (void)st;
-                return -123123123; // Tell device node to default to node attributes.
+                return -123123123; // Tell device node to default to node attributes. (DEVFS::NOSTAT)
             }
 
             virtual void probe(struct devinfo info) {
@@ -245,6 +247,7 @@ namespace NDev {
     extern "C" struct regentry __drivers_start[];
     extern "C" struct regentry __drivers_end[];
 
+    // Call this function at the bottom of driver files to register them.
 #define REGDRIVER(driver, driverinfo) \
     extern "C" __attribute__((section(".drivers"), used)) struct NDev::regentry driver##_entry = { \
         .magic = MAGIC, \

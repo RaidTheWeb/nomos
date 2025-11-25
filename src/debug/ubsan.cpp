@@ -127,5 +127,10 @@ namespace NDebug {
         extern "C" void __ubsan_handle_builtin_unreachable(struct unreachable *info) {
             handleviolation("Unreachable reached", &info->loc);
         }
+
+        extern "C" void __ubsan_handle_vla_bound_not_positive(struct vlaboundnotpositive *info, uintptr_t bound) {
+            (void)bound;
+            handleviolation("VLA bound not positive", &info->loc);
+        }
     }
 }

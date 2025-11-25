@@ -164,12 +164,14 @@ namespace NArch {
             struct addrspace *dest;
         };
 
-        static inline uint64_t vmatovmm(uint64_t vma) {
+        static inline uint64_t vmatovmm(uint64_t vma, bool cow) {
             return 0 |
-                PRESENT | COW | // Mark as present, and using CoW.
+                PRESENT | // Mark as present.
                 (vma & NMem::Virt::VIRT_USER ? USER : 0) |
                 (vma & NMem::Virt::VIRT_NX ? NOEXEC : 0) |
-                (vma & NMem::Virt::VIRT_RW ? 0 : 0); // Omit write.
+                (cow ? COW : (
+                    vma & NMem::Virt::VIRT_RW ? WRITEABLE : 0 // Non-COW writeable.
+                ));
         }
 
         static void dupvmanode(struct NMem::Virt::vmanode *node, void *data) {
@@ -181,13 +183,22 @@ namespace NArch {
 
                 size_t size = node->end - node->start;
 
+                bool cowexempt = node->flags & NMem::Virt::VIRT_SHARED; // Is this mapped exempt from CoW?
+
                 for (size_t i = 0; i < size; i += PAGESIZE) {
 
                     uintptr_t phys = _virt2phys(work->src, node->start + i);
 
-                    // Remap to CoW for both source and destination (we want them to make their own distinct copies on write).
-                    _mappage(work->dest, node->start + i, phys, vmatovmm(node->flags));
-                    _mappage(work->src, node->start + i, phys, vmatovmm(node->flags));
+                    // Only map if the physical address is valid.
+                    if (phys == 0) {
+                        continue;
+                    }
+
+                    // Map page into destination address space.
+                    assertarg(_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, !cowexempt)), "Failed to destination map page %p during address space fork.\n", node->start + i);
+                    if (!cowexempt) { // Only bother remapping the source if we're doing CoW.
+                        assertarg(_mappage(work->src, node->start + i, phys, vmatovmm(node->flags, true)), "Failed to source remap page during %p address space fork.\n", node->start + i);
+                    }
                 }
             }
         }
@@ -223,7 +234,7 @@ namespace NArch {
                 }
 
                 if (!(entry & USER)) {
-                    dest->pml4->entries[i] = src->pml4->entries[i];
+                    dest->pml4->entries[i] = src->pml4->entries[i]; // Copy kernel mappings as-is.
                 }
             }
 

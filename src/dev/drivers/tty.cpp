@@ -511,6 +511,7 @@ namespace NDev {
             static const uint64_t CURVTDEVICEID = DEVFS::makedev(MAJOR, 0); // /dev/tty0 -> Points to currently active virtual terminal.
         public:
             TTYDriver(void) {
+                // "Abstract" devices are fake devices that represent the current TTY (/dev/tty) and current VT (/dev/tty0).
                 registry->add(new Device(CURVTDEVICEID, this)); // Register abstract.
                 registry->add(new Device(CURDEVICEID, this)); // Register abstract.
 
@@ -681,7 +682,7 @@ notspecial:
                     *st = tty->ifnode->getattr();
                     tty->ifnode->unref();
                 }
-                return -123123123; // Default to node fill of our stat.
+                return DEVFS::NOSTAT; // Default to node fill of our stat.
             }
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {

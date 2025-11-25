@@ -80,7 +80,7 @@ namespace NFS {
             }
 
             int ret = this->device->driver->stat(this->attr.st_dev, st);
-            if (ret == -123123123) { // XXX: Make constant. Specific error code so that the device node knows to retrieve its stat attributes instead of the driver.
+            if (ret == NOSTAT) { // XXX: Make constant. Specific error code so that the device node knows to retrieve its stat attributes instead of the driver.
                 *st = this->attr;
                 return 0;
             }

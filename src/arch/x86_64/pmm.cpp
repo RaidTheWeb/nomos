@@ -97,7 +97,7 @@ namespace NArch {
                         allocate = NLib::aligndown(allocate, PAGESIZE);
 
                         size_t pages = allocate / PAGESIZE;
-                        size_t bmapsize = (pages + 7) / 8;
+                        size_t bmapsize = (pages + 7) / 8; // Bitmap is represented with qwords, this is going to be rounded up to the nearest page.
                         size_t bmappages = NLib::alignup(bmapsize, PAGESIZE) / PAGESIZE;
 
                         if (bmappages * PAGESIZE + PAGESIZE > allocate) {
@@ -179,17 +179,21 @@ namespace NArch {
             // Sanity check:
             // If we allocate, and then immediately free, the next allocation of the same size should be the same pointer (free list logic).
             void *test1 = alloc(4096);
+            assert(test1 != NULL, "Failed to allocate small buddy allocation.\n");
             free(test1);
             void *test2 = alloc(4096);
+            assert(test2 != NULL, "Failed to allocate small buddy allocation.\n");
             free(test2);
             assertarg(test1 == test2, "Buddy allocator does not return last freed (%p != %p).\n", test1, test2);
 
             NUtil::printf("[arch/x86_64/pmm]: Buddy allocator self-test passed.\n");
 
             void *test3 = alloc(2 * 1024 * 1000);
+            assert(test3 != NULL, "Failed to allocate large bitmap allocation.\n");
             free(test3, 2 * 1024 * 1024);
 
             void *test4 = alloc(2 * 1024 * 1024);
+            assert(test4 != NULL, "Failed to allocate large bitmap allocation.\n");
             free(test4, 2 * 1024 * 1024);
             assertarg(test3 == test4, "Bitmap allocator does not return last freed (%p != %p).\n", test3, test4);
 
@@ -219,7 +223,7 @@ namespace NArch {
                 for (size_t i = 0; i < numbitmapzones; i++) {
                     if (phys >= bitmapzones[i].addr && phys < bitmapzones[i].addr + bitmapzones[i].size) { // We found our bitmap zone.
 
-                        return &zone.meta[(phys - bitmapzones[i].addr) / PAGESIZE];
+                        return &bitmapzones[i].meta[(phys - bitmapzones[i].addr) / PAGESIZE];
                     }
                 }
             }

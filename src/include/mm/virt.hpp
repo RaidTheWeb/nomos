@@ -15,7 +15,8 @@ namespace NMem {
             VIRT_USER       = (1 << 1), // Region is unprivileged.
             VIRT_NX         = (1 << 2), // Region is non-executable.
             VIRT_SWAPPED    = (1 << 3), // Region is swapped out to disk.
-            VIRT_DIRTY      = (1 << 4)  // Region has been modified (and is thus, dirty). Automatic.
+            VIRT_DIRTY      = (1 << 4), // Region has been modified (and is thus, dirty). Automatic.
+            VIRT_SHARED     = (1 << 5)  // Region is shared between processses (no CoW!).
         };
 
         // Address ordered AVL tree for managing the allocations of an address space.

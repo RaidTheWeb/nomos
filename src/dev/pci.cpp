@@ -23,7 +23,7 @@ namespace NDev {
 
         NLib::SingleList<struct mcfgrange> ranges;
 
-        bool usemcfg = false;
+        bool usemcfg = false; // Set to true if MCFG table is present. XXX: Does not currently support alternative means of discovery.
 
         void scanbus(uint8_t bus);
 
@@ -199,10 +199,10 @@ namespace NDev {
             if (dev->info.pci.msixsupport) {
                 uint32_t bir = read(dev, dev->info.pci.msixoff + MSIXTABLE, 4);
 
-                uint8_t idx = bir & 0x7;
+                uint8_t bar_idx = bir & 0x7;
                 uint32_t off = bir & ~0x7;
 
-                struct PCI::bar bar = getbar(dev, idx); // MSI-X info is contained within the specified BAR.
+                struct PCI::bar bar = getbar(dev, bar_idx); // MSI-X info is contained within the specified BAR.
 
                 struct msixentry *table = (struct msixentry *)(bar.base + off);
                 table[idx].vc |= (1 << 0); // Flip mask bit to mask.
@@ -229,10 +229,10 @@ namespace NDev {
             if (dev->info.pci.msixsupport) {
                 uint32_t bir = read(dev, dev->info.pci.msixoff + MSIXTABLE, 4);
 
-                uint8_t idx = bir & 0x7;
+                uint8_t table_idx = bir & 0x7;
                 uint32_t off = bir & ~0x7;
 
-                struct PCI::bar bar = getbar(dev, idx); // MSI-X info is contained within the specified BAR.
+                struct PCI::bar bar = getbar(dev, table_idx); // MSI-X info is contained within the specified BAR.
 
                 struct msixentry *table = (struct msixentry *)(bar.base + off);
                 table[idx].vc &= ~(1 << 0); // Flip mask bit to unmask.
@@ -515,10 +515,13 @@ namespace NDev {
                         switch (size) {
                             case 1:
                                 *(uint8_t *)virt = val;
+                                break;
                             case 2:
                                 *(uint16_t *)virt = val;
+                                break;
                             case 4:
                                 *(uint32_t *)virt = val;
+                                break;
                         }
 
                         return;

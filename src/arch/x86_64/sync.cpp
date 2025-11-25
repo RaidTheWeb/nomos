@@ -23,6 +23,7 @@ namespace NArch {
                     asm volatile("pause"); // Pause to avoid consuming crazy amounts of power during contention. Backoff is used to reduce contention.
                 }
 
+                // Exponential backoff to reduce contention.
                 backoff = (backoff << 1) | 1;
                 if (backoff > BACKOFFMAX) {
                     backoff = BACKOFFMAX;
@@ -51,7 +52,6 @@ namespace NArch {
     void IRQSpinlock::acquire(void) {
         this->state = CPU::get()->setint(false); // Disable interrupts. Stops preemption.
         this->lock->acquire(); // Raw acquire internal lock.
-                               //
     }
 
     void IRQSpinlock::release(void) {
@@ -120,7 +120,9 @@ namespace NArch {
         }
 
         // Release our lock state.
-        __atomic_store_n(&node->next->locked, 0, memory_order_release);
+        if (node->next) {
+            __atomic_store_n(&node->next->locked, 0, memory_order_release);
+        }
 release:
         mcsstate->depth--;
     }

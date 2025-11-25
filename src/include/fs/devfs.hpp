@@ -12,6 +12,7 @@ namespace NFS {
         static const uint64_t MAJORLO = 0x000000000000ff00;
         static const uint64_t MINORHI = 0x00000000ffff0000;
         static const uint64_t MINORLO = 0x00000000000000ff;
+        static const int64_t NOSTAT = -123123123; // Specific error code to indicate that the driver could not provide stat info, so the device node should use its own.
 
         // Pack 32-bit major and minor device ids into 64-bit device number.
         static constexpr uint64_t makedev(uint32_t major, uint32_t minor) {

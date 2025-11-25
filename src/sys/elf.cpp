@@ -85,8 +85,8 @@ namespace NSys {
 
             for (size_t i = 0; i < argc; i++) {
                 size_t len = NLib::strlen(argv[i]) + 1;
-                stackptr += len;
                 NLib::memcpy((void *)stackptr, argv[i], len); // Copy argv element into stack.
+                stackptr += len;
                 uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                 ((uint64_t *)argvptrs)[i] = calc; // Point the associated argv pointer to the stack location of the element.
             }
@@ -95,8 +95,9 @@ namespace NSys {
             if (envp) {
                 for (size_t i = 0; i < envc; i++) {
                     size_t len = NLib::strlen(envp[i]) + 1;
-                    stackptr += len;
                     NLib::memcpy((void *)stackptr, envp[i], len); // Copy envp element into stack.
+
+                    stackptr += len;
                     uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                     ((uint64_t *)envpptrs)[i] = calc; // Point the associated envp pointer to the stack location of the element.
                 }
@@ -111,7 +112,7 @@ namespace NSys {
         }
 
         bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry) {
-            struct pheader *phdrs = new struct pheader[hdr->phsize];
+            struct pheader *phdrs = new struct pheader[hdr->phcount];
             if (!phdrs) {
                 return false;
             }
@@ -152,7 +153,7 @@ namespace NSys {
                     )) {
                         // Failed. Free everything we've currently acquired.
                         delete[] phdrs;
-                        NArch::PMM::free(phys, phdrs[i].msize);
+                        NArch::PMM::free(phys, phdrs[i].msize + misalign);
                         return false;
                     }
 
@@ -160,7 +161,7 @@ namespace NSys {
                         // Failed. Free everything we've currently acquired.
                         NArch::VMM::unmaprange(space, phdrs[i].vaddr, phdrs[i].msize); // Unmap range in space.
                         delete[] phdrs;
-                        NArch::PMM::free(phys, phdrs[i].msize);
+                        NArch::PMM::free(phys, phdrs[i].msize + misalign);
                         return false;
                     }
 

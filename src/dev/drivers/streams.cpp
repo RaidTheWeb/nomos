@@ -73,7 +73,7 @@ namespace NDev {
                 uint64_t minor = DEVFS::minor(dev);
 
                 if (minor == FULLMINOR) {
-                    return -ENOSPC; // /dev/full should return ENOSPC error on write.
+                    return -ENOSPC; // /dev/full should return ENOSPC error on write. Because it's "full".
                 }
 
                 // None of these stream devices are "writable", but will tell the user that everything went well, regardless.

@@ -11,7 +11,7 @@
 namespace NArch {
     namespace APIC {
         IoApic *ioapics = NULL;
-        static size_t numioapic;
+        size_t numioapic;
         uintptr_t lapicaddr = 0;
         uintptr_t lapicphy = 0;
 
@@ -179,7 +179,7 @@ namespace NArch {
                     }
 
                     // Allocated Vector | NMI Delivery Mode | Flags (polarity and trigger mode).
-                    writelapic(reg, (isr->id & 0xff) | (0b100 << 8) | entry->flags << 12);
+                    writelapic(reg, (isr->id & 0xff) | (0b100 << 8) | (entry->flags << 12));
                 }
 
                 entry = (struct acpi_madt_lapic_nmi *)ACPI::getentry(&ACPI::madt, ACPI_MADT_ENTRY_TYPE_LAPIC_NMI, ++i);

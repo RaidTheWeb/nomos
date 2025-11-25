@@ -134,6 +134,7 @@ namespace NArch {
                         *pte = newpte;
                         space->lock.release();
 
+                        // XXX: Free pages with no more references from any thread.
                         NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
                         return;
                     }

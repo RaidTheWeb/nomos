@@ -184,21 +184,20 @@ namespace NMem {
         struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)((uintptr_t)ptr - sizeof(struct SubAllocator::metadata));
         size_t old = meta->size; // Find old size, so we can figure out how much to copy.
 
-        if (getslabidx(newsize) == getslabidx(old)) {
-            return ptr;
-        }
-
         void *newptr = this->alloc(newsize);
         if (newptr == NULL) {
+            this->free(ptr);
             return NULL;
         }
+
+        size_t aligned = (((newsize + sizeof(struct SubAllocator::metadata)) + (16 - 1)) & ~(16 - 1));
 
         // Pick if we should be copying all the data from the old one, or up until the new size.
         size_t copysize = old < newsize ? old : newsize;
         NLib::memcpy(newptr, ptr, copysize); // Copy across the old data.
 
         // Free old pointer.
-        free(ptr);
+        this->free(ptr);
         return newptr;
     }
 }

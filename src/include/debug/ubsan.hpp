@@ -67,6 +67,10 @@ namespace NDebug {
         struct unreachable {
             struct sourceloc loc;
         };
+
+        struct vlaboundnotpositive {
+            struct sourceloc loc;
+        };
     }
 }
 
