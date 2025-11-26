@@ -5,20 +5,29 @@
 
 namespace NSched {
     void WaitQueue::wait(void) {
+        this->waitinglock.acquire(); // We MUST acquire the lock before setting the thread to waiting, otherwise we'll never be rescheduled when the timeslice expires.
+        NArch::CPU::get()->setint(false); // Disable interrupts to prevent preemption during this critical section.
         __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
 
-        this->waitinglock.acquire();
         this->waiting.pushback(NArch::CPU::get()->currthread);
         this->waitinglock.release();
+        NArch::CPU::get()->setint(true); // Re-enable interrupts.
         yield();
     }
 
     void WaitQueue::wake(void) {
+        NLib::SingleList<Thread *> towake;
         this->waitinglock.acquire();
-        if (!this->waiting.empty()) {
+        while (!this->waiting.empty()) {
             Thread *thread = this->waiting.pop();
-            schedulethread(thread); // Reschedule waiting thread. XXX: Consider dumping it back into the CPU that it first yielded on, for cache reasons.
+            towake.push(thread);
         }
         this->waitinglock.release();
+
+        // Schedule all threads that were waiting.
+        for (NLib::SingleList<Thread *>::Iterator it = towake.begin(); it.valid(); it.next()) {
+            Thread *thread = *(it.get());
+            schedulethread(thread);
+        }
     }
 }

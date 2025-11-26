@@ -14,7 +14,7 @@ namespace NSched {
         public:
             // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn.
             void wait(void);
-            // Wake up the first thread in line to continue operation.
+            // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
             void wake(void);
     };
 
@@ -22,7 +22,7 @@ namespace NSched {
 #define waitevent(wq, condition) { \
         if (!(condition)) { \
             for (;;) { \
-                wq->wait(); \
+                (wq)->wait(); \
                 if ((condition)) { \
                     break; \
                 } \

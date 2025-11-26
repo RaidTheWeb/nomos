@@ -8,6 +8,7 @@
 #include <dev/pci.hpp>
 
 #include <lib/align.hpp>
+#include <sched/event.hpp>
 
 namespace NDev {
     using namespace NFS;
@@ -26,9 +27,9 @@ namespace NDev {
     static constexpr uint16_t REGCMBSIZE = 0x003c;
 
     // Tail doorbell of submission queue.
-    #define SUBQUEUEDB(ID, STRIDE) (0x1000 + (2 * (ID)) * (STRIDE))
+    #define SUBQUEUEDB(ID, STRIDE) (0x1000 + (2 * (ID)) * (4 << (STRIDE)))
     // Head doorbell of completion queue.
-    #define COMPQUEUEDB(ID, STRIDE) (0x1000 + (2 * (ID) + 1) * (STRIDE))
+    #define COMPQUEUEDB(ID, STRIDE) (0x1000 + (2 * (ID) + 1) * (4 << (STRIDE)))
 
     struct nvmecaps {
         uint64_t mqes   : 16;
@@ -36,6 +37,7 @@ namespace NDev {
         uint64_t ams    : 2;    // Arbitration mechanism is supported.
         uint64_t rsvd0  : 5;
         uint64_t to     : 8;    // Timeout.
+
         uint64_t stride : 4;    // Stride used when calculating doorbell offsets.
         uint64_t nssrs  : 1;    // Subsystem reset supported.
         uint64_t css    : 8;    // Command sets are supported.
@@ -84,7 +86,8 @@ namespace NDev {
     static constexpr uint8_t ADMINCREATECQ = 0x05;
     static constexpr uint8_t ADMINIDENTIFY = 0x06;
 
-
+    static constexpr uint8_t IOWRITE = 0x01;
+    static constexpr uint8_t IOREAD = 0x02;
 
     struct nvmesqe { // Submission queue entry.
         uint8_t op;             // Opcode.
@@ -136,9 +139,9 @@ namespace NDev {
     struct nvmeid { // Controller identification command result.
         uint16_t vendor;            // Vendor.
         uint16_t ssvendor;          // Subsystem vendor.
-        char serialnumber[20];      // Serial number.
-        char modelnumber[40];       // Model number.
-        char fwrev[8];              // Firmware revision.
+        uint8_t serialnumber[20];   // Serial number (ASCII, not NUL-terminated).
+        uint8_t modelnumber[40];    // Model number (ASCII, not NUL-terminated).
+        uint8_t fwrev[8];           // Firmware revision (ASCII, not NUL-terminated).
         uint8_t rab;                // Recommended arbitration burst.
         uint8_t ieee[3];            // IEEE OUI identifier.
         uint8_t cmic;               // CMI and NSS caps.
@@ -166,8 +169,8 @@ namespace NDev {
         uint16_t mtfa;              // Maximum time for firmware to activate.
         uint32_t hmpsize;           // Preferred size to be used for host buffer.
         uint32_t hmmsize;           // Minimum size to be used for host buffer.
-        uint8_t tnvmcap[16];        // Total NVM capacity.
-        uint8_t unvmcap[16];        // Unallocated NVM capacity.
+        uint64_t tnvmcap[2];        // Total NVM capacity (128-bit; two 64-bit values).
+        uint64_t unvmcap[2];        // Unallocated NVM capacity (128-bit).
         uint32_t rpmbs;             // RPMB support.
         uint16_t edstt;             // Extended device self-test time.
         uint8_t dsto;               // Self-test options.
@@ -200,7 +203,7 @@ namespace NDev {
     } __attribute__((packed));
 
     struct nvmensid { // Namespace identification command result.
-        uint64_t nssize;            // Namespace size.
+        uint64_t nssize;            // Namespace LBA size.
         uint64_t nscap;             // Namespace capacity.
         uint64_t nsutilisation;     // Namespace utilisation.
         uint8_t nsfeatures;         // Namespace features.
@@ -244,17 +247,20 @@ namespace NDev {
 
     struct nvmequeue {
         uint32_t head;
-uint32_t tail;
+        uint32_t tail;
         uint32_t size;
         uint32_t id;
         uint16_t cqvec;
         uint8_t phase;
         void *entries;
         uintptr_t dmaaddr;
+
+        uint16_t nextcid; // Next command ID for this queue. Only use for submission queues.
     };
 
     struct nvmens {
-        uint32_t nsid;
+        uint32_t nsid; // Namespace ID (Given by the controller).
+        uint32_t nsnum; // Namespace number (0-based index).
         struct nvmensid *id;
         uint64_t capacity;
         uint32_t blksize;
@@ -264,12 +270,21 @@ uint32_t tail;
     };
 
     static constexpr size_t MAXQUEUES = 64;
+    static constexpr size_t MAXCTRL = 16;
     static constexpr size_t MAXNS = 256;
     static constexpr size_t PAGESIZE = 4096;
     static constexpr size_t QUEUESIZE = 1024;
 
     struct nvmeprplist {
         uint64_t entries[PAGESIZE / sizeof(uint64_t)];
+    };
+
+    // Struct for pending operations.
+    struct nvmepending {
+        NSched::WaitQueue wq; // Wait queue for this pending operation.
+        bool done; // Is the operation done? Atomic.
+        int status;
+        uint8_t inuse; // Are we using this slot? Atomic.
     };
 
     struct nvmectrl {
@@ -287,11 +302,17 @@ uint32_t tail;
         struct nvmeid *id; // Reference to an identification struct for immediate access.
 
         struct nvmens namespaces[MAXNS];
+        uint8_t qvecs[MAXNS + 1]; // Vectors used for each namespace's I/O completion queue.
         uint32_t nscount;
         uint32_t activenscount;
 
+        struct devinfo info;
+
         bool initialised;
-        uint16_t nextcid; // Constant controller-wide command ID.
+
+        struct nvmepending pending[MAXQUEUES * QUEUESIZE];
+
+        // XXX: Per-controller locks.
     };
 
     static inline uint64_t read64(struct PCI::bar *bar, uint64_t reg) {
@@ -326,35 +347,60 @@ uint32_t tail;
         *((volatile uint8_t *)(bar->base + reg)) = val;
     }
 
-    // Allocate memory, guaranteeing alignment.
-    static void *dmaalloc(size_t size) { // XXX: Can't ever return zero for NULL check.
-        void *ptr = NArch::PMM::alloc(size + PAGESIZE);
-        if (!ptr) {
-            return NULL;
-        }
-
-        uintptr_t addr = (uintptr_t)NArch::hhdmoff(ptr);
-        uintptr_t aligned = NLib::alignup(addr, PAGESIZE);
-        return (void *)aligned;
+    // Allocate DMA-capable memory.
+    static void *dmaalloc(size_t size) {
+        return NArch::hhdmoff(NArch::PMM::alloc(size));
     }
 
-    // Free aligned memory.
+    // Free DMA-capable memory.
     static void dmafree(void *ptr, size_t size) {
-        if (!ptr) {
-            return;
-        }
-
-        uintptr_t addr = (uintptr_t)ptr;
-        uintptr_t original = NLib::aligndown(addr, PAGESIZE);
-        NArch::PMM::free(NArch::hhdmsub((void *)original), size + PAGESIZE);
+        NArch::PMM::free(NArch::hhdmsub(ptr), size);
     }
+
+    class NVMEDriver;
+
+    static NVMEDriver *instance;
 
     class NVMEDriver : public DevDriver {
         private:
+            struct nvmectrl controllers[MAXCTRL];
+            size_t ctrlcount = 0;
         public:
             NVMEDriver(void) {
+                instance = this;
             }
 
+            ~NVMEDriver() {
+                for (size_t i = 0; i < this->ctrlcount; i++) {
+                    struct nvmectrl *ctrl = &this->controllers[i];
+
+                    if (ctrl->initialised) {
+                        // Disable controller.
+                        ctrl->cc.en = 0;
+                        write32(&ctrl->pcibar, REGCC, *((uint32_t *)&ctrl->cc));
+
+                        // Free admin queues.
+                        dmafree(ctrl->asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
+                        dmafree(ctrl->acq.entries, QUEUESIZE * sizeof(struct nvmecqe));
+
+                        // Free I/O queues.
+                        for (size_t q = 0; q < MAXQUEUES; q++) {
+                            if (ctrl->iosq[q].entries) {
+                                dmafree(ctrl->iosq[q].entries, ctrl->iosq[q].size * sizeof(struct nvmesqe));
+                            }
+                            if (ctrl->iocq[q].entries) {
+                                dmafree(ctrl->iocq[q].entries, ctrl->iocq[q].size * sizeof(struct nvmecqe));
+                            }
+                        }
+
+                        // Free identification structure.
+                        dmafree(ctrl->id, PAGESIZE);
+                    }
+                    PCI::unmapbar(ctrl->pcibar);
+                }
+            }
+
+            // Create a queue (submission or completion).
             int createqueue(struct nvmequeue *queue, uint32_t size, uint32_t id, uint16_t cqvec, bool iscq) {
                 queue->size = size;
                 queue->id = id;
@@ -362,6 +408,7 @@ uint32_t tail;
                 queue->head = 0;
                 queue->tail = 0;
                 queue->phase = 1;
+                queue->nextcid = 0;
 
                 size_t entsize = size * (iscq ? sizeof(struct nvmecqe) : sizeof(struct nvmesqe));
                 queue->entries = dmaalloc(entsize);
@@ -375,6 +422,7 @@ uint32_t tail;
                 return 0;
             }
 
+            // Submit commands to the admin queue (in the form of submission queue entries).
             int submitadmin(struct nvmectrl *ctrl, struct nvmesqe *cmd) {
                 uint16_t tail = ctrl->asq.tail;
                 struct nvmesqe *next = &((struct nvmesqe *)ctrl->asq.entries)[tail];
@@ -393,6 +441,7 @@ uint32_t tail;
                 return 0;
             }
 
+            // Create an I/O submission queue.
             int createiosqueue(struct nvmectrl *ctrl, uint16_t id, uint32_t size, uint8_t prio) {
                 struct nvmesqe ciocmd = { };
                 NLib::memset(&ciocmd, 0, sizeof(struct nvmesqe));
@@ -408,13 +457,14 @@ uint32_t tail;
                 ciocmd.cdw11 = (id << 16) | (prio << 1) | (1 << 1) | (1 << 0); // Use priority and include CQID.
                 submitadmin(ctrl, &ciocmd);
 
-                struct nvmecqe *cqe = NULL;
-                while ((cqe = waitadmin(ctrl)) == NULL) { // Blocking wait upon command completion.
-                    asm volatile ("pause");
+                if (waitadmin(ctrl) != 0) {
+                    dmafree(ctrl->iosq[id].entries, size * sizeof(struct nvmesqe));
+                    return -1;
                 }
                 return 0;
             }
 
+            // Create an I/O completion queue.
             int createiocqueue(struct nvmectrl *ctrl, uint16_t id, uint32_t size, uint16_t vec) {
                 struct nvmesqe ciocmd = { };
                 NLib::memset(&ciocmd, 0, sizeof(struct nvmesqe));
@@ -426,18 +476,19 @@ uint32_t tail;
                 ciocmd.op = ADMINCREATECQ; // Create I/O command queue.
                 ciocmd.prp1 = ctrl->iocq[id].dmaaddr; // Pass the DMA to the command.
 
-                ciocmd.cdw10 = (size - 1) << 16 | id;
+                ciocmd.cdw10 = (id & 0xffff) | (size - 1) << 16;
                 ciocmd.cdw11 = (vec << 16) | (1 << 1) | (1 << 0); // Bit 0 (use interrupts), Bit 1 (DMA is contiguous).
 
                 submitadmin(ctrl, &ciocmd);
 
-                struct nvmecqe *cqe = NULL;
-                while ((cqe = waitadmin(ctrl)) == NULL) { // Blocking wait upon command completion.
-                    asm volatile ("pause");
+                if (waitadmin(ctrl) != 0) {
+                    dmafree(ctrl->iocq[id].entries, size * sizeof(struct nvmecqe));
+                    return -1;
                 }
                 return 0;
             }
 
+            // Create a PRP list for a buffer larger than two pages.
             uintptr_t createprplist(void *buffer, size_t size) {
                 uintptr_t start = (uintptr_t)buffer;
                 uintptr_t end = start + size;
@@ -450,35 +501,40 @@ uint32_t tail;
                     return 0;
                 }
 
-                size_t numlistpages = (numpages - 2 + (PAGESIZE / sizeof(uint64_t)) - 1) / (PAGESIZE / sizeof(uint64_t));
+                const size_t entries_per_page = PAGESIZE / sizeof(uint64_t);
+                size_t numlistpages = (numpages - 2 + entries_per_page - 1) / entries_per_page;
 
-                struct nvmeprplist *lists = (struct nvmeprplist *)NArch::PMM::alloc(numlistpages * PAGESIZE);
-
-                if (!lists) {
+                uintptr_t listsphys = (uintptr_t)NArch::PMM::alloc(numlistpages * PAGESIZE);
+                if (!listsphys) {
                     return 0;
                 }
 
+                // Zero the list pages in the kernel virtual map before filling.
+                struct nvmeprplist *base = (struct nvmeprplist *)NArch::hhdmoff((void *)listsphys);
+                NLib::memset(base, 0, numlistpages * PAGESIZE);
+
                 size_t currentidx = 0;
-                struct nvmeprplist *curr = (struct nvmeprplist *)NArch::hhdmoff(lists); // Reference our list through an HHDM offset.
+                struct nvmeprplist *curr = base; // Virtual pointer to current list page.
 
                 for (size_t i = 2; i < numpages; i++) {
                     uintptr_t virt = firstpage + (i * PAGESIZE);
                     uintptr_t phys = NArch::VMM::virt2phys(&NArch::VMM::kspace, virt);
 
-                    curr->entries[currentidx] = phys;
-                    currentidx++;
+                    curr->entries[currentidx++] = phys;
 
-                    if (currentidx >= (PAGESIZE / sizeof(uint64_t))) {
+                    if (currentidx >= entries_per_page) {
                         currentidx = 0;
-                        currentidx++;
+                        // Advance to next list page (virtual address space).
+                        curr = (struct nvmeprplist *)((uintptr_t)curr + PAGESIZE);
                     }
                 }
 
-                return (uintptr_t)lists;
+                return listsphys;
             }
 
+            // Prepare PRPs for a command.
             int setupprps(struct nvmesqe *cmd, void *buffer, size_t size) {
-                if (size == 0) {
+                if (size == 0) { // My bad king, I had no idea it was like that.
                     cmd->prp1 = 0;
                     cmd->prp2 = 0;
                     return -1;
@@ -486,38 +542,75 @@ uint32_t tail;
 
                 uint64_t bufferphys = NArch::VMM::virt2phys(&NArch::VMM::kspace, (uintptr_t)buffer);
 
-                if (size <= PAGESIZE) {
+                if (size <= PAGESIZE) { // Fits within first PRP.
                     cmd->prp1 = bufferphys;
                     cmd->prp2 = 0;
-                } else if (size <= (2 * PAGESIZE)) {
+                } else if (size <= (2 * PAGESIZE)) { // Fits within two PRPs.
                     cmd->prp1 = bufferphys;
                     cmd->prp2 = bufferphys + PAGESIZE;
-                } else {
-                    cmd->prp1 = bufferphys;
+                } else { // Needs a PRP list.
+                    cmd->prp1 = bufferphys; // First PRP is direct.
 
                     uintptr_t listphys = createprplist(buffer, size);
                     if (!listphys) {
                         return -1;
                     }
 
-                    cmd->prp2 = listphys;
+                    cmd->prp2 = listphys; // Subsequent PRPs are in the list.
                 }
 
                 return 0;
             }
 
+            // Prepare a pending operation slot.
+            static int preparewait(struct nvmectrl *ctrl, uint16_t qid, uint16_t cid, struct nvmepending **outpending) {
+                size_t idx = qid * QUEUESIZE + (cid % QUEUESIZE);
+                struct nvmepending *pending = &ctrl->pending[idx];
+
+                bool expected = false;
+                bool desired = true;
+                if (!__atomic_compare_exchange_n(&pending->inuse, &expected, desired, false, memory_order_acq_rel, memory_order_acquire)) {
+                    return -1; // Slot is already in use.
+                }
+
+                __atomic_store_n(&pending->done, false, memory_order_relaxed);
+                __atomic_thread_fence(memory_order_release);
+                pending->status = 0;
+
+                *outpending = pending;
+                return 0;
+            }
+
             int iorequest(struct nvmectrl *ctrl, uint16_t id, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size) {
+                struct nvmequeue *sq = &ctrl->iosq[id];
+                struct nvmequeue *cq = &ctrl->iocq[id];
 
-                uint16_t tail = ctrl->iosq[id].tail;
-                struct nvmesqe *next = &((struct nvmesqe *)ctrl->iosq[id].entries)[tail];
+                uint16_t cid = sq->nextcid++;
 
+                struct nvmepending *pending;
+                if (preparewait(ctrl, id, cid, &pending) != 0) {
+                    return -1;
+                }
+
+                uint32_t tail = sq->tail;
+                uint32_t nexttail = (tail + 1) % sq->size;
+
+                // Simple full-queue check
+                if (nexttail == sq->head) {
+                    return -1; // queue full
+                }
+
+                struct nvmesqe *next = &((struct nvmesqe *)sq->entries)[tail];
                 NLib::memset(next, 0, sizeof(struct nvmesqe));
 
                 next->op = opcode;
                 next->nsid = nsid;
+                next->cid = cid;
+                next->psdt = 0;
+                next->fuse = 0;
 
-                next->cdw10 = lba & 0xffffffff;
-                next->cdw11 = (lba >> 32) & 0xffffffff;
+                next->cdw10 = (uint32_t)(lba & 0xffffffff);
+                next->cdw11 = (uint32_t)((lba >> 32) & 0xffffffff);
                 next->cdw12 = (sectors - 1) & 0xffff;
                 next->cdw12 |= (0 << 14) | (0 << 15); // FUA and limited retry.
 
@@ -525,50 +618,217 @@ uint32_t tail;
                     return -1;
                 }
 
+            #ifdef __x86_64__
                 asm volatile ("sfence" : : : "memory");
-                tail = (tail + 1) % QUEUESIZE;
-                ctrl->iosq[id].tail = tail;
-                write32(&ctrl->pcibar, SUBQUEUEDB(id, ctrl->caps.stride), tail);
+            #endif
+
+                sq->tail = nexttail;
+                write32(&ctrl->pcibar, SUBQUEUEDB(id, ctrl->caps.stride), sq->tail);
+
+                // Wait for completion on CQ (extracted to helper for IRQ transition)
+                if (waitirq(pending) != 0) {
+                    return -1;
+                }
+
                 return 0;
             }
 
-            struct nvmecqe *waitadmin(struct nvmectrl *ctrl) {
-                volatile struct nvmecqe *cqe = &((struct nvmecqe *)ctrl->acq.entries)[ctrl->acq.head];
+            // Waits for completion of an admin command.
+            int waitadmin(struct nvmectrl *ctrl) {
+                for (;;) {
+                    volatile struct nvmecqe *cqe = &((struct nvmecqe *)ctrl->acq.entries)[ctrl->acq.head];
 
-                uint16_t phase = cqe->p;
+                    uint16_t phase = cqe->p;
 
-                if (phase != ctrl->acq.phase) { // Literally nothing yet.
-                    return NULL;
+                    if (phase != ctrl->acq.phase) {
+                        asm volatile ("pause");
+                        continue;
+                    }
+
+                    struct nvmecqe *res = (struct nvmecqe *)cqe;
+
+                    uint16_t status = res->sc;
+                    if (status != 0) {
+                        // consume CQE and report error
+                        ctrl->acq.head++;
+                        if (ctrl->acq.head >= ctrl->acq.size) {
+                            ctrl->acq.head = 0;
+                            ctrl->acq.phase = !ctrl->acq.phase; // Flip phase whenever we wrap around.
+                        }
+
+                        write32(&ctrl->pcibar, COMPQUEUEDB(0, ctrl->caps.stride), ctrl->acq.head); // Write to doorbell.
+                        return -1;
+                    }
+
+                    // consume successful CQE
+                    ctrl->acq.head++;
+                    if (ctrl->acq.head >= ctrl->acq.size) {
+                        ctrl->acq.head = 0;
+                        ctrl->acq.phase = !ctrl->acq.phase;
+                    }
+
+                    write32(&ctrl->pcibar, COMPQUEUEDB(0, ctrl->caps.stride), ctrl->acq.head); // Write to doorbell.
+
+                    return 0;
                 }
-
-                struct nvmecqe *res = (struct nvmecqe *)cqe;
-
-                uint16_t status = res->sc;
-                if (status != 0) {
-                    NUtil::printf("Got status %x.\n", status);
-                    // Error.
-                    return NULL;
-                }
-
-                ctrl->acq.head++;
-                if (ctrl->acq.head >= QUEUESIZE) {
-                    ctrl->acq.head = 0;
-                    ctrl->acq.phase = !ctrl->acq.phase; // Flip phase whenever we wrap around.
-                }
-
-                write32(&ctrl->pcibar, COMPQUEUEDB(0, ctrl->caps.stride), ctrl->acq.head); // Write to doorbell.
-
-                return res;
             }
 
-            void initnamespace(struct nvmectrl *ctrl, struct nvmens *ns, uint32_t id) {
-                NUtil::printf("Hello, it's me: NVMe namespace initialisation.\n");
-
-
+            // Sleep calling thread until command is complete (used for I/O commands).
+            static int waitirq(struct nvmepending *pending) {
+                waitevent(&pending->wq, __atomic_load_n(&pending->done, memory_order_acquire) == true);
+                int status = pending->status;
+                __atomic_store_n(&pending->inuse, false, memory_order_release); // After this, we can no longer guarantee the pending struct is valid.
+                return status ? -1 : 0; // Non-zero status indicates error.
             }
 
-            static void adminqueue(struct NArch::Interrupts::isr *isr, struct NArch::CPU::context *ctx) {
-                NUtil::printf("Hello!.\n");
+            // Waits for completion of an I/O command.
+            static int waitio(struct nvmectrl *ctrl, struct nvmequeue *cq, uint16_t id) {
+                for (;;) {
+                    volatile struct nvmecqe *cqe = &((struct nvmecqe *)cq->entries)[cq->head];
+                    uint16_t phase = cqe->p;
+
+                    if (phase != cq->phase) {
+                        asm volatile ("pause");
+                        continue;
+                    }
+
+                    // Ensure we see the other fields after seeing the phase bit
+                    asm volatile ("" : : : "memory");
+
+                    uint16_t status = cqe->sc;
+                    if (status != 0) {
+                        // consume CQE and report error
+                        cq->head++;
+                        if (cq->head >= cq->size) {
+                            cq->head = 0;
+                            cq->phase = !cq->phase;
+                        }
+                        write32(&ctrl->pcibar, COMPQUEUEDB(id, ctrl->caps.stride), cq->head);
+                        return -1;
+                    }
+
+                    break;
+                }
+
+                // consume successful CQE
+                cq->head++;
+                if (cq->head >= cq->size) {
+                    cq->head = 0;
+                    cq->phase = !cq->phase;
+                }
+
+                write32(&ctrl->pcibar, COMPQUEUEDB(id, ctrl->caps.stride), cq->head);
+                return 0;
+            }
+
+            static void ioqueue(struct NArch::Interrupts::isr *isr, struct NArch::CPU::context *ctx) {
+                NUtil::printf("NVMe interrupt received!\n");
+                uint8_t vec = (uint8_t)(isr->id & 0xff);
+
+                // Find which controller this interrupt belongs to.
+                for (size_t i = 0; i < instance->ctrlcount; i++) {
+                    struct nvmectrl *ctrl = &instance->controllers[i];
+                    for (size_t j = 0; j < ctrl->nscount; j++) {
+                        struct nvmens *ns = &ctrl->namespaces[j];
+                        if (ctrl->qvecs[ns->nsnum + 1] == vec) {
+                            NUtil::printf("Interrupt belongs to controller %u, namespace %u.\n", i, ns->nsid);
+
+                            while (true) {
+                                volatile struct nvmecqe *cqe = &((struct nvmecqe *)ctrl->iocq[ns->nsnum + 1].entries)[ctrl->iocq[ns->nsnum + 1].head];
+                                uint16_t phase = cqe->p;
+
+                                if (phase != ctrl->iocq[ns->nsnum + 1].phase) {
+                                    break; // No more completions.
+                                }
+
+                                // Ensure we see the other fields after seeing the phase bit
+                                asm volatile ("" : : : "memory");
+
+                                uint16_t cid = cqe->cid;
+                                struct nvmepending *pending = &ctrl->pending[(ns->nsnum + 1) * QUEUESIZE + (cid % QUEUESIZE)];
+                                pending->status = cqe->sc;
+                                __atomic_store_n(&pending->done, true, memory_order_release);
+                                pending->wq.wake();
+
+                                // Consume!
+                                ctrl->iocq[ns->nsnum + 1].head++;
+                                if (ctrl->iocq[ns->nsnum + 1].head >= ctrl->iocq[ns->nsnum + 1].size) {
+                                    ctrl->iocq[ns->nsnum + 1].head = 0;
+                                    ctrl->iocq[ns->nsnum + 1].phase = !ctrl->iocq[ns->nsnum + 1].phase;
+                                }
+
+                                write32(&ctrl->pcibar, COMPQUEUEDB(ns->nsnum + 1, ctrl->caps.stride), ctrl->iocq[ns->nsnum + 1].head);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Initialise an NVMe namespace.
+            void initnamespace(struct nvmectrl *ctrl, struct nvmens *ns) {
+                ns->id = (struct nvmensid *)dmaalloc(sizeof(struct nvmensid));
+                if (!ns->id) {
+                    NUtil::printf("[dev/nvme]: Failed to initialise namespace, could not allocate PRP for Identify command.\n");
+                    return;
+                }
+
+                struct nvmesqe idcmd = { };
+                NLib::memset(&idcmd, 0, sizeof(struct nvmesqe));
+
+
+                idcmd.nsid = ns->nsid;
+                idcmd.op = ADMINIDENTIFY;
+
+                idcmd.fuse = 0;
+                idcmd.psdt = 0;
+                idcmd.cid = ctrl->asq.nextcid++;
+
+                idcmd.prp1 = NArch::VMM::virt2phys(&NArch::VMM::kspace, (uintptr_t)ns->id);
+                idcmd.cdw10 = 0x00; // Identify namespace.
+
+                submitadmin(ctrl, &idcmd);
+
+                if (waitadmin(ctrl) != 0) {
+                    NUtil::printf("[dev/nvme]: Admin identify namespace failed for ns %u\n", ns->nsid);
+                    dmafree(ns->id, sizeof(struct nvmensid));
+                    return;
+                }
+
+                int fmt = ns->id->flbasize & 0xf;
+                ns->blksize = 1 << ns->id->lbaf[fmt].lbadatasize;
+                ns->capacity = ns->id->nscap;
+
+                NArch::CPU::get()->currthread->disablemigrate();
+
+                // Register the interrupt onto the allocated vector for this queue's MSI/MSI-X IRQ (ns->nsnum + 1).
+                NArch::Interrupts::regisr(ctrl->qvecs[ns->nsnum + 1], ioqueue, true);
+
+                NArch::CPU::get()->currthread->enablemigrate();
+
+                if (createiocqueue(ctrl, ns->nsnum + 1, QUEUESIZE, ns->nsnum + 1) != 0) {
+                    NUtil::printf("[dev/nvme]: Failed to initialise namespace, could not create I/O completion queue.\n");
+                    dmafree(ns->id, sizeof(struct nvmensid));
+                    return;
+                }
+
+                // Submission queue must be created after completion queue, because it needs reference to the completion queue ID.
+                if (createiosqueue(ctrl, ns->nsnum + 1, QUEUESIZE, 0) != 0) {
+                    NUtil::printf("[dev/nvme]: Failed to initialise namespace, could not create I/O submission queue.\n");
+                    dmafree(ctrl->iocq[ns->nsnum + 1].entries, QUEUESIZE * sizeof(struct nvmecqe));
+                    dmafree(ns->id, sizeof(struct nvmensid));
+                    return;
+                }
+
+                ns->active = true;
+                NUtil::printf("[dev/nvme]: Successfully initialised namespace %u.\n", ns->nsid);
+
+                // Read first byte from namespace and print it (test read).
+                uint8_t testbuf[512] = { 0 };
+                if (iorequest(ctrl, ns->nsnum + 1, IOREAD, ns->nsid, 0, 1, testbuf, 512) != 0) {
+                    NUtil::printf("[dev/nvme]: Test read from namespace %u failed.\n", ns->nsid);
+                } else {
+                    NUtil::printf("[dev/nvme]: Test read from namespace %u succeeded, first byte: 0x%02x\n", ns->nsid, testbuf[0]);
+                }
             }
 
             void probe(struct devinfo info) override {
@@ -581,22 +841,15 @@ uint32_t tail;
                     return;
                 }
 
-                NArch::CPU::get()->currthread->disablemigrate();
-
-                uint8_t adminvec = 0;
-                PCI::enablevectors(&info, 1, &adminvec); // Allocate some vectors to use.
-
-                NArch::Interrupts::regisr(adminvec, adminqueue, true);
-
-                NArch::CPU::get()->currthread->enablemigrate();
-
                 uint16_t cmd = PCI::read(&info, 0x4, 2);
                 cmd |= (1 << 2) | (1 << 1); // Bus mastering + MMIO.
                 PCI::write(&info, 0x4, cmd, 2);
 
-                struct nvmectrl controller = { };
+                struct nvmectrl &controller = this->controllers[this->ctrlcount++];
                 NLib::memset(&controller, 0, sizeof(struct nvmectrl));
+                NLib::memset(controller.pending, 0, sizeof(controller.pending));
 
+                controller.info = info;
                 controller.pcibar = bar; // Reference to the actual PCI bar.
 
                 uint64_t caps = read64(&controller.pcibar, REGCAP);
@@ -694,21 +947,24 @@ uint32_t tail;
 
                 idcmd.fuse = 0;
                 idcmd.psdt = 0; // Use PRP.
-                idcmd.cid = controller.nextcid++;
+                idcmd.cid = controller.asq.nextcid++;
 
                 idcmd.prp1 = NArch::VMM::virt2phys(&NArch::VMM::kspace, (uintptr_t)id);
                 idcmd.cdw10 = 0x01; // Identify controller.
 
                 submitadmin(&controller, &idcmd);
 
-                struct nvmecqe *cqe = NULL;
-                while ((cqe = waitadmin(&controller)) == NULL) { // Blocking wait upon command completion.
-                    asm volatile ("pause");
+                if (waitadmin(&controller) != 0) {
+                    NUtil::printf("[dev/nvme]: Failed to identify controller (admin identify failed).\n");
+                    dmafree(controller.asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
+                    dmafree(controller.acq.entries, QUEUESIZE * sizeof(struct nvmecqe));
+                    dmafree(id, sizeof(struct nvmeid));
+                    PCI::unmapbar(bar);
+                    return;
                 }
 
                 controller.id = id;
 
-                controller.nscount = id->nn;
                 uint32_t *nsids = (uint32_t *)dmaalloc(PAGESIZE);
                 if (!nsids) {
                     dmafree(controller.asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
@@ -724,23 +980,49 @@ uint32_t tail;
                 nsidscmd.nsid = 0;
                 nsidscmd.op = ADMINIDENTIFY;
 
-                nsidscmd.cid = controller.nextcid++;
+                nsidscmd.cid = controller.asq.nextcid++;
 
                 nsidscmd.prp1 = NArch::VMM::virt2phys(&NArch::VMM::kspace, (uintptr_t)nsids);
                 nsidscmd.cdw10 = 0x02; // Identify namespace ID list.
 
                 submitadmin(&controller, &nsidscmd);
-                while ((cqe = waitadmin(&controller)) == NULL) { // Blocking wait.
-                    asm volatile ("pause");
+                if (waitadmin(&controller) != 0) {
+                    NUtil::printf("[dev/nvme]: Failed to fetch namespace ID list.\n");
+                    dmafree(nsids, PAGESIZE);
+                    dmafree(controller.asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
+                    dmafree(controller.acq.entries, QUEUESIZE * sizeof(struct nvmecqe));
+                    dmafree(controller.id, sizeof(struct nvmeid));
+                    PCI::unmapbar(bar);
+                    return;
                 }
 
-                for (size_t i = 0; i < controller.nscount; i++) {
+                for (size_t i = 0; i < id->nn; i++) {
+                    if (nsids[i]) {
+                        NUtil::printf("[dev/nvme]: Discovered namespace %u with ID %u.\n", i, nsids[i]);
+                        controller.nscount++;
+                    }
+                }
+
+                NArch::CPU::get()->currthread->disablemigrate();
+
+                // Allocate vectors for each namespace's I/O completion queue, plus one for the admin queue.
+                PCI::enablevectors(&info, controller.nscount + 1, controller.qvecs);
+
+                NArch::CPU::get()->currthread->enablemigrate();
+
+                for (size_t i = 0; i < id->nn; i++) {
                     if (nsids[i]) { // Namespace ID list will let us know if there is an actual namespace here, or just the capacity for one.
                         struct nvmens *ns = &controller.namespaces[i];
 
-                        initnamespace(&controller, ns, nsids[i]);
+                        ns->nsid = nsids[i];
+                        ns->nsnum = i;
+                        initnamespace(&controller, ns);
                     }
                 }
+
+                dmafree(nsids, PAGESIZE); // We no longer need these.
+                controller.initialised = true;
+                NUtil::printf("[dev/nvme]: Successfully initialised NVMe controller with %u namespaces.\n", controller.nscount);
             }
     };
 

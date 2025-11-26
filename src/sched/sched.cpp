@@ -733,11 +733,14 @@ namespace NSched {
 #ifdef __x86_64__
         while (__sync_lock_test_and_set(&this->locked, 1)) {
 #endif
+
+            this->waitqueuelock.acquire();
+            NArch::CPU::get()->setint(false); // Disable interrupts to prevent preemption during this critical section.
             __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
             assert(NArch::CPU::get()->currthread != NArch::CPU::get()->idlethread, "Mutex on idle thread.\n");
-            this->waitqueuelock.acquire();
             this->waitqueue.pushback(NArch::CPU::get()->currthread);
             this->waitqueuelock.release();
+            NArch::CPU::get()->setint(true); // Re-enable interrupts.
             yield(); // Yield into suspend.
             // We're back, try to reacquire, and if we CAN, we're out!
         }

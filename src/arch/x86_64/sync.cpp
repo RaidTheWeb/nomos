@@ -50,8 +50,8 @@ namespace NArch {
     }
 
     void IRQSpinlock::acquire(void) {
-        this->state = CPU::get()->setint(false); // Disable interrupts. Stops preemption.
         this->lock->acquire(); // Raw acquire internal lock.
+        this->state = CPU::get()->setint(false); // Disable interrupts. Stops preemption.
     }
 
     void IRQSpinlock::release(void) {

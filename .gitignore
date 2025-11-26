@@ -9,3 +9,7 @@
 /flanterm/
 /uACPI/
 src/include/limine.h
+
+# Editor Artifacts
+.github/
+.vscode/
