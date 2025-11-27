@@ -30,6 +30,8 @@ namespace NDev {
             NUtil::printf("Read block %lu\n", 0);
             blkdev->cache->read(2, blk);
             NUtil::printf("Read block %lu\n", 2);
+            blkdev->cache->read(1, blk);
+            NUtil::printf("Read block %lu\n", 1);
 
             NMem::allocator.free(blk);
             return blkdev->ns->blksize;

@@ -251,6 +251,8 @@ namespace NDev {
         void *entries;
         uintptr_t dmaaddr;
 
+        NArch::Spinlock qlock; // Lock for this queue.
+
         uint16_t nextcid; // Next command ID for this queue. Only use for submission queues.
     };
 

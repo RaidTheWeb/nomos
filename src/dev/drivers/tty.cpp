@@ -11,6 +11,7 @@
 #include <lib/signal.hpp>
 #include <mm/ucopy.hpp>
 #include <sched/sched.hpp>
+#include <std/stddef.h>
 
 namespace NDev {
     using namespace NFS;
@@ -329,7 +330,8 @@ namespace NDev {
                 // POLLIN. We might have some data.
                 NLib::ScopeSpinlock guard(&this->linelock);
                 if (this->linebuffer.empty()) { // EOF is only valid at the start of a line.
-                    this->linebuffer.push(c);
+                    this->pending_eof = true;
+                    this->readwait.wake();
                     return;
                 }
             }
@@ -346,7 +348,8 @@ namespace NDev {
                 NLib::ScopeSpinlock guard1(&this->linelock);
                 NLib::ScopeSpinlock guard2(&this->outlock);
                 this->linebuffer.push(c);
-                if (this->termios.lflag & ECHO) {
+                bool shouldecho = (this->termios.lflag & ECHO) || (!(this->termios.lflag & ECHO) && (this->termios.lflag & ECHONL) && (c == '\n'));
+                if (shouldecho) {
                     if (canwrite) {
                         writefn(&c, 1);
                     }
@@ -361,7 +364,8 @@ namespace NDev {
             // if (c >= 32 && c <= 126) { // Add if printable.
                 NLib::ScopeSpinlock guard(&this->linelock);
                 this->linebuffer.push(c);
-                if ((this->termios.lflag & ECHO) && !((this->termios.lflag & ECHONL) && c == '\n')) {
+                bool shouldecho = (this->termios.lflag & ECHO) || (!(this->termios.lflag & ECHO) && (this->termios.lflag & ECHONL) && (c == '\n'));
+                if (shouldecho) {
                     if (canwrite) {
                         writefn(&c, 1);
                     }
@@ -405,6 +409,13 @@ namespace NDev {
 
         if (this->termios.lflag & ICANON) {
             this->linelock.acquire();
+            // If an EOF was received at the start of the line, return EOF (0).
+            if (this->pending_eof && this->linebuffer.empty()) {
+                this->pending_eof = false;
+                this->linelock.release();
+                return 0;
+            }
+
             if ((fdflags & VFS::O_NONBLOCK) && this->linebuffer.empty()) {
                 this->linelock.release();
                 return -EAGAIN; // There's nothing we can do. Caller should try again when we have data.
@@ -463,7 +474,7 @@ namespace NDev {
         (void)fdflags;
 
         NSched::Thread *thread = NArch::CPU::get()->currthread;
-        this->fpgrp = thread->process->pgrp;
+        this->fpgrp = thread->process->pgrp; // XXX: Only for testing purposes. Should be set on open().
 
         if (thread->process->pgrp != this->fpgrp) {
             NSched::signalthread(thread, SIGTTOU);
@@ -678,9 +689,12 @@ notspecial:
                     assert((currentvt - 1) < MAXTTYS, "Current VT exceeds number of TTYs.\n");
 
                     TTYDevice *tty = ttys[currentvt - 1];
+                    tty->devlock.acquire();
                     tty->ifnode->ref();
                     *st = tty->ifnode->getattr();
                     tty->ifnode->unref();
+                    tty->devlock.release();
+                    return 0;
                 }
                 return DEVFS::NOSTAT; // Default to node fill of our stat.
             }
@@ -695,13 +709,17 @@ notspecial:
                     assert((currentvt - 1) < MAXTTYS, "Current VT exceeds number of TTYs.\n");
 
                     TTYDevice *tty = ttys[currentvt - 1];
-                    return tty->tty->read((char *)buf, count, fdflags);
+                    ssize_t ret = tty->tty->read((char *)buf, count, fdflags);
+                    return ret;
                 } else { // Device is /dev/tty1-63
                     // Here, we could be coming from direct access, or through /dev/tty.
                     uint32_t num = DEVFS::minor(dev) - 1;
 
                     TTYDevice *tty = ttys[num];
-                    return tty->tty->read((char *)buf, count, fdflags);
+                    tty->devlock.acquire();
+                    ssize_t ret = tty->tty->read((char *)buf, count, fdflags);
+                    tty->devlock.release();
+                    return ret;
                 }
                 return 0;
             }
@@ -719,8 +737,11 @@ notspecial:
                     uint32_t num = DEVFS::minor(dev) - 1;
 
                     TTYDevice *tty = ttys[num];
+                    tty->devlock.acquire();
 
-                    return tty->tty->write((const char *)buf, count, fdflags, DEVFS::minor(dev) == currentvt ? NLimine::console_write : NULL);
+                    ssize_t ret = tty->tty->write((const char *)buf, count, fdflags, DEVFS::minor(dev) == currentvt ? NLimine::console_write : NULL);
+                    tty->devlock.release();
+                    return ret;
 
                 }
                 return 0;
@@ -739,39 +760,95 @@ notspecial:
                     uint32_t num = DEVFS::minor(dev) - 1;
 
                     TTYDevice *tty = ttys[num];
+                    tty->devlock.acquire();
 
+                    ssize_t ret = 0;
                     switch (request) {
                         case TTY::ioctls::TCGETS:
                             if (!arg) {
+                                tty->devlock.release();
                                 return -EINVAL;
                             }
-                            return NMem::UserCopy::copyto((void *)arg, &tty->tty->termios, sizeof(struct TTY::termios));
+                            ret = NMem::UserCopy::copyto((void *)arg, &tty->tty->termios, sizeof(struct TTY::termios));
+                            tty->devlock.release();
+                            return ret;
                         case TTY::ioctls::TCSETS:
                             if (!arg) {
+                                tty->devlock.release();
                                 return -EINVAL;
                             }
-                            return NMem::UserCopy::copyfrom(&tty->tty->termios, (void *)arg, sizeof(struct TTY::termios));
+
+                            ret = NMem::UserCopy::copyfrom(&tty->tty->termios, (void *)arg, sizeof(struct TTY::termios));
+                            tty->devlock.release();
+                            return ret;
                         case TTY::ioctls::TCSETSW:
                             if (!arg) {
+                                tty->devlock.release();
                                 return -EINVAL;
                             }
                             // Wait until output buffer is flushed.
-                            return NMem::UserCopy::copyfrom(&tty->tty->termios, (void *)arg, sizeof(struct TTY::termios));
+                            ret = NMem::UserCopy::copyfrom(&tty->tty->termios, (void *)arg, sizeof(struct TTY::termios));
+                            tty->devlock.release();
+                            return ret;
                         case TTY::ioctls::TCSETSF:
                             if (!arg) {
+                                tty->devlock.release();
                                 return -EINVAL;
                             }
                             { // Discard queued input before setting flags.
-                                NLib::ScopeSpinlock guard1(&tty->tty->inlock);
+                                NLib::ScopeSpinlock guard1(&tty->tty->linelock);
                                 NLib::ScopeSpinlock guard2(&tty->tty->outlock);
-                                NLib::ScopeSpinlock guard3(&tty->tty->linelock);
+                                NLib::ScopeSpinlock guard3(&tty->tty->inlock);
                                 tty->tty->inbuffer.clear();
                                 tty->tty->outbuffer.clear();
                                 tty->tty->linebuffer.clear();
                             }
-                            return NMem::UserCopy::copyfrom(&tty->tty->termios, (void *)arg, sizeof(struct TTY::termios)); // Then set attributes.
+                            ret = NMem::UserCopy::copyfrom(&tty->tty->termios, (void *)arg, sizeof(struct TTY::termios)); // Then set attributes.
+                            tty->devlock.release();
+                            return ret;
                         case TTY::ioctls::TCFLSH: {
-                            // XXX: Flush specifics.
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            int which = 0;
+                            ret = NMem::UserCopy::copyfrom(&which, (void *)arg, sizeof(which));
+                            if (ret < 0) {
+                                tty->devlock.release();
+                                return ret;
+                            }
+
+                            // Which: 0 = flush input, 1 = flush output, 2 = flush both
+                            switch (which) {
+                                case 0: { // Flush input
+                                    NLib::ScopeSpinlock guard1(&tty->tty->linelock);
+                                    NLib::ScopeSpinlock guard2(&tty->tty->inlock);
+                                    tty->tty->inbuffer.clear();
+                                    tty->tty->linebuffer.clear();
+                                    break;
+                                }
+                                case 1: { // Flush output
+                                    NLib::ScopeSpinlock guard(&tty->tty->outlock);
+                                    tty->tty->outbuffer.clear();
+                                    break;
+                                }
+                                case 2: { // Flush both
+                                    // Use canonical lock order: linelock -> outlock -> inlock
+                                    NLib::ScopeSpinlock guard1(&tty->tty->linelock);
+                                    NLib::ScopeSpinlock guard2(&tty->tty->outlock);
+                                    NLib::ScopeSpinlock guard3(&tty->tty->inlock);
+                                    tty->tty->inbuffer.clear();
+                                    tty->tty->outbuffer.clear();
+                                    tty->tty->linebuffer.clear();
+                                    break;
+                                }
+                                default:
+                                    tty->devlock.release();
+                                    return -EINVAL;
+                            }
+
+                            tty->devlock.release();
                             return 0;
                         }
 
@@ -781,22 +858,83 @@ notspecial:
                             __atomic_store_n(&proc->tty, tty->ifnode->getattr().st_rdev, memory_order_relaxed);
                             proc->tty = tty->ifnode->getattr().st_rdev;
                             tty->ifnode->unref();
+                            tty->devlock.release();
+                            return 0;
+                        }
+
+                        case TTY::ioctls::TIOCGPGRP: {
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            int pgid = 0;
+                            if (tty->tty->fpgrp) {
+                                pgid = (int)tty->tty->fpgrp->id;
+                            }
+
+                            ret = NMem::UserCopy::copyto((void *)arg, &pgid, sizeof(pgid));
+                            tty->devlock.release();
+                            return ret;
+                        }
+
+                        case TTY::ioctls::TIOCSPGRP: {
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            int requested = 0;
+                            ret = NMem::UserCopy::copyfrom(&requested, (void *)arg, sizeof(requested));
+                            if (ret < 0) {
+                                tty->devlock.release();
+                                return ret;
+                            }
+
+                            NSched::Process **ppgrp = NSched::pidtable->find(requested);
+                            if (!ppgrp) {
+                                tty->devlock.release();
+                                return -ESRCH;
+                            }
+                            NSched::ProcessGroup *target = (*ppgrp)->pgrp;
+
+                            // Ensure caller is in the same session as the target process group.
+                            NSched::Process *caller = NArch::CPU::get()->currthread->process;
+                            if (!caller->session || !target->session || caller->session != target->session) {
+                                tty->devlock.release();
+                                return -EPERM;
+                            }
+
+                            // If the TTY has an associated session, ensure the target is in the same session.
+                            if (tty->tty->session && tty->tty->session != target->session) {
+                                tty->devlock.release();
+                                return -EPERM;
+                            }
+
+                            // Accept the requested process group as the foreground pgrp.
+                            tty->tty->fpgrp = target;
+                            tty->devlock.release();
                             return 0;
                         }
 
                         case TTY::ioctls::TIOCGWINSZ:
                             if (!arg) {
+                                tty->devlock.release();
                                 return -EINVAL;
                             }
-                            return NMem::UserCopy::copyto((void *)arg, &tty->tty->winsize, sizeof(struct TTY::winsize));
+                            ret = NMem::UserCopy::copyto((void *)arg, &tty->tty->winsize, sizeof(struct TTY::winsize));
+                            tty->devlock.release();
+                            return ret;
                         case TTY::ioctls::TIOCSWINSZ:
                             if (!arg) {
+                                tty->devlock.release();
                                 return -EINVAL;
                             }
-                            return NMem::UserCopy::copyfrom(&tty->tty->winsize, (void *)arg, sizeof(struct TTY::winsize));
+                            ret = NMem::UserCopy::copyfrom(&tty->tty->winsize, (void *)arg, sizeof(struct TTY::winsize));
+                            tty->devlock.release();
+                            return ret;
                     }
                 }
-
                 return -EINVAL;
             }
     };

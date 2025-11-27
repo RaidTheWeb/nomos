@@ -6,6 +6,10 @@
 #endif
 #include <util/kprint.hpp>
 
+namespace NSched {
+    class Mutex;
+}
+
 namespace NLib {
 
     class ScopeSpinlock {

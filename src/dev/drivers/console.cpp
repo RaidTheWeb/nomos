@@ -7,6 +7,7 @@
 #include <dev/drivers/tty.hpp>
 #include <fs/devfs.hpp>
 #include <mm/ucopy.hpp>
+#include <std/stddef.h>
 
 namespace NDev {
 
@@ -19,6 +20,7 @@ namespace NDev {
 
             static const uint64_t DEVICEID = DEVFS::makedev(5, 1); // /dev/console device id.
             VFS::INode *targetnode = NULL;
+            NSched::Mutex devlock; // Lock for device access.
         public:
             ConsoleDriver(void) {
                 registry->add(new Device(DEVICEID, this)); // Register.
@@ -49,10 +51,12 @@ namespace NDev {
 
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
+                this->devlock.acquire();
 
                 this->targetnode->ref();
                 ssize_t ret = this->targetnode->write(buf, count, offset, fdflags);
                 this->targetnode->unref();
+                this->devlock.release();
                 return ret;
             }
 
@@ -60,18 +64,22 @@ namespace NDev {
                 (void)offset;
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
 
+                this->devlock.acquire();
                 this->targetnode->ref();
                 ssize_t ret = this->targetnode->read(buf, count, offset, fdflags);
                 this->targetnode->unref();
+                this->devlock.release();
                 return ret;
             }
 
             int ioctl(uint64_t dev, unsigned long request, uint64_t arg) override {
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
 
+                this->devlock.acquire();
                 this->targetnode->ref();
                 int ret = this->targetnode->ioctl(request, arg);
                 this->targetnode->unref();
+                this->devlock.release();
                 return ret;
             }
     };

@@ -4,8 +4,6 @@ namespace NFS {
     namespace DEVFS {
 
         ssize_t DevNode::read(void *buf, size_t count, off_t offset, int fdflags) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -14,8 +12,6 @@ namespace NFS {
         }
 
         ssize_t DevNode::write(const void *buf, size_t count, off_t offset, int fdflags) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -24,8 +20,6 @@ namespace NFS {
         }
 
         int DevNode::open(int flags) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -34,8 +28,6 @@ namespace NFS {
         }
 
         int DevNode::close(int fdflags) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -44,8 +36,6 @@ namespace NFS {
         }
 
         int DevNode::mmap(void *addr, size_t offset, uint64_t flags, int fdflags) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -54,8 +44,6 @@ namespace NFS {
         }
 
         int DevNode::munmap(void *addr, int fdflags) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -64,8 +52,6 @@ namespace NFS {
         }
 
         int DevNode::ioctl(unsigned long request, uint64_t arg) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!this->device) {
                 return -ENODEV;
             }
@@ -74,22 +60,21 @@ namespace NFS {
         }
 
         int DevNode::stat(struct VFS::stat *st) {
-            NLib::ScopeSpinlock guard(&this->spin);
             if (!this->device) {
                 return -ENODEV;
             }
 
             int ret = this->device->driver->stat(this->attr.st_dev, st);
-            if (ret == NOSTAT) { // XXX: Make constant. Specific error code so that the device node knows to retrieve its stat attributes instead of the driver.
+            if (ret == NOSTAT) {
+                this->metalock.acquire();
                 *st = this->attr;
+                this->metalock.release();
                 return 0;
             }
             return ret;
         }
 
         VFS::INode *DevNode::resolvesymlink(void) {
-            NLib::ScopeSpinlock guard(&this->spin);
-
             if (!VFS::S_ISLNK(this->attr.st_mode)) {
                 return NULL;
             }
@@ -102,7 +87,7 @@ namespace NFS {
         }
 
         VFS::INode *DevNode::lookup(const char *name) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            NLib::ScopeSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return NULL;
@@ -118,7 +103,7 @@ namespace NFS {
         }
 
         bool DevNode::add(VFS::INode *node) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            NLib::ScopeSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false;
@@ -132,7 +117,7 @@ namespace NFS {
         }
 
         bool DevNode::remove(const char *name) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            NLib::ScopeSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false;

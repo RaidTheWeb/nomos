@@ -329,12 +329,14 @@ namespace NDev {
 
     int NVMEDriver::iorequest(struct nvmectrl *ctrl, uint16_t id, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size) {
         struct nvmequeue *sq = &ctrl->iosq[id];
-        struct nvmequeue *cq = &ctrl->iocq[id];
+
+        sq->qlock.acquire(); // Lock the submission queue. This only needs to be done for the scope of submission queue manipulation.
 
         uint16_t cid = sq->nextcid++;
 
         struct nvmepending *pending;
         if (preparewait(ctrl, id, cid, &pending) != 0) {
+            sq->qlock.release();
             return -1;
         }
 
@@ -343,6 +345,7 @@ namespace NDev {
 
         // Simple full-queue check
         if (nexttail == sq->head) {
+            sq->qlock.release();
             return -1; // queue full
         }
 
@@ -361,6 +364,7 @@ namespace NDev {
         next->cdw12 |= (0 << 14) | (0 << 15); // FUA and limited retry.
 
         if (setupprps(next, buffer, size) != 0) {
+            sq->qlock.release();
             return -1;
         }
 
@@ -370,6 +374,7 @@ namespace NDev {
 
         sq->tail = nexttail;
         write32(&ctrl->pcibar, SUBQUEUEDB(id, ctrl->caps.stride), sq->tail);
+        sq->qlock.release();
 
         // Wait for completion on CQ (extracted to helper for IRQ transition)
         if (waitio(pending) != 0) {

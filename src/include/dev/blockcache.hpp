@@ -51,6 +51,8 @@ namespace NDev {
             // Evict entries until under capacity.
             void evict(void);
 
+            int readwrite(uint64_t lba, void *buffer, bool iswrite);
+
             // Read a block from cache or device.
             int read(uint64_t lba, void *buffer);
             // Write a block to cache and mark dirty.

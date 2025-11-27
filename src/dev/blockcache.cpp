@@ -47,11 +47,27 @@ namespace NDev {
     }
 
     struct cacheentry *BlockCache::selectvict(void) {
-        // TODO: More advanced eviction policy.
-        return this->tail;
+        struct cacheentry *victim = this->tail;
+        while (victim) {
+            if (!victim->dirty) {
+                // Found clean victim.
+                return victim;
+            } else if (true) { // XXX: Implement LCR Lchip check here (IEEE. 8512727).
+                return victim;
+            }
+
+            victim = victim->prev;
+        }
+        return NULL;
     }
 
     static void promoteentry(struct cacheentry **head, struct cacheentry **tail, struct cacheentry *entry) {
+        // If entry is NULL or already the head (MRU), nothing to do.
+        if (!entry || *head == entry) {
+            return;
+        }
+
+        // Unlink entry from its current position.
         if (entry->prev) {
             entry->prev->next = entry->next;
         } else {
@@ -62,6 +78,8 @@ namespace NDev {
         } else {
             *tail = entry->prev;
         }
+
+        // Insert at front (MRU).
         entry->next = *head;
         entry->prev = NULL;
         if (*head) {
@@ -73,7 +91,7 @@ namespace NDev {
         }
     }
 
-    int BlockCache::read(uint64_t lba, void *buffer) {
+    int BlockCache::readwrite(uint64_t lba, void *buffer, bool iswrite) {
         this->cachelock.acquire();
 
         struct cacheentry **hit = this->cachemap.find(lba);
@@ -83,7 +101,12 @@ namespace NDev {
             // Move to front of LRU list (MRU).
             promoteentry(&this->head, &this->tail, entry);
 
-            NLib::memcpy(buffer, (*hit)->data, this->blocksize);
+            if (iswrite) {
+                NLib::memcpy(entry->data, buffer, this->blocksize);
+                entry->dirty = true;
+            } else {
+                NLib::memcpy(buffer, (*hit)->data, this->blocksize);
+            }
             this->cachelock.release();
             return 0;
         }
@@ -98,17 +121,27 @@ namespace NDev {
             // Since most wake() calls happen while holding the cache lock on the owner thread, we will likely end up spinning until the lock is released.
             waiteventlocked(&inf->wq, inf->done, &this->cachelock);
 
-            struct cacheentry *entry = inf->entry; // We should have the entry now.
-            inf->refcount--;
             int err = inf->error;
+            inf->refcount--;
             if (inf->refcount == 0) {
                 delete inf; // No more waiters, safe to delete.
+            }
+
+            struct cacheentry **entryp = this->cachemap.find(lba); // Refetch, to ensure we didn't lose it.
+            struct cacheentry *entry = NULL;
+            if (entryp) {
+                entry = *entryp;
             }
 
             if (entry && err == 0) {
                 // Promote to MRU.
                 promoteentry(&this->head, &this->tail, entry);
-                NLib::memcpy(buffer, entry->data, this->blocksize);
+                if (iswrite) {
+                    NLib::memcpy(entry->data, buffer, this->blocksize);
+                    entry->dirty = true;
+                } else {
+                    NLib::memcpy(buffer, entry->data, this->blocksize);
+                }
                 this->cachelock.release();
                 return 0;
             } else {
@@ -127,8 +160,6 @@ namespace NDev {
         newinf->refcount = 0;
         newinf->error = 0;
         this->inflightmap.insert(lba, newinf); // Insert into map, so other threads know we're loading this LBA.
-
-        NUtil::printf("Block %llu not found in cache, reading from device.\n", lba);
 
         // Cache miss!
         this->evict(); // Evict if we need to.
@@ -201,7 +232,12 @@ namespace NDev {
             // Promote to MRU.
             promoteentry(&this->head, &this->tail, entry);
 
-            NLib::memcpy(buffer, entry->data, this->blocksize);
+            if (iswrite) {
+                NLib::memcpy(entry->data, buffer, this->blocksize);
+                entry->dirty = true;
+            } else {
+                NLib::memcpy(buffer, entry->data, this->blocksize);
+            }
 
             newinf->wq.wake(); // Wake up waiters.
 
@@ -217,7 +253,12 @@ namespace NDev {
         newentry->lba = lba;
         newentry->dirty = false;
 
-        NLib::memcpy(buffer, newentry->data, this->blocksize);
+        if (iswrite) {
+            NLib::memcpy(newentry->data, buffer, this->blocksize);
+            newentry->dirty = true;
+        } else {
+            NLib::memcpy(buffer, newentry->data, this->blocksize);
+        }
 
         // Insert at front of LRU list (MRU).
         newentry->next = this->head;
@@ -246,13 +287,50 @@ namespace NDev {
         return 0;
     }
 
+    int BlockCache::read(uint64_t lba, void *buffer) {
+        return this->readwrite(lba, buffer, false);
+    }
+
     int BlockCache::write(uint64_t lba, const void *buffer) {
-        (void)lba;
-        (void)buffer;
-        return -1;
+        return this->readwrite(lba, (void *)buffer, true);
     }
 
     void BlockCache::flush(void) {
+        while (true) {
+            this->cachelock.acquire();
+            struct cacheentry *cur = this->head;
+            while (cur && !cur->dirty) {
+                cur = cur->next;
+            }
+            if (!cur) {
+                this->cachelock.release();
+                break; // No more entries.
+            }
+
+            uint64_t lba = cur->lba;
+            uint8_t *scratch = new uint8_t[this->blocksize]; // Allocate scratch buffer for writeback.
+            if (!scratch) {
+                this->cachelock.release();
+                NUtil::printf("[dev/blockcache]: Failed to allocate scratch buffer during flush.\n");
+                break; // Can't allocate scratch buffer, give up.
+            }
+            NLib::memcpy(scratch, cur->data, this->blocksize);
+            this->cachelock.release(); // Release lock while doing IO.
+
+            ssize_t res = this->dev->writeblock(lba, scratch);
+
+            this->cachelock.acquire();
+            if (res == 0) {
+                struct cacheentry **entryp = this->cachemap.find(lba);
+                if (NLib::memcmp(scratch, (*entryp)->data, this->blocksize) == 0) {
+                    (*entryp)->dirty = false;
+                }
+            } else {
+                NUtil::printf("[dev/blockcache]: Failed to write back block %llu during flush (err=%d).\n", lba, (int)res);
+            }
+            delete[] scratch;
+            this->cachelock.release();
+        }
     }
 
     void BlockCache::evict(void) {
@@ -261,13 +339,12 @@ namespace NDev {
             return; // No need to evict.
         }
 
-        NUtil::printf("Evicting entries to maintain cache capacity of %llu.\n", this->capacity);
         while (this->cachemap.size() >= this->capacity) { // We're going to add one, so evict until under capacity.
             victim = this->selectvict();
             if (!victim) {
+                NUtil::printf("[dev/blockcache]: No victim found during eviction.\n");
                 break; // No victim found, should not happen.
             }
-            NUtil::printf("Evicting block %llu from cache.\n", victim->lba);
 
             if (victim->prev) {
                 victim->prev->next = victim->next;

@@ -286,7 +286,7 @@ namespace NFS {
         class INode {
             protected:
                 uint32_t refcount = 0;
-                NArch::Spinlock spin;
+                NArch::Spinlock metalock; // Meta lock for this node.
                 IFileSystem *fs;
                 struct stat attr;
                 const char *name;
@@ -346,29 +346,29 @@ namespace NFS {
                 virtual bool remove(const char *name) = 0;
 
                 void setparent(INode *parent) {
-                    NLib::ScopeSpinlock guard(&this->spin);
+                    NLib::ScopeSpinlock guard(&this->metalock);
                     this->parent = parent;
                 }
 
                 INode *getparent(void) {
-                    NLib::ScopeSpinlock guard(&this->spin);
+                    NLib::ScopeSpinlock guard(&this->metalock);
                     return this->parent;
                 }
 
                 const char *getname(void) {
-                    NLib::ScopeSpinlock guard(&this->spin);
+                    NLib::ScopeSpinlock guard(&this->metalock);
                     return this->name;
                 }
 
                 virtual INode *resolvesymlink(void) = 0;
 
                 struct stat getattr(void) {
-                    NLib::ScopeSpinlock guard(&this->spin);
+                    NLib::ScopeSpinlock guard(&this->metalock);
                     return this->attr;
                 }
 
                 void setattr(struct stat attr) {
-                    NLib::ScopeSpinlock guard(&this->spin);
+                    NLib::ScopeSpinlock guard(&this->metalock);
                     this->attr = attr;
                 }
 

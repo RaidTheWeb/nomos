@@ -115,6 +115,13 @@ namespace NDev {
             NLib::CircularBuffer<char> linebuffer;
             NArch::Spinlock linelock;
 
+            // Multi-lock ordering:
+            // 1. linelock
+            // 2. outlock
+            // 3. inlock
+
+            bool pending_eof = false;
+
             // Job control structures:
             NSched::ProcessGroup *fpgrp = NULL; // Foreground process group.
             NSched::Session *session = NULL;
@@ -137,6 +144,7 @@ namespace NDev {
         public:
 
             TTY *tty = NULL;
+            NSched::Mutex devlock; // Lock for device access.
 
             TTYDevice(uint64_t id, DevDriver *driver) : Device(id, driver) {
                 this->tty = new TTY();

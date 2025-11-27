@@ -3,6 +3,7 @@
 
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
+#include <sched/sched.hpp>
 
 namespace NFS {
     namespace RAMFS {
@@ -10,6 +11,7 @@ namespace NFS {
             private:
                 uint8_t *data = NULL;
                 NLib::HashMap<RAMNode *> children;
+                NSched::Mutex datalock; // Lock for data access.
             public:
 
                 RAMNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr) : VFS::INode(fs, name, attr) { }

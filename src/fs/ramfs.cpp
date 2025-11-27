@@ -8,9 +8,10 @@ namespace NFS {
             assert(buf, "Reading into invalid buffer.\n");
             assert(count, "Invalid count.\n");
 
-            NLib::ScopeSpinlock guard(&this->spin);
+            this->datalock.acquire();
 
             if (offset >= this->attr.st_size) {
+                this->datalock.release();
                 return 0;
             }
             if ((off_t)(offset + count) > this->attr.st_size) {
@@ -18,12 +19,13 @@ namespace NFS {
             }
 
             NLib::memcpy(buf, this->data + offset, count);
+            this->datalock.release();
             return count;
         }
 
         ssize_t RAMNode::write(const void *buf, size_t count, off_t offset, int fdflags) {
             (void)fdflags;
-            NLib::ScopeSpinlock guard(&this->spin);
+            this->datalock.acquire();
 
             if ((off_t)(offset + count) > this->attr.st_size) {
                 this->attr.st_size = offset + count;
@@ -34,11 +36,12 @@ namespace NFS {
             }
 
             NLib::memcpy(this->data + offset, (void *)buf, count);
+            this->datalock.release();
             return count;
         }
 
         VFS::INode *RAMNode::resolvesymlink(void) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            this->datalock.acquire();
 
             if (!VFS::S_ISLNK(this->attr.st_mode)) {
                 return NULL; // Non-symbolic links cannot resolve to node.
@@ -51,11 +54,13 @@ namespace NFS {
             VFS::VFS *vfs = this->fs->getvfs();
 
             // Attempt to resolve the node our data points to. Uses normal resolution function, but it doesn't attempt to resolve symbolic links (we don't want any crazy recursion).
-            return vfs->resolve((const char *)this->data, this, false);
+            VFS::INode *node = vfs->resolve((const char *)this->data, this, false);
+            this->datalock.release();
+            return node;
         }
 
         VFS::INode *RAMNode::lookup(const char *name) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            NLib::ScopeSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return NULL; // Non-directories possess no children.
@@ -71,7 +76,7 @@ namespace NFS {
         }
 
         bool RAMNode::add(VFS::INode *node) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            NLib::ScopeSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false; // Non-directories possess no children.
@@ -85,7 +90,7 @@ namespace NFS {
         }
 
         bool RAMNode::remove(const char *name) {
-            NLib::ScopeSpinlock guard(&this->spin);
+            NLib::ScopeSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false; // Non-directories possess no children.

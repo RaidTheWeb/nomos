@@ -2,6 +2,9 @@
 #include <fs/devfs.hpp>
 #include <mm/ucopy.hpp>
 
+#include <sched/sched.hpp>
+#include <std/stddef.h>
+
 namespace NDev {
 
     using namespace NFS;
@@ -16,6 +19,8 @@ namespace NDev {
             static const uint32_t FULLMINOR = 7;
             static const uint32_t RANDOMMINOR = 8;
             static const uint32_t URANDOMMINOR = 9;
+
+            // None of the devices have any state, so there's no need for locking mechanisms.
         public:
             StreamDriver(void) {
                 registry->add(new Device(DEVFS::makedev(MAJOR, NULLMINOR), this));
