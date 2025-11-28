@@ -405,6 +405,8 @@ namespace NDev {
                         // Ensure we see the other fields after seeing the phase bit
                         asm volatile ("" : : : "memory");
 
+
+                        // Signal waiting thread that this command is complete.
                         uint16_t cid = cqe->cid;
                         struct nvmepending *pending = &ctrl->pending[(ns->nsnum + 1) * QUEUESIZE + (cid % QUEUESIZE)];
                         pending->status = cqe->sc;

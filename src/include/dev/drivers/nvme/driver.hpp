@@ -34,12 +34,11 @@ namespace NDev {
         public:
             struct nvmectrl *ctrl;
             struct nvmens *ns;
-            BlockCache *cache;
-
         public:
             NVMEBlockDevice(uint64_t id, NVMEDriver *driver, struct nvmectrl *ctrl, struct nvmens *ns) : BlockDevice(id, driver) {
                 this->ctrl = ctrl;
                 this->ns = ns;
+                this->blksize = ns->blksize;
                 this->cache = new BlockCache(this, 2, ns->blksize); // 64MB cache.
             }
             ~NVMEBlockDevice();

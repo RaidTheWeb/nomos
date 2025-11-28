@@ -296,7 +296,7 @@ namespace NDev {
     }
 
     void BlockCache::flush(void) {
-        while (true) {
+        while (true) { // We're literally just dumping all dirty entries until none remain.
             this->cachelock.acquire();
             struct cacheentry *cur = this->head;
             while (cur && !cur->dirty) {

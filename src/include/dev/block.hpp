@@ -2,6 +2,7 @@
 #define __DEV__BLOCK_HPP
 
 #include <dev/dev.hpp>
+#include <dev/blockcache.hpp>
 
 namespace NDev {
 
@@ -53,7 +54,12 @@ namespace NDev {
         PARTTYPE_GPT    = 2
     };
 
+
+
     class BlockDevice : public Device {
+        protected:
+            BlockCache *cache = NULL;
+            size_t blksize = 512;
         public:
             BlockDevice(uint64_t id, DevDriver *driver) : Device(id, driver) { }
             ~BlockDevice() = default;

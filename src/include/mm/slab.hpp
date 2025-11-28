@@ -11,13 +11,13 @@ namespace NMem {
     extern bool sanitisefreed;
 
     __attribute__((used))
-    static const size_t numslabs = 17;
+    static const size_t numslabs = 16;
 
     __attribute__((used))
     static const size_t slabsizes[numslabs] = {
         // Allocate slabs up to the exact size of a traditional "page".
         16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536,
-        2048, 3072, 4096
+        2048, 3072
     };
 
     __attribute__((used))

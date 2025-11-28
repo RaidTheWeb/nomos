@@ -18,23 +18,10 @@ namespace NDev {
             // Find the block device.
             NVMEBlockDevice *blkdev = (NVMEBlockDevice *)registry->get(dev);
 
-            uint8_t *blk = (uint8_t *)NMem::allocator.alloc(blkdev->ns->blksize);
-            if (!blk) {
-                return -ENOMEM;
+            if (blkdev) {
+                return blkdev->readbytes(buf, count, offset, fdflags);
             }
-            blkdev->cache->read(0, blk);
-            NUtil::printf("Read block %lu\n", 0);
-            blkdev->cache->read(1, blk);
-            NUtil::printf("Read block %lu\n", 1);
-            blkdev->cache->read(0, blk);
-            NUtil::printf("Read block %lu\n", 0);
-            blkdev->cache->read(2, blk);
-            NUtil::printf("Read block %lu\n", 2);
-            blkdev->cache->read(1, blk);
-            NUtil::printf("Read block %lu\n", 1);
-
-            NMem::allocator.free(blk);
-            return blkdev->ns->blksize;
+            return -ENODEV;
         }
 
         return -1;

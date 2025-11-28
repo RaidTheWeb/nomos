@@ -20,7 +20,25 @@ namespace NDev {
 
     // Read raw bytes from block device, goes through cache.
     ssize_t BlockDevice::readbytes(void *buf, size_t count, off_t offset, int fdflags) {
-        return -1;
+        for (size_t progress = 0; progress < count;) {
+            uint64_t lba = (offset + progress) / blksize;
+
+            uint8_t blockbuf[blksize];
+            ssize_t res = cache->read(lba, blockbuf);
+            if (res < 0) {
+                return -EIO;
+            }
+
+            uint64_t chunk = count - progress;
+            uint64_t blockoffset = (offset + progress) % blksize;
+            if (chunk > blksize - blockoffset) {
+                chunk = blksize - blockoffset;
+            }
+
+            NMem::UserCopy::copyto((uint8_t *)buf + progress, (uint8_t *)blockbuf + blockoffset, chunk);
+            progress += chunk;
+        }
+        return count;
     }
 
 

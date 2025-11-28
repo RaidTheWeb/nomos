@@ -46,7 +46,6 @@ namespace NMem {
         // Needs to include enough space for the metadata.
         size_t aligned = (((size + sizeof(struct SubAllocator::metadata)) + (16 - 1)) & ~(16 - 1));
 
-        // Get slab index.
         size_t idx = getslabidx(aligned);
 
         if (idx != __SIZE_MAX__) {
