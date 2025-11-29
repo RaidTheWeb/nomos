@@ -176,6 +176,10 @@ namespace NFS {
             }
 
             INode *node = mount->fs->create(pobj.basename(), attr);
+            if (!node) {
+                parent->unref();
+                return NULL; // Creation failed.
+            }
             parent->add(node);
             parent->unref();
 
@@ -497,6 +501,13 @@ namespace NFS {
             if (!node) { // Couldn't find it. Check if there's a reason to create it.
                 if (!(flags & O_CREAT)) {
                     return -ENOENT; // Don't bother if there's no create flag.
+                }
+                // Create the node.
+                struct stat attr = { 0 };
+                attr.st_mode = mode;
+                node = vfs.create(pathbuf, attr);
+                if (!node) {
+                    return -EIO; // Generic I/O error.
                 }
             }
 

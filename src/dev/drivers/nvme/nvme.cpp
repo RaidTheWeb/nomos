@@ -14,6 +14,7 @@
 #include <lib/align.hpp>
 #include <sched/event.hpp>
 #include <stddef.h>
+#include <dev/block.hpp>
 
 namespace NDev {
     using namespace NFS;
@@ -486,7 +487,8 @@ namespace NDev {
         NUtil::printf("[dev/nvme]: Successfully initialised namespace %u.\n", ns->nsid);
 
         // Add block device to registry and create device node.
-        registry->add(new NVMEBlockDevice(DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, 0)), this, ctrl, ns));
+        NVMEBlockDevice *nsblkdev = new NVMEBlockDevice(DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, 0)), this, ctrl, ns);
+        registry->add(nsblkdev);
 
         struct VFS::stat st {
             .st_mode = (VFS::S_IFBLK | 0644),
@@ -498,8 +500,26 @@ namespace NDev {
             .st_blocks = (ns->capacity * ns->blksize) / 512,
         };
         char namebuf[64];
-        NUtil::snprintf(namebuf, sizeof(namebuf), "/dev/nvme%un%up%u", ctrl->num, ns->nsnum + 1, 0);
+        NUtil::snprintf(namebuf, sizeof(namebuf), "/dev/nvme%un%u", ctrl->num, ns->nsnum + 1);
         assert(VFS::vfs.create(namebuf, st), "Failed to create NVMe block device node.");
+
+        struct parttableinfo *ptinfo = getpartinfo(nsblkdev);
+        if (ptinfo) {
+            for (size_t i = 0; i < ptinfo->numparts; i++) {
+                struct partinfo *part = &ptinfo->partitions[i];
+
+                NUtil::snprintf(namebuf, sizeof(namebuf), "/dev/nvme%un%up%u", ctrl->num, ns->nsnum + 1, i + 1);
+                st.st_size = (part->lastlba - part->firstlba + 1) * ns->blksize;
+                st.st_blocks = st.st_size / 512;
+                st.st_rdev = DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, i + 1));
+
+                // XXX: Inherit block cache from parent block device, rather than keeping separate caches for each partition.
+                NVMEBlockDevice *partblkdev = new NVMEBlockDevice(DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, i + 1)), this, ctrl, ns, part->firstlba, part->lastlba);
+                registry->add(partblkdev);
+
+                assert(VFS::vfs.create(namebuf, st), "Failed to create NVMe partition block device node.");
+            }
+        }
     }
 
     void NVMEDriver::probe(struct devinfo info) {

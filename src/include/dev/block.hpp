@@ -54,14 +54,22 @@ namespace NDev {
         PARTTYPE_GPT    = 2
     };
 
-
-
     class BlockDevice : public Device {
         protected:
             BlockCache *cache = NULL;
-            size_t blksize = 512;
         public:
+            size_t blksize = 512;
+            bool ispart = false;
+            uint64_t startlba = 0;
+            uint64_t lastlba = 0;
+
             BlockDevice(uint64_t id, DevDriver *driver) : Device(id, driver) { }
+            BlockDevice(uint64_t id, DevDriver *driver, uint64_t startlba, uint64_t lastlba) : Device(id, driver) {
+                // Adds additional offset for partition.
+                this->ispart = true;
+                this->startlba = startlba;
+                this->lastlba = lastlba;
+            }
             ~BlockDevice() = default;
 
             // Read block-wise from device. Must be implemented by driver.
@@ -75,6 +83,19 @@ namespace NDev {
             virtual ssize_t writebytes(const void *buf, size_t count, off_t offset, int fdflags);
     };
 
+    struct partinfo {
+        uint64_t firstlba = 0;
+        uint64_t lastlba = 0;
+    };
+
+    struct parttableinfo {
+        enum parttype type = PARTTYPE_NONE;
+        size_t numparts = 0;
+        struct partinfo *partitions = NULL;
+    };
+
+    // Get partition table info from block device, owner is expected to free returned struct.
+    struct parttableinfo *getpartinfo(BlockDevice *dev);
 }
 
 #endif
