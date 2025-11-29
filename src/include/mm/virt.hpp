@@ -106,10 +106,11 @@ namespace NMem {
                 // Allocate an aligned region within address space.
                 void *alloc(size_t size, uint8_t flags);
 
-                void setflags(uintptr_t start, uintptr_t end, uint8_t flags);
-
                 // Forcibly occupy this area of memory. Useful for areas of memory that we should avoid (kernel sections, regions of actual RAM). We only want to be allocating where we could not be having anything useful.
                 void *reserve(uintptr_t start, uintptr_t end, uint8_t flags);
+
+                // Set flags for a region (only marks used if the containing region was in use).
+                void protect(uintptr_t start, uintptr_t end, uint8_t flags);
 
                 // Free an aligned region with address space.
                 void free(void *ptr, size_t size);

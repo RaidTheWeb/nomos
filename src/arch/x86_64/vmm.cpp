@@ -9,6 +9,8 @@
 #include <lib/string.hpp>
 #include <sys/syscall.hpp>
 #include <util/kprint.hpp>
+#include <sched/sched.hpp>
+#include <fs/vfs.hpp>
 
 extern void *_text_start;
 extern void *_text_end;
@@ -476,55 +478,150 @@ namespace NArch {
         extern "C" uint64_t sys_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t off) {
             SYSCALL_LOG("sys_mmap(%p, %lu, %u, %u, %d, %lu).\n", hint, size, prot, flags, fd, off);
 
-            if (!size || (off % PAGESIZE)) {
+            if (size == 0) {
                 return -EINVAL;
             }
 
             size = NLib::alignup(size, PAGESIZE);
 
-            bool isfile = !(flags & MAP_ANONYMOUS); // Anonymous mappings have nothing to do with files.
-            if (isfile && fd < 0) {
-                return -EBADF;
-            }
-
-            struct addrspace *space = CPU::get()->currthread->process->addrspace;
+            struct CPU::cpulocal *cpu = CPU::get();
+            NSched::Thread *thread = cpu->currthread;
+            NSched::Process *proc = thread->process;
+            struct addrspace *space = proc->addrspace;
 
             NLib::ScopeSpinlock guard(&space->lock);
 
-            void *region = space->vmaspace->alloc(size, prottovma(prot)); // Allocate VMA region.
-            if (!region) {
-                return -ENOMEM;
+            uint64_t vmaflags = prottovma(prot);
+            if (flags & MAP_SHARED) {
+                vmaflags |= NMem::Virt::VIRT_SHARED; // Map as shared, it won't be copy-on-write (changes visible to all processes sharing the mapping).
             }
 
-            void *phys = PMM::alloc(size);
-            if (!phys) {
-                space->vmaspace->free(region, size);
-                return -ENOMEM;
+            void *addr = NULL;
+
+            if (flags & MAP_FIXED) {
+                if ((uintptr_t)hint % PAGESIZE != 0) {
+                    // Misaligned hint address.
+                    return -EINVAL;
+                }
+                space->vmaspace->free(hint, size); // Free any existing mappings in the range.
+                addr = space->vmaspace->reserve((uintptr_t)hint, (uintptr_t)hint + size, vmaflags);
+                if (!addr) {
+                    // Failed to reserve at fixed address.
+                    return -ENOMEM;
+                }
+            } else {
+                // Allocate anywhere, it really doesn't matter.
+                addr = space->vmaspace->alloc(size, vmaflags);
+                if (!addr) {
+                    return -ENOMEM;
+                }
             }
 
             if (flags & MAP_ANONYMOUS) {
-                NLib::memset(hhdmoff(phys), 0, size);
+                for (size_t i = 0; i < size; i += PAGESIZE) {
+                    void *page = PMM::alloc(PAGESIZE);
+                    if (!page) {
+                        _unmaprange(space, (uintptr_t)addr, i);
+                        space->vmaspace->free(addr, size);
+                        return -ENOMEM;
+                    }
+                    NLib::memset(hhdmoff(page), 0, PAGESIZE);
+                    if (!_mappage(space, (uintptr_t)addr + i, (uintptr_t)page, prottovmm(prot))) {
+                        _unmaprange(space, (uintptr_t)addr, i);
+                        space->vmaspace->free(addr, size);
+                        return -ENOMEM;
+                    }
+                }
+            } else { // File-backed mapping.
+                if (fd < 0) {
+                    space->vmaspace->free(addr, size);
+                    return -EBADF;
+                }
+
+                // We're going to need to get the file descriptor from the process's file descriptor table.
+                NFS::VFS::FileDescriptor *filedesc = proc->fdtable->get(fd);
+                if (!filedesc) {
+                    space->vmaspace->free(addr, size);
+                    return -EBADF;
+                }
+
+                NFS::VFS::INode *node = filedesc->getnode();
+                if (!node) {
+                    filedesc->unref();
+                    space->vmaspace->free(addr, size);
+                    return -EBADF;
+                }
+
+                // XXX: Dump the ifnode into the vmaspace so we can track during page faults?
+
+                // Get the implementing node to map the region (handled by filesystem or device).
+                int ret = node->mmap(addr, off, prottovmm(prot), flags);
+
+                filedesc->unref();
+                node->unref();
+
+                if (ret < 0) {
+                    space->vmaspace->free(addr, size);
+                    return ret;
+                }
             }
 
-            if (!_maprange(space, (uintptr_t)region, (uintptr_t)phys, prottovmm(prot), size)) {
-                space->vmaspace->free(region, size);
-                PMM::free(phys, size);
-                return -ENOMEM;
-            }
-
-            // Sets return address of memory map with region.
-            return (uint64_t)region;
+            return (uint64_t)addr;
         }
 
         extern "C" uint64_t sys_munmap(void *ptr, size_t size) {
             SYSCALL_LOG("sys_munmap(%p, %lu).\n", ptr, size);
-            assert(false, "Unimplemented system call.\n");
+
+            if ((uintptr_t)ptr % PAGESIZE != 0 || size == 0) {
+                return -EINVAL;
+            }
+
+            size = NLib::alignup(size, PAGESIZE);
+
+            struct CPU::cpulocal *cpu = CPU::get();
+            NSched::Thread *thread = cpu->currthread;
+            NSched::Process *proc = thread->process;
+            struct addrspace *space = proc->addrspace;
+
+            NLib::ScopeSpinlock guard(&space->lock);
+
+            _unmaprange(space, (uintptr_t)ptr, size);
+            space->vmaspace->free(ptr, size);
+
             return 0;
         }
 
         extern "C" uint64_t sys_mprotect(void *ptr, size_t size, int prot) {
             SYSCALL_LOG("sys_mprotect(%p, %lu, %d).\n", ptr, size, prot);
-            assert(false, "Unimplemented system call.\n");
+
+            if ((uintptr_t)ptr % PAGESIZE != 0 || size == 0) {
+                return -EINVAL;
+            }
+
+            size = NLib::alignup(size, PAGESIZE);
+
+            struct CPU::cpulocal *cpu = CPU::get();
+            NSched::Thread *thread = cpu->currthread;
+            NSched::Process *proc = thread->process;
+            struct addrspace *space = proc->addrspace;
+
+            NLib::ScopeSpinlock guard(&space->lock);
+
+            uint64_t vmaflags = prottovma(prot);
+
+            // Update VMA flags for specified range.
+            space->vmaspace->protect((uintptr_t)ptr, (uintptr_t)ptr + size, vmaflags);
+
+            for (size_t i = 0; i < size; i += PAGESIZE) {
+                uint64_t *pte = _resolvepte(space, (uintptr_t)ptr + i);
+                if (pte && (*pte & PRESENT)) {
+                    uint64_t phys = *pte & ADDRMASK;
+                    uint64_t newflags = prottovmm(prot);
+                    *pte = phys | newflags;
+                    doshootdown(CPU::TLBSHOOTDOWN_SINGLE, (uintptr_t)ptr + i, (uintptr_t)ptr + i + PAGESIZE);
+                }
+            }
+
             return 0;
         }
 

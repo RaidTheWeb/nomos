@@ -276,7 +276,6 @@ namespace NDev {
 
                 uint8_t idx = bir & 0x7;
                 uint32_t off = bir & ~0x7;
-                NUtil::printf("Table is on BAR%u at %p.\n", idx, off);
 
                 struct PCI::bar bar = getbar(dev, idx); // MSI-X info is contained within the specified BAR.
 

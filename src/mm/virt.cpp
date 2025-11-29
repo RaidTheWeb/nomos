@@ -227,12 +227,6 @@ namespace NMem {
             this->root = NULL; // NULL root.
         }
 
-        void VMASpace::setflags(uintptr_t start, uintptr_t end, uint8_t flags) {
-            this->free((void *)start, end - start); // Free size of region before remapping (in case it's only marking part of an area).
-
-            this->alloc(end - start, flags);
-        }
-
         void *VMASpace::alloc(size_t size, uint8_t flags) {
             assert(size && NArch::PAGESIZE, "Attempting to allocate zero aligned/zero size VMA region.\n");
 
@@ -368,7 +362,13 @@ namespace NMem {
         void *VMASpace::reserve(uintptr_t start, uintptr_t end, uint8_t flags) {
             // Find the node that contains this region.
             struct vmanode *node = this->containing(this->root, start, end);
-            assertarg(node, "No VMA node exists to contain %p->%p.\n", start, end);
+            if (!node) {
+                return NULL;
+            }
+
+            if (node->used) {
+                return NULL;
+            }
 
             // Identical logic to alloc(), but we utilise the containing node instead of a found suitable node. This will still create holes for free allocation spaces, around the reserved regions.
 
@@ -399,6 +399,42 @@ namespace NMem {
             return (void *)start;
         }
 
+        void VMASpace::protect(uintptr_t start, uintptr_t end, uint8_t flags) {
+            struct vmanode *node = this->containing(this->root, start, end);
+            if (!node) {
+                return;
+            }
+
+            struct vmanode *nodes[3];
+            size_t count = 0;
+
+            if (node->start < start) {
+                nodes[count] = this->newnode(node->start, start, node->used);
+                nodes[count]->flags = node->flags;
+                count++;
+            }
+
+            nodes[count] = this->newnode(start, end, node->used);
+            nodes[count]->flags = flags;
+            // Preserve shared flag if it was set.
+            if (node->flags & VIRT_SHARED) {
+                nodes[count]->flags |= VIRT_SHARED;
+            }
+            count++;
+
+            if (end < node->end) {
+                nodes[count] = this->newnode(end, node->end, node->used);
+                nodes[count]->flags = node->flags;
+                count++;
+            }
+
+            this->root = this->remove(this->root, node->start);
+
+            for (size_t i = 0; i < count; i++) {
+                this->root = this->insert(this->root, nodes[i]);
+            }
+        }
+
         void VMASpace::free(void *ptr, size_t size) {
             if (!ptr || !size) {
                 return; // Don't attempt to free zero pointer or zero size.
@@ -423,7 +459,39 @@ namespace NMem {
                 }
             }
 
-            assert(tofree, "Attempting to free a node that doesn't exist within VMA.\n");
+            if (!tofree) {
+                return;
+            }
+
+            if (tofree->start != start || tofree->end != end) {
+                struct vmanode *nodes[3];
+                size_t count = 0;
+
+                if (tofree->start < start) {
+                    nodes[count] = this->newnode(tofree->start, start, tofree->used);
+                    nodes[count]->flags = tofree->flags;
+                    count++;
+                }
+
+                nodes[count] = this->newnode(start, end, true);
+                nodes[count]->flags = tofree->flags;
+                count++;
+
+                if (end < tofree->end) {
+                    nodes[count] = this->newnode(end, tofree->end, tofree->used);
+                    nodes[count]->flags = tofree->flags;
+                    count++;
+                }
+
+                this->root = this->remove(this->root, tofree->start);
+
+                for (size_t i = 0; i < count; i++) {
+                    this->root = this->insert(this->root, nodes[i]);
+                }
+
+                this->free(ptr, size);
+                return;
+            }
 
             tofree->used = false; // Set to free.
             this->updatenode(tofree); // Recompute balancing prerequisites.
