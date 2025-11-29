@@ -94,48 +94,14 @@ namespace NDev {
     int BlockCache::readwrite(uint64_t lba, void *buffer, size_t off, size_t len, bool iswrite) {
         this->cachelock.acquire();
 
-        struct cacheentry **hit = this->cachemap.find(lba);
-        if (hit) {
-            struct cacheentry *entry = *hit;
+        while (true) {
+            struct cacheentry **hit = this->cachemap.find(lba);
+            if (hit) {
+                struct cacheentry *entry = *hit;
 
-            // Move to front of LRU list (MRU).
-            promoteentry(&this->head, &this->tail, entry);
-
-            if (iswrite) {
-                NLib::memcpy(entry->data + off, buffer, len);
-                entry->dirty = true;
-            } else {
-                NLib::memcpy(buffer, (*hit)->data + off, len);
-            }
-            this->cachelock.release();
-            return 0;
-        }
-
-        struct inflight **infp = this->inflightmap.find(lba);
-        if (infp) { // If another thread is already handling this LBA.
-
-            struct inflight *inf = *infp;
-            inf->refcount++;
-
-            // Wait until our inflight load is done.
-            // Since most wake() calls happen while holding the cache lock on the owner thread, we will likely end up spinning until the lock is released.
-            waiteventlocked(&inf->wq, inf->done, &this->cachelock);
-
-            int err = inf->error;
-            inf->refcount--;
-            if (inf->refcount == 0) {
-                delete inf; // No more waiters, safe to delete.
-            }
-
-            struct cacheentry **entryp = this->cachemap.find(lba); // Refetch, to ensure we didn't lose it.
-            struct cacheentry *entry = NULL;
-            if (entryp) {
-                entry = *entryp;
-            }
-
-            if (entry && err == 0) {
-                // Promote to MRU.
+                // Move to front of LRU list (MRU).
                 promoteentry(&this->head, &this->tail, entry);
+
                 if (iswrite) {
                     NLib::memcpy(entry->data + off, buffer, len);
                     entry->dirty = true;
@@ -144,10 +110,30 @@ namespace NDev {
                 }
                 this->cachelock.release();
                 return 0;
-            } else {
-                this->cachelock.release();
-                return err; // Failed to load entry.
             }
+
+            struct inflight **infp = this->inflightmap.find(lba);
+            if (infp) { // If another thread is already handling this LBA.
+                struct inflight *inf = *infp;
+                inf->refcount++;
+
+                // Wait until our inflight load is done.
+                // Since most wake() calls happen while holding the cache lock on the owner thread, we will likely end up spinning until the lock is released.
+                waiteventlocked(&inf->wq, inf->done, &this->cachelock);
+
+                int err = inf->error;
+                inf->refcount--;
+                if (inf->refcount == 0) {
+                    delete inf; // No more waiters, safe to delete.
+                }
+
+                if (err) {
+                    this->cachelock.release();
+                    return err;
+                }
+                continue; // Retry lookup
+            }
+            break;
         }
 
         struct inflight *newinf = new struct inflight;
@@ -322,8 +308,10 @@ namespace NDev {
             this->cachelock.acquire();
             if (res == 0) {
                 struct cacheentry **entryp = this->cachemap.find(lba);
-                if (NLib::memcmp(scratch, (*entryp)->data, this->blocksize) == 0) {
-                    (*entryp)->dirty = false;
+                if (entryp && *entryp) {
+                    if (NLib::memcmp(scratch, (*entryp)->data, this->blocksize) == 0) {
+                        (*entryp)->dirty = false;
+                    }
                 }
             } else {
                 NUtil::printf("[dev/blockcache]: Failed to write back block %llu during flush (err=%d).\n", lba, (int)res);
@@ -359,11 +347,22 @@ namespace NDev {
             this->cachemap.remove(victim->lba);
 
             ssize_t res = 0;
+            struct inflight *inf = NULL;
             if (victim->dirty) {
+                inf = new struct inflight;
+                if (inf) {
+                    inf->done = false;
+                    inf->refcount = 0;
+                    inf->error = 0;
+                    inf->entry = NULL;
+                    this->inflightmap.insert(victim->lba, inf);
+                }
+
                 this->cachelock.release();
                 res = this->dev->writeblock(victim->lba, victim->data); // Make sure to write back if dirty, so we aren't discarding our changes.
                 this->cachelock.acquire();
             }
+
             if (res < 0) { // If we failed to write back, we should stop eviction here.
                 NUtil::printf("[dev/blockcache]: Failed to write back dirty block %llu during eviction.\n", victim->lba);
                 if (!this->cachemap.find(victim->lba)) { // If victim not already re-inserted.
@@ -382,7 +381,25 @@ namespace NDev {
                     delete[] victim->data;
                     delete victim;
                 }
+
+                if (inf) {
+                    inf->done = true;
+                    this->inflightmap.remove(victim->lba);
+                    inf->wq.wake();
+                    if (inf->refcount == 0) {
+                        delete inf;
+                    }
+                }
                 break; // Stop eviction on failure to write back.
+            }
+
+            if (inf) {
+                inf->done = true;
+                this->inflightmap.remove(victim->lba);
+                inf->wq.wake();
+                if (inf->refcount == 0) {
+                    delete inf;
+                }
             }
 
             delete[] victim->data;
