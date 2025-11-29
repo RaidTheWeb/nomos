@@ -49,7 +49,8 @@ namespace NDev {
             }
 
             ssize_t writeblock(uint64_t lba, const void *buffer) override {
-                return -1;
+                size_t blksize = ns->blksize;
+                return ((NVMEDriver *)driver)->iorequest(ctrl, ns->nsnum + 1, IOWRITE, ns->nsid, lba, 1, (void *)buffer, blksize);
             }
     };
 }

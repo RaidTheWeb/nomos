@@ -16,7 +16,7 @@ namespace NArch {
     }
 
     static inline void outl(uint16_t port, uint32_t val) {
-        asm volatile("outl %l0, %w1" : /* no outputs */ : "a"(val), "Nd"(port) : "memory");
+        asm volatile("outl %0, %w1" : /* no outputs */ : "a"(val), "Nd"(port) : "memory");
     }
 
     static inline uint8_t inb(uint16_t port) {
@@ -26,14 +26,14 @@ namespace NArch {
     }
 
     static inline uint16_t inw(uint16_t port) {
-        uint8_t ret = 0;
+        uint16_t ret = 0;
         asm volatile("inw %w1, %w0" : "=a"(ret) : "Nd"(port) : "memory");
         return ret;
     }
 
     static inline uint32_t inl(uint16_t port) {
-        uint8_t ret = 0;
-        asm volatile("inl %l1, %w0" : "=a"(ret) : "Nd"(port) : "memory");
+        uint32_t ret = 0;
+        asm volatile("inl %w1, %0" : "=a"(ret) : "Nd"(port) : "memory");
         return ret;
     }
 }

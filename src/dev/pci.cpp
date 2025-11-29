@@ -4,6 +4,7 @@
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/vmm.hpp>
+#include <arch/x86_64/io.hpp>
 #endif
 
 #include <dev/dev.hpp>
@@ -393,37 +394,66 @@ namespace NDev {
 
             uint32_t baselo = read(dev, baroff, 4);
 
-            // Acquire size by writing ~0 to the register, then reading.
-            write(dev, baroff, ~0, 4);
-            uint32_t sizelo = read(dev, baroff, 4);
+            // Determine whether this is MMIO or IO, and whether it's a 64-bit BAR.
+            bool is_mmio = !(baselo & 0x1);
+            int type = (baselo >> 1) & 0x3; // for MMIO: 0=32-bit, 2=64-bit
 
-            write(dev, baroff, baselo, 4); // Write original value of base to register (restore).
+            uint64_t bar_size = 0;
+            uint32_t size_lo = 0;
+            uint32_t size_hi = 0;
 
-            if (!(baselo & (1 << 0))) { // If the first bit is zero, this is an MMIO bar.
+            if (is_mmio && type == 2) {
+                // 64-bit MMIO BAR: save original high dword, probe size by writing all-ones to both dwords
+                uint32_t basehi = read(dev, baroff + 4, 4);
+
+                // Write all-ones to both low and high parts to probe size
+                write(dev, baroff, ~0u, 4);
+                write(dev, baroff + 4, ~0u, 4);
+
+                size_lo = read(dev, baroff, 4);
+                size_hi = read(dev, baroff + 4, 4);
+
+                // Restore original base values
+                write(dev, baroff, baselo, 4);
+                write(dev, baroff + 4, basehi, 4);
+
+                uint64_t combined = ((uint64_t)size_hi << 32) | (uint64_t)size_lo;
+                bar_size = (~(combined & ~0xFULL)) + 1; // mask lower type bits then invert
+
                 bar.mmio = true;
+                // Construct the 64-bit base from saved parts
+                bar.base = (baselo & 0xfffffff0) | ((uint64_t)basehi << 32);
+            } else {
+                // 32-bit MMIO or IO BARs
+                // Acquire size by writing ~0 to the register, then reading.
+                write(dev, baroff, ~0u, 4);
+                size_lo = read(dev, baroff, 4);
 
-                int type = (baselo >> 1) & 0x3;
+                write(dev, baroff, baselo, 4); // Restore original value
 
-                bar.base = baselo & 0xfffffff0;
-                if (type == 2) { // Type 2 is 64-bit, this means we should combine with the next BAR.
-                    uint32_t basehi = read(dev, baroff + 4, 4);
-                    bar.base |= ((uint64_t)basehi << 32);
+                if (is_mmio) {
+                    bar.mmio = true;
+                    bar.base = baselo & 0xfffffff0;
+                    bar_size = (~(size_lo & ~0xFULL)) + 1;
+                } else {
+                    // IO BAR
+                    bar.base = baselo & ~0x3;
+                    bar_size = (~(size_lo & ~0x3)) + 1;
                 }
+            }
 
-
-                bar.len = ~(sizelo & ~0b1111) + 1;
+            // If MMIO, map the physical BAR into kernel virtual space and return virtual base.
+            if (bar.mmio) {
+                size_t len = (size_t)bar_size;
                 NArch::VMM::kspace.lock.acquire();
-                uintptr_t virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(bar.len, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
-                assert(NArch::VMM::_maprange(
-                    &NArch::VMM::kspace, virt, bar.base,
-                    NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, bar.len)
-                , "Failed to map PCI MMIO space.\n");
+                uintptr_t virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(len, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
+                assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, bar.base, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, len), "Failed to map PCI MMIO space.\n");
                 NArch::VMM::kspace.lock.release();
 
+                bar.len = len;
                 bar.base = virt; // Update BAR with virtual mapped address.
-            } else { // First bit is one, this is an I/O bar.
-                bar.base = baselo & ~0b11; // Remove first two bits (marker and reserved).
-                bar.len = ~(sizelo & ~0b11) + 1; // And add one, for actual size.
+            } else {
+                bar.len = (size_t)bar_size;
             }
 
             return bar;
@@ -494,6 +524,27 @@ namespace NDev {
                     it.next();
                 }
             }
+            // Fall back to legacy PCI config access through I/O ports (0xCF8/0xCFC)
+            {
+                uint32_t addr = 0x80000000u |
+                    ((uint32_t)dev->info.pci.bus << 16) |
+                    ((uint32_t)dev->info.pci.slot << 11) |
+                    ((uint32_t)dev->info.pci.func << 8) |
+                    (off & 0xfc);
+
+                NArch::outl(0xcf8, addr);
+
+                uint16_t port = 0xcfc + (off & 0x3);
+                switch (size) {
+                    case 1:
+                        return NArch::inb(port);
+                    case 2:
+                        return NArch::inw(port);
+                    case 4:
+                        return NArch::inl(port);
+                }
+            }
+
             return 0;
         }
 
@@ -528,6 +579,29 @@ namespace NDev {
                     }
 
                     it.next();
+                }
+            }
+            // Legacy PCI config access via IO ports
+            {
+                uint32_t addr = 0x80000000u |
+                    ((uint32_t)dev->info.pci.bus << 16) |
+                    ((uint32_t)dev->info.pci.slot << 11) |
+                    ((uint32_t)dev->info.pci.func << 8) |
+                    (off & 0xfc);
+
+                NArch::outl(0xcf8, addr);
+
+                uint16_t port = 0xcfc + (off & 0x3);
+                switch (size) {
+                    case 1:
+                        NArch::outb(port, (uint8_t)val);
+                        break;
+                    case 2:
+                        NArch::outw(port, (uint16_t)val);
+                        break;
+                    case 4:
+                        NArch::outl(port, (uint32_t)val);
+                        break;
                 }
             }
         }

@@ -8,6 +8,7 @@
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 #include <sched/sched.hpp>
+#include <sys/syscall.hpp>
 
 namespace NSched {
     using namespace NArch;
@@ -912,7 +913,7 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_fork(void) {
-        NUtil::printf("sys_fork().\n");
+        SYSCALL_LOG("sys_fork().\n");
 
         Process *current = NArch::CPU::get()->currthread->process;
 
@@ -972,7 +973,7 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_setsid(void) {
-        NUtil::printf("sys_setsid().\n");
+        SYSCALL_LOG("sys_setsid().\n");
 
         Process *current = NArch::CPU::get()->currthread->process;
         NLib::ScopeSpinlock guard(&current->lock);
@@ -1007,7 +1008,7 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_setpgid(int pid, int pgid) {
-        NUtil::printf("sys_setpgid(%d, %d).\n", pid, pgid);
+        SYSCALL_LOG("sys_setpgid(%d, %d).\n", pid, pgid);
 
         if (pgid < 0) {
             return -EINVAL;
@@ -1085,7 +1086,7 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_getpgid(int pid) {
-        NUtil::printf("sys_getpgid(%d).\n", pid);
+        SYSCALL_LOG("sys_getpgid(%d).\n", pid);
 
         NLib::ScopeSpinlock guard(&pidtablelock);
 
@@ -1105,17 +1106,17 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_gettid(void) {
-        NUtil::printf("sys_gettid().\n");
+        SYSCALL_LOG("sys_gettid().\n");
         return CPU::get()->currthread->id;
     }
 
     extern "C" uint64_t sys_getpid(void) {
-        NUtil::printf("sys_getpid().\n");
+        SYSCALL_LOG("sys_getpid().\n");
         return CPU::get()->currthread->process->id;
     }
 
     extern "C" uint64_t sys_getppid(void) {
-        NUtil::printf("sys_getppid().\n");
+        SYSCALL_LOG("sys_getppid().\n");
         if (CPU::get()->currthread->process->parent) {
             return CPU::get()->currthread->process->parent->id;
         }
@@ -1139,7 +1140,7 @@ namespace NSched {
     }
 
     extern "C" uint64_t sys_exit(int status) {
-        NUtil::printf("sys_exit(%d).\n", status);
+        SYSCALL_LOG("sys_exit(%d).\n", status);
         exit(); // Exit.
         return 0;
     }

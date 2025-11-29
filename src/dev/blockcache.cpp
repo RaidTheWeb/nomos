@@ -91,7 +91,7 @@ namespace NDev {
         }
     }
 
-    int BlockCache::readwrite(uint64_t lba, void *buffer, bool iswrite) {
+    int BlockCache::readwrite(uint64_t lba, void *buffer, size_t off, size_t len, bool iswrite) {
         this->cachelock.acquire();
 
         struct cacheentry **hit = this->cachemap.find(lba);
@@ -102,10 +102,10 @@ namespace NDev {
             promoteentry(&this->head, &this->tail, entry);
 
             if (iswrite) {
-                NLib::memcpy(entry->data, buffer, this->blocksize);
+                NLib::memcpy(entry->data + off, buffer, len);
                 entry->dirty = true;
             } else {
-                NLib::memcpy(buffer, (*hit)->data, this->blocksize);
+                NLib::memcpy(buffer, (*hit)->data + off, len);
             }
             this->cachelock.release();
             return 0;
@@ -137,10 +137,10 @@ namespace NDev {
                 // Promote to MRU.
                 promoteentry(&this->head, &this->tail, entry);
                 if (iswrite) {
-                    NLib::memcpy(entry->data, buffer, this->blocksize);
+                    NLib::memcpy(entry->data + off, buffer, len);
                     entry->dirty = true;
                 } else {
-                    NLib::memcpy(buffer, entry->data, this->blocksize);
+                    NLib::memcpy(buffer, entry->data + off, len);
                 }
                 this->cachelock.release();
                 return 0;
@@ -233,10 +233,10 @@ namespace NDev {
             promoteentry(&this->head, &this->tail, entry);
 
             if (iswrite) {
-                NLib::memcpy(entry->data, buffer, this->blocksize);
+                NLib::memcpy(entry->data + off, buffer, len);
                 entry->dirty = true;
             } else {
-                NLib::memcpy(buffer, entry->data, this->blocksize);
+                NLib::memcpy(buffer, entry->data + off, len);
             }
 
             newinf->wq.wake(); // Wake up waiters.
@@ -254,10 +254,10 @@ namespace NDev {
         newentry->dirty = false;
 
         if (iswrite) {
-            NLib::memcpy(newentry->data, buffer, this->blocksize);
+            NLib::memcpy(newentry->data + off, buffer, len);
             newentry->dirty = true;
         } else {
-            NLib::memcpy(buffer, newentry->data, this->blocksize);
+            NLib::memcpy(buffer, newentry->data + off, len);
         }
 
         // Insert at front of LRU list (MRU).
@@ -287,12 +287,12 @@ namespace NDev {
         return 0;
     }
 
-    int BlockCache::read(uint64_t lba, void *buffer) {
-        return this->readwrite(lba, buffer, false);
+    int BlockCache::read(uint64_t lba, void *buffer, size_t off, size_t len) {
+        return this->readwrite(lba, buffer, off, len, false);
     }
 
-    int BlockCache::write(uint64_t lba, const void *buffer) {
-        return this->readwrite(lba, (void *)buffer, true);
+    int BlockCache::write(uint64_t lba, const void *buffer, size_t off, size_t len) {
+        return this->readwrite(lba, (void *)buffer, off, len, true);
     }
 
     void BlockCache::flush(void) {

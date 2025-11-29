@@ -4,6 +4,7 @@
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
 #include <mm/ucopy.hpp>
+#include <sys/syscall.hpp>
 
 namespace NFS {
     namespace VFS {
@@ -442,7 +443,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_openat(int dirfd, const char *path, int flags, unsigned int mode) {
-            NUtil::printf("sys_openat(%d, %s, %d, %u).\n", dirfd, path, flags, mode);
+            SYSCALL_LOG("sys_openat(%d, %s, %d, %u).\n", dirfd, path, flags, mode);
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, 1024); // XXX: Maximum path length.
             if (pathsize < 0) {
@@ -544,7 +545,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_dup(int fd, int flags) {
-            NUtil::printf("sys_dup(%d, %d).\n", fd, flags);
+            SYSCALL_LOG("sys_dup(%d, %d).\n", fd, flags);
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
@@ -552,7 +553,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_dup2(int fd, int flags, int newfd) {
-            NUtil::printf("sys_dup2(%d, %d, %d).\n", fd, flags, newfd);
+            SYSCALL_LOG("sys_dup2(%d, %d, %d).\n", fd, flags, newfd);
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
@@ -560,7 +561,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_close(int fd) {
-            NUtil::printf("sys_close(%d).\n", fd);
+            SYSCALL_LOG("sys_close(%d).\n", fd);
 
             if (fd < 0) {
                 return -EBADF;
@@ -593,7 +594,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_read(int fd, void *buf, size_t count) {
-            NUtil::printf("sys_read(%d, %p, %lu).\n", fd, buf, count);
+            SYSCALL_LOG("sys_read(%d, %p, %lu).\n", fd, buf, count);
             if (fd < 0) {
                 return -EBADF;
             }
@@ -647,7 +648,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_write(int fd, const void *buf, size_t count) {
-            NUtil::printf("sys_write(%d, %p, %lu).\n", fd, buf, count);
+            SYSCALL_LOG("sys_write(%d, %p, %lu).\n", fd, buf, count);
 
             if (fd < 0) {
                 return -EBADF;
@@ -700,7 +701,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_ioctl(int fd, unsigned long request, uint64_t arg) {
-            NUtil::printf("sys_ioctl(%d, %lu, %p).\n", fd, request, arg);
+            SYSCALL_LOG("sys_ioctl(%d, %lu, %p).\n", fd, request, arg);
 
             if (fd < 0) {
                 return -EBADF;
@@ -736,7 +737,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_seek(int fd, off_t off, int whence) {
-            NUtil::printf("sys_seek(%d, %ld, %d).\n", fd, off, whence);
+            SYSCALL_LOG("sys_seek(%d, %ld, %d).\n", fd, off, whence);
 
             if (fd < 0) {
                 return -EBADF;

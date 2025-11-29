@@ -11,7 +11,6 @@ namespace NDev {
 
     ssize_t NVMEDriver::read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) {
         uint32_t major = DEVFS::major(dev);
-        NUtil::printf("Hello!.\n");
 
         if (major == NSBLKMAJOR) {
 
@@ -28,11 +27,18 @@ namespace NDev {
     }
 
     ssize_t NVMEDriver::write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) {
-        (void)dev;
-        (void)buf;
-        (void)count;
-        (void)offset;
-        (void)fdflags;
+        uint32_t major = DEVFS::major(dev);
+
+        if (major == NSBLKMAJOR) {
+
+            // Find the block device.
+            NVMEBlockDevice *blkdev = (NVMEBlockDevice *)registry->get(dev);
+
+            if (blkdev) {
+                return blkdev->writebytes(buf, count, offset, fdflags);
+            }
+            return -ENODEV;
+        }
         return 0;
     }
 

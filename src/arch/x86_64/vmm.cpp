@@ -7,6 +7,7 @@
 #include <lib/assert.hpp>
 #include <lib/errno.hpp>
 #include <lib/string.hpp>
+#include <sys/syscall.hpp>
 #include <util/kprint.hpp>
 
 extern void *_text_start;
@@ -473,7 +474,7 @@ namespace NArch {
         }
 
         extern "C" uint64_t sys_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t off) {
-            NUtil::printf("sys_mmap(%p, %lu, %u, %u, %d, %lu).\n", hint, size, prot, flags, fd, off);
+            SYSCALL_LOG("sys_mmap(%p, %lu, %u, %u, %d, %lu).\n", hint, size, prot, flags, fd, off);
 
             if (!size || (off % PAGESIZE)) {
                 return -EINVAL;
@@ -516,13 +517,13 @@ namespace NArch {
         }
 
         extern "C" uint64_t sys_munmap(void *ptr, size_t size) {
-            NUtil::printf("sys_munmap(%p, %lu).\n", ptr, size);
+            SYSCALL_LOG("sys_munmap(%p, %lu).\n", ptr, size);
             assert(false, "Unimplemented system call.\n");
             return 0;
         }
 
         extern "C" uint64_t sys_mprotect(void *ptr, size_t size, int prot) {
-            NUtil::printf("sys_mprotect(%p, %lu, %d).\n", ptr, size, prot);
+            SYSCALL_LOG("sys_mprotect(%p, %lu, %d).\n", ptr, size, prot);
             assert(false, "Unimplemented system call.\n");
             return 0;
         }
