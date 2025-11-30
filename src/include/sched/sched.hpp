@@ -84,6 +84,7 @@ namespace NSched {
 
             void rotateleft(struct node *node);
             void rotateright(struct node *node);
+            void transplant(struct node *u, struct node *v);
         public:
             RBTree(void) { };
 

@@ -14,100 +14,88 @@ namespace NSched {
     using namespace NArch;
 
     void RBTree::_insert(struct node *node, int (*cmp)(struct node *, struct node *)) {
+        struct node *y = NULL;
+        struct node *x = this->root;
 
-        struct node **newnode = &this->root;
-        struct node *parent = NULL;
-
-        while (*newnode) { // Breaks when we reach a undefined path (we can put our node here!).
-            parent = *newnode;
-            newnode = cmp(node, parent) < 0 ? &parent->left : &parent->right; // Use comparison function to determine what path we should be traversing.
+        while (x != NULL) {
+            y = x;
+            if (cmp(node, x) < 0) {
+                x = x->left;
+            } else {
+                x = x->right;
+            }
         }
 
-        node->packparent(parent);
-        *newnode = node;
+        node->packparent(y);
+        if (y == NULL) {
+            this->root = node;
+        } else if (cmp(node, y) < 0) {
+            y->left = node;
+        } else {
+            y->right = node;
+        }
+
         node->left = NULL;
         node->right = NULL;
         node->packcolour(colour::RED);
 
-        if (parent) {
-            if (!parent->getparent()) {
-                this->rebalance(node);
-            }
-        } else {
-            node->packcolour(colour::BLACK);
-        }
+        this->rebalance(node);
 
-        // Increment cached count.
         __atomic_add_fetch(&this->nodecount, 1, memory_order_seq_cst);
     }
 
-    void RBTree::_erase(struct node *node) {
-        struct node *child = NULL;
-        struct node *parent = NULL;
+    void RBTree::_erase(struct node *z) {
+        struct node *y = z;
+        struct node *x = NULL;
+        struct node *x_parent = NULL;
+        enum colour y_original_colour = y->getcolour();
 
-        enum colour colour;
-
-        if (!node->left) {
-            child = node->right;
-        } else if (!node->right) {
-            child = node->left;
+        if (z->left == NULL) {
+            x = z->right;
+            this->transplant(z, z->right);
+            x_parent = z->getparent();
+        } else if (z->right == NULL) {
+            x = z->left;
+            this->transplant(z, z->left);
+            x_parent = z->getparent();
         } else {
-            struct node *successor = this->_next(node);
-            colour = successor->getcolour();
+            y = this->_next(z);
+            y_original_colour = y->getcolour();
+            x = y->right;
 
-            child = successor->right;
-            parent = successor->getparent();
-
-            if (child) {
-                child->packparent(parent);
-            }
-
-            // Link to right.
-            if (parent != node) {
-                parent->left = child;
-                successor->right = node->right;
-                node->right->packparent(successor);
-            }
-
-            // Replace node.
-            successor->parent = node->parent;
-            successor->left = node->left;
-            node->left->packparent(successor);
-            successor->packcolour(node->getcolour()); // Preserve original colour.
-
-            if (node == this->root) { // If the successor is the root.
-                this->root = successor;
+            if (y->getparent() == z) {
+                x_parent = y;
             } else {
-                *(node == node->getparent()->left ? &node->getparent()->left : &node->getparent()->right) = successor;
+                x_parent = y->getparent();
+                this->transplant(y, y->right);
+                y->right = z->right;
+                if (y->right) y->right->packparent(y);
             }
 
-            if (colour == colour::BLACK) {
-                this->reerase(child, parent);
-            }
-
-            // Decrement cached count.
-            __atomic_sub_fetch(&this->nodecount, 1, memory_order_seq_cst);
-            return;
+            this->transplant(z, y);
+            y->left = z->left;
+            y->left->packparent(y);
+            y->packcolour(z->getcolour());
         }
 
-        parent = node->getparent();
-        colour = node->getcolour();
-        if (child) {
-            child->packparent(parent);
+        if (y_original_colour == colour::BLACK) {
+            this->reerase(x, x_parent);
         }
 
-        if (parent) {
-            *(node == parent->left ? &parent->left : &parent->right) = child;
-        } else {
-            this->root = child;
-        }
-
-        if (colour == colour::BLACK) {
-            this->reerase(child, parent);
-        }
-
-        // Decrement cached count.
         __atomic_sub_fetch(&this->nodecount, 1, memory_order_seq_cst);
+    }
+
+    void RBTree::transplant(struct node *u, struct node *v) {
+        if (u->getparent() == NULL) {
+            this->root = v;
+        } else if (u == u->getparent()->left) {
+            u->getparent()->left = v;
+        } else {
+            u->getparent()->right = v;
+        }
+        if (v != NULL) {
+            v->packparent(u->getparent());
+        }
     }
 
     void RBTree::rotateleft(struct node *x) {
@@ -208,7 +196,7 @@ namespace NSched {
         if (node->left) {
             struct node *n = node->left;
             while (n->right) {
-                n = node->right;
+                n = n->right;
             }
             return n;
         }
@@ -221,127 +209,103 @@ namespace NSched {
         return parent;
     }
 
-    void RBTree::rebalance(struct node *node) {
-
-        while (node != this->root && node->getparent()->getcolour() == colour::RED) {
-            struct node *gparent = node->getparent()->getparent();
-            if (node->getparent() == gparent->left) { // Left case.
-                struct node *uncle = gparent->right;
-
-                if (uncle->getcolour() == colour::RED) { // RED->RED
-                    node->getparent()->packcolour(colour::BLACK);
-                    node->packcolour(colour::BLACK);
-                    gparent->packcolour(colour::RED);
-                    node = gparent;
+    void RBTree::rebalance(struct node *z) {
+        while (z->getparent() && z->getparent()->getcolour() == colour::RED) {
+            if (z->getparent() == z->getparent()->getparent()->left) {
+                struct node *y = z->getparent()->getparent()->right;
+                if (y && y->getcolour() == colour::RED) {
+                    z->getparent()->packcolour(colour::BLACK);
+                    y->packcolour(colour::BLACK);
+                    z->getparent()->getparent()->packcolour(colour::RED);
+                    z = z->getparent()->getparent();
                 } else {
-                    if (node == node->getparent()->right) {
-                        node = node->getparent();
-                        this->rotateleft(node);
+                    if (z == z->getparent()->right) {
+                        z = z->getparent();
+                        this->rotateleft(z);
                     }
-                    node->getparent()->packcolour(colour::BLACK);
-                    gparent->packcolour(colour::RED);
-                    this->rotateright(gparent);
+                    z->getparent()->packcolour(colour::BLACK);
+                    z->getparent()->getparent()->packcolour(colour::RED);
+                    this->rotateright(z->getparent()->getparent());
                 }
-            } else { // Right case.
-                struct node *uncle = gparent->left;
-
-                if (uncle->getcolour() == colour::RED) { // RED->RED
-                    node->getparent()->packcolour(colour::BLACK);
-                    node->packcolour(colour::BLACK);
-                    gparent->packcolour(colour::RED);
-                    node = gparent;
+            } else {
+                struct node *y = z->getparent()->getparent()->left;
+                if (y && y->getcolour() == colour::RED) {
+                    z->getparent()->packcolour(colour::BLACK);
+                    y->packcolour(colour::BLACK);
+                    z->getparent()->getparent()->packcolour(colour::RED);
+                    z = z->getparent()->getparent();
                 } else {
-                    if (node == node->getparent()->left) {
-                        node = node->getparent();
-                        this->rotateright(node);
+                    if (z == z->getparent()->left) {
+                        z = z->getparent();
+                        this->rotateright(z);
                     }
-                    node->getparent()->packcolour(colour::BLACK);
-                    gparent->packcolour(colour::RED);
-                    this->rotateleft(gparent);
+                    z->getparent()->packcolour(colour::BLACK);
+                    z->getparent()->getparent()->packcolour(colour::RED);
+                    this->rotateleft(z->getparent()->getparent());
                 }
             }
         }
-
         this->root->packcolour(colour::BLACK);
     }
 
-    void RBTree::reerase(struct node *child, struct node *parent) {
-        while (child != this->root && (!child || child->getcolour() == colour::BLACK)) {
-            if (!parent) {
-                break;
-            }
-
-            bool isleft = child == parent->left;
-            struct node *sibling = isleft ? parent->right : parent->left;
-            if (!sibling) {
-                break;
-            }
-
-            // Sibling is red.
-            if (sibling->getcolour() == colour::RED) {
-                sibling->packcolour(colour::BLACK);
-                parent->packcolour(colour::RED);
-                isleft ? this->rotateleft(parent) : this->rotateright(parent);
-                sibling = isleft ? parent->right : parent->left;
-                if (!sibling) {
-                    break;
+    void RBTree::reerase(struct node *x, struct node *x_parent) {
+        struct node *w;
+        while (x != this->root && (x == NULL || x->getcolour() == colour::BLACK)) {
+            if (x == x_parent->left) {
+                w = x_parent->right;
+                if (w->getcolour() == colour::RED) {
+                    w->packcolour(colour::BLACK);
+                    x_parent->packcolour(colour::RED);
+                    this->rotateleft(x_parent);
+                    w = x_parent->right;
                 }
-            }
-
-            // Sibling and nephews are black.
-            if ((!sibling->left || sibling->left->getcolour() == colour::BLACK) &&
-                (!sibling->right || sibling->right->getcolour() == colour::BLACK)) {
-
-                sibling->packcolour(colour::RED);
-                child = parent;
-                parent = child->getparent();
-                continue;
-            }
-
-            if (isleft) {
-                // Outer nephew is black.
-                if (!sibling->right || sibling->right->getcolour() == colour::BLACK) {
-
-                    if (sibling->left) {
-                        sibling->left->packcolour(colour::BLACK);
+                if ((w->left == NULL || w->left->getcolour() == colour::BLACK) &&
+                    (w->right == NULL || w->right->getcolour() == colour::BLACK)) {
+                    w->packcolour(colour::RED);
+                    x = x_parent;
+                    x_parent = x->getparent();
+                } else {
+                    if (w->right == NULL || w->right->getcolour() == colour::BLACK) {
+                        if (w->left) w->left->packcolour(colour::BLACK);
+                        w->packcolour(colour::RED);
+                        this->rotateright(w);
+                        w = x_parent->right;
                     }
-                    sibling->packcolour(colour::RED);
-                    this->rotateright(sibling);
-                    sibling = parent->right;
+                    w->packcolour(x_parent->getcolour());
+                    x_parent->packcolour(colour::BLACK);
+                    if (w->right) w->right->packcolour(colour::BLACK);
+                    this->rotateleft(x_parent);
+                    x = this->root;
                 }
             } else {
-                // Outer nephew is black.
-                if (!sibling->left || sibling->left->getcolour() == colour::BLACK) {
-
-                    if (sibling->right) {
-                        sibling->right->packcolour(colour::BLACK);
+                w = x_parent->left;
+                if (w->getcolour() == colour::RED) {
+                    w->packcolour(colour::BLACK);
+                    x_parent->packcolour(colour::RED);
+                    this->rotateright(x_parent);
+                    w = x_parent->left;
+                }
+                if ((w->right == NULL || w->right->getcolour() == colour::BLACK) &&
+                    (w->left == NULL || w->left->getcolour() == colour::BLACK)) {
+                    w->packcolour(colour::RED);
+                    x = x_parent;
+                    x_parent = x->getparent();
+                } else {
+                    if (w->left == NULL || w->left->getcolour() == colour::BLACK) {
+                        if (w->right) w->right->packcolour(colour::BLACK);
+                        w->packcolour(colour::RED);
+                        this->rotateleft(w);
+                        w = x_parent->left;
                     }
-                    sibling->packcolour(colour::RED);
-                    this->rotateleft(sibling);
-                    sibling = parent->left;
+                    w->packcolour(x_parent->getcolour());
+                    x_parent->packcolour(colour::BLACK);
+                    if (w->left) w->left->packcolour(colour::BLACK);
+                    this->rotateright(x_parent);
+                    x = this->root;
                 }
             }
-
-            // Final rebalance.
-            if (sibling) {
-                sibling->packcolour(parent->getcolour());
-                parent->packcolour(colour::BLACK);
-
-                if (isleft && sibling->right) {
-                    sibling->right->packcolour(colour::BLACK);
-                } else if (!isleft && sibling->left) {
-                    sibling->left->packcolour(colour::BLACK);
-                }
-
-                isleft ? this->rotateleft(parent) : this->rotateright(parent);
-            }
-            child = this->root;
-            break;
         }
-
-        if (child) {
-            child->packcolour(colour::BLACK);
-        }
+        if (x) x->packcolour(colour::BLACK);
     }
 
     size_t RBTree::count(void) {
