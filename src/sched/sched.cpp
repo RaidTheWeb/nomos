@@ -9,6 +9,7 @@
 #include <mm/slab.hpp>
 #include <sched/sched.hpp>
 #include <sys/syscall.hpp>
+#include <sys/timer.hpp>
 
 namespace NSched {
     using namespace NArch;
@@ -442,7 +443,9 @@ namespace NSched {
             return NULL; // We're done here, there's nothing we can do.
         }
 
-        busiest->runqueue.lock.acquire(); // We have multiple things we want to be doing, and don't want any race conditions during our work.
+        if (!busiest->runqueue.lock.trylock()) {
+            return NULL; // Failed to acquire lock, abort steal to prevent deadlock.
+        }
         struct RBTree::node *node = busiest->runqueue._last(); // Grab node with highest runtime (least deserving of being run), and incur migration penalty.
         if (!node) {
             busiest->runqueue.lock.release();
@@ -507,13 +510,18 @@ namespace NSched {
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
 
-        APIC::lapicstop(); // Prevent double schedule by stopping any running timer.
-
         struct CPU::cpulocal *cpu = CPU::get(); // Get an easy local reference to our current CPU.
 
         assert(cpu, "Failed to acquire current CPU.\n");
 
         cpu->setint(false); // Disable interrupts, we don't want our scheduling work to be interrupted.
+
+        // Clean up zombies.
+        while (cpu->zombies) {
+            Thread *zombie = cpu->zombies;
+            cpu->zombies = zombie->nextzombie;
+            delete zombie;
+        }
 
         size_t curintr = __atomic_add_fetch(&cpu->schedintr, 1, memory_order_seq_cst); // Increment the number of times this interrupt has been called.
 
@@ -578,10 +586,11 @@ namespace NSched {
         if (prev != next) { // We need to context switch.
             bool needswap = prev->process->addrspace != next->process->addrspace;
             if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::DEAD) {
-                delete prev; // Destroy old thread. XXX: Defer?
+                prev->nextzombie = cpu->zombies;
+                cpu->zombies = prev;
             }
 
-            APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
+            cpu->quantum_left = QUANTUMMS;
 
             switchthread(next, needswap); // Swap to context.
         }
@@ -592,7 +601,7 @@ namespace NSched {
         // It'd be a waste to attempt to context switch when we're working on the same code.
 
         cpu->setint(true); // Although it'll be re-enabled during the context switch, we may have lost track of the interrupt state here. So, we should explicitly reenable it before rescheduling.
-        APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
+        cpu->quantum_left = QUANTUMMS;
 
         // If it's the same thread, we'll just be dumped right back to where we are.
     }
@@ -684,14 +693,31 @@ namespace NSched {
     }
 
     void yield(void) {
-        APIC::lapicstop(); // Stop currently running timer.
-
         CPU::get()->setint(true);
 
         // Artificially induce a schedule interrupt, using a "loopback" IPI.
         APIC::sendipi(CPU::get()->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
 
         // At this point, we've either been rescheduled (if we were running) or marked dead.
+    }
+
+    // Timer callback for sleep().
+    static void sleepwork(void *arg) {
+        Thread *thread = (Thread *)arg;
+        schedulethread(thread);
+    }
+
+    void sleep(uint64_t ms) {
+        Thread *current = CPU::get()->currthread;
+        NSys::Timer::timerlock();
+        NArch::CPU::get()->setint(false); // Disable interrupts to prevent preemption during this critical section.
+
+        __atomic_store_n(&current->tstate, Thread::state::WAITING, memory_order_release);
+        NSys::Timer::create(sleepwork, current, ms); // XXX: Figure out how to ENSURE we don't get preempted before the yield().
+
+        NSys::Timer::timerunlock();
+        NArch::CPU::get()->setint(true); // Re-enable interrupts.
+        yield();
     }
 
     void Mutex::acquire(void) {
@@ -862,7 +888,7 @@ namespace NSched {
     void await(void) {
         CPU::get()->setint(false);
 
-        APIC::lapiconeshot(QUANTUMMS * 1000, 0xfe);
+        CPU::get()->quantum_left = QUANTUMMS;
 
         CPU::get()->setint(true);
 

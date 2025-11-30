@@ -42,13 +42,6 @@ namespace NDev {
                 this->cache = new BlockCache(this, 2, ns->blksize); // 64MB cache.
             }
 
-            NVMEBlockDevice(uint64_t id, NVMEDriver *driver, struct nvmectrl *ctrl, struct nvmens *ns, uint64_t startlba, uint64_t lastlba) : BlockDevice(id, driver, startlba, lastlba) {
-                this->ctrl = ctrl;
-                this->ns = ns;
-                this->blksize = ns->blksize;
-                this->cache = new BlockCache(this, 2, ns->blksize); // 64MB cache.
-            }
-
             ~NVMEBlockDevice();
 
             ssize_t readblock(uint64_t lba, void *buffer) override {

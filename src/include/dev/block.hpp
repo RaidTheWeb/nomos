@@ -55,21 +55,13 @@ namespace NDev {
     };
 
     class BlockDevice : public Device {
-        protected:
-            BlockCache *cache = NULL;
         public:
             size_t blksize = 512;
-            bool ispart = false;
             uint64_t startlba = 0;
             uint64_t lastlba = 0;
+            BlockCache *cache = NULL;
 
             BlockDevice(uint64_t id, DevDriver *driver) : Device(id, driver) { }
-            BlockDevice(uint64_t id, DevDriver *driver, uint64_t startlba, uint64_t lastlba) : Device(id, driver) {
-                // Adds additional offset for partition.
-                this->ispart = true;
-                this->startlba = startlba;
-                this->lastlba = lastlba;
-            }
             ~BlockDevice() = default;
 
             // Read block-wise from device. Must be implemented by driver.
@@ -81,6 +73,27 @@ namespace NDev {
             virtual ssize_t readbytes(void *buf, size_t count, off_t offset, int fdflags);
             // Write raw bytes to block device, goes through cache.
             virtual ssize_t writebytes(const void *buf, size_t count, off_t offset, int fdflags);
+    };
+
+    class PartitionBlockDevice : public BlockDevice {
+        public:
+            BlockDevice *parent = NULL;
+
+            PartitionBlockDevice(uint64_t id, DevDriver *driver, BlockDevice *parent, uint64_t startlba, uint64_t lastlba) : BlockDevice(id, driver) {
+                this->parent = parent;
+                this->blksize = parent->blksize;
+                this->cache = parent->cache; // Share cache with parent device.
+            }
+
+            ~PartitionBlockDevice() = default;
+
+            ssize_t readblock(uint64_t lba, void *buffer) override {
+                return this->parent->readblock(lba + this->startlba, buffer);
+            }
+
+            ssize_t writeblock(uint64_t lba, const void *buffer) override {
+                return this->parent->writeblock(lba + this->startlba, buffer);
+            }
     };
 
     struct partinfo {

@@ -13,6 +13,7 @@
 #include <arch/x86_64/serial.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
+#include <arch/x86_64/timer.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <fs/ustar.hpp>
 #include <lib/assert.hpp>
@@ -190,6 +191,8 @@ namespace NArch {
         SMP::setup();
 
         CPU::init(); // Initialise BSP state.
+
+        Timer::init(); // Initialise timer subsystem.
 
         NUtil::canmutex = true; // We're allowed to print mutex now.
 

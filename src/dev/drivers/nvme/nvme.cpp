@@ -513,8 +513,10 @@ namespace NDev {
                 st.st_blocks = st.st_size / 512;
                 st.st_rdev = DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, i + 1));
 
-                // XXX: Inherit block cache from parent block device, rather than keeping separate caches for each partition.
-                NVMEBlockDevice *partblkdev = new NVMEBlockDevice(DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, i + 1)), this, ctrl, ns, part->firstlba, part->lastlba);
+                PartitionBlockDevice *partblkdev = new PartitionBlockDevice(
+                    DEVFS::makedev(NSBLKMAJOR, nsblktominor(ctrl->num, ns->nsnum, i + 1)),
+                    this, nsblkdev, part->firstlba, part->lastlba
+                );
                 registry->add(partblkdev);
 
                 assert(VFS::vfs.create(namebuf, st), "Failed to create NVMe partition block device node.");

@@ -246,6 +246,7 @@ namespace NSched {
 
             enum state tstate = state::READY; // Current state of thread.
             struct RBTree::node node; // Red-Black tree node for this thread.
+            struct Thread *nextzombie = NULL; // Next zombie in the zombie list.
             size_t id = 0; // Thread ID.
             size_t cid = 0; // Current CPU ID. What CPU owns this right now?
             size_t lastcid = 0; // Last CPU ID. What CPU owned it before?
@@ -335,6 +336,9 @@ namespace NSched {
 
     // Voluntarily relinquish access to the CPU. The yielding thread will be rewarded with more opportunities to make up the runtime it lost while yielding.
     void yield(void);
+
+    // Sleep for a given number of milliseconds.
+    void sleep(uint64_t ms);
 
     // Exit a kernel thread. REQUIRED for ending kernel threads that return eventually.
     void exit(void);

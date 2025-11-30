@@ -4,8 +4,20 @@
 #include <std/stddef.h>
 
 namespace NDev {
+    // TODO: Implement asynchronous prefetching of blocks for read-ahead.
 
     #define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+    static void writebackworker(void *arg) {
+        // TODO: Improve writeback strategy.
+
+        BlockCache *cache = (BlockCache *)arg;
+        while (true) {
+            // Scan for dirty blocks and write them back.
+            cache->flush();
+            NSched::sleep(5000); // Sleep for 5 seconds between writebacks.
+        }
+    }
 
     BlockCache::BlockCache(BlockDevice *dev, size_t capacity, size_t blocksize) {
         this->dev = dev;
@@ -13,6 +25,9 @@ namespace NDev {
         this->blocksize = blocksize;
         this->head = NULL;
         this->tail = NULL;
+        // Start writeback worker thread.
+        NSched::Thread *wbthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)writebackworker, (void *)this);
+        NSched::schedulethread(wbthread);
     }
 
     BlockCache::~BlockCache() {
@@ -31,7 +46,6 @@ namespace NDev {
         }
         this->head = this->tail = NULL;
 
-        // Clear cache map (buckets freed by KVHashMap destructor/clear())
         this->cachemap.clear();
 
         // Free any inflight entries stored in the inflight map.
