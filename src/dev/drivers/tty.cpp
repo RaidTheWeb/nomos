@@ -277,18 +277,20 @@ namespace NDev {
             }
 
             if (signal >= 0) {
-                NSched::signalpgrp(this->fpgrp, signal);
+                if (this->fpgrp) {
+                    NSched::signalpgrp(this->fpgrp, signal);
+                }
                 return;
             }
         }
 
         if (termios.lflag & ICANON) {
             if (c == this->termios.cc.verase) {
-                NLib::ScopeSpinlock guard(&this->linelock);
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
                 if (!this->linebuffer.empty()) {
                     this->linebuffer.popback(); // Remove a character.
                     if (this->termios.lflag & ECHO) {
-                        NLib::ScopeSpinlock guard(&this->outlock);
+                        NLib::ScopeIRQSpinlock guard(&this->outlock);
                         if (this->termios.lflag & ECHOE) { // Backspace should actually be backspace, and get rid of the last character, not just move the cursor back over it.
                             this->outbuffer.push('\b');
                             this->outbuffer.push(' ');
@@ -310,7 +312,7 @@ namespace NDev {
             } else if (c == this->termios.cc.vkill) {
                 if (this->termios.lflag & ECHO) {
                     if (this->termios.lflag & ECHOK) {
-                        NLib::ScopeSpinlock guard(&this->outlock);
+                        NLib::ScopeIRQSpinlock guard(&this->outlock);
 
                         this->outbuffer.push('^');
                         this->outbuffer.push(this->termios.cc.vkill + 0x40);
@@ -328,7 +330,7 @@ namespace NDev {
             } else if (c == this->termios.cc.veof) {
                 // Forced to flush output to buffer, there's nothing left.
                 // POLLIN. We might have some data.
-                NLib::ScopeSpinlock guard(&this->linelock);
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
                 if (this->linebuffer.empty()) { // EOF is only valid at the start of a line.
                     this->pending_eof = true;
                     this->readwait.wake();
@@ -345,8 +347,8 @@ namespace NDev {
             }
 
             if (c == '\n' || c == this->termios.cc.veol || c == this->termios.cc.veol2) {
-                NLib::ScopeSpinlock guard1(&this->linelock);
-                NLib::ScopeSpinlock guard2(&this->outlock);
+                NLib::ScopeIRQSpinlock guard1(&this->linelock);
+                NLib::ScopeIRQSpinlock guard2(&this->outlock);
                 this->linebuffer.push(c);
                 bool shouldecho = (this->termios.lflag & ECHO) || (!(this->termios.lflag & ECHO) && (this->termios.lflag & ECHONL) && (c == '\n'));
                 if (shouldecho) {
@@ -362,14 +364,14 @@ namespace NDev {
             }
 
             // if (c >= 32 && c <= 126) { // Add if printable.
-                NLib::ScopeSpinlock guard(&this->linelock);
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
                 this->linebuffer.push(c);
                 bool shouldecho = (this->termios.lflag & ECHO) || (!(this->termios.lflag & ECHO) && (this->termios.lflag & ECHONL) && (c == '\n'));
                 if (shouldecho) {
                     if (canwrite) {
                         writefn(&c, 1);
                     }
-                    NLib::ScopeSpinlock guard(&this->outlock);
+                    NLib::ScopeIRQSpinlock guard(&this->outlock);
                     this->outbuffer.push(c);
                 }
             // }
@@ -377,7 +379,7 @@ namespace NDev {
             if (canwrite && this->termios.lflag & ECHO) {
                 writefn(&c, 1);
             }
-            NLib::ScopeSpinlock guard(&this->inlock);
+            NLib::ScopeIRQSpinlock guard(&this->inlock);
 
             this->inbuffer.push(c); // Append character to input buffer. Raw mode doesn't process any input.
 
@@ -408,6 +410,7 @@ namespace NDev {
         }
 
         if (this->termios.lflag & ICANON) {
+            // Create an IRQSpinlock guard to manage line lock (because input interrupt sources also acquire this lock).
             this->linelock.acquire();
             // If an EOF was received at the start of the line, return EOF (0).
             if (this->pending_eof && this->linebuffer.empty()) {
@@ -474,7 +477,7 @@ namespace NDev {
         (void)fdflags;
 
         NSched::Thread *thread = NArch::CPU::get()->currthread;
-        this->fpgrp = thread->process->pgrp; // XXX: Only for testing purposes. Should be set on open().
+        this->fpgrp = thread->process->pgrp;
 
         if (thread->process->pgrp != this->fpgrp) {
             NSched::signalthread(thread, SIGTTOU);
@@ -485,7 +488,7 @@ namespace NDev {
             writefn(buf, count);
         }
 
-        NLib::ScopeSpinlock guard(&this->outlock);
+        NLib::ScopeIRQSpinlock guard(&this->outlock);
         for (size_t i = 0; i < count; i++) {
             outbuffer.push(buf[i]);
         }
@@ -796,9 +799,9 @@ notspecial:
                                 return -EINVAL;
                             }
                             { // Discard queued input before setting flags.
-                                NLib::ScopeSpinlock guard1(&tty->tty->linelock);
-                                NLib::ScopeSpinlock guard2(&tty->tty->outlock);
-                                NLib::ScopeSpinlock guard3(&tty->tty->inlock);
+                                NLib::ScopeIRQSpinlock guard1(&tty->tty->linelock);
+                                NLib::ScopeIRQSpinlock guard2(&tty->tty->outlock);
+                                NLib::ScopeIRQSpinlock guard3(&tty->tty->inlock);
                                 tty->tty->inbuffer.clear();
                                 tty->tty->outbuffer.clear();
                                 tty->tty->linebuffer.clear();
@@ -822,22 +825,22 @@ notspecial:
                             // Which: 0 = flush input, 1 = flush output, 2 = flush both
                             switch (which) {
                                 case 0: { // Flush input
-                                    NLib::ScopeSpinlock guard1(&tty->tty->linelock);
-                                    NLib::ScopeSpinlock guard2(&tty->tty->inlock);
+                                    NLib::ScopeIRQSpinlock guard1(&tty->tty->linelock);
+                                    NLib::ScopeIRQSpinlock guard2(&tty->tty->inlock);
                                     tty->tty->inbuffer.clear();
                                     tty->tty->linebuffer.clear();
                                     break;
                                 }
                                 case 1: { // Flush output
-                                    NLib::ScopeSpinlock guard(&tty->tty->outlock);
+                                    NLib::ScopeIRQSpinlock guard(&tty->tty->outlock);
                                     tty->tty->outbuffer.clear();
                                     break;
                                 }
                                 case 2: { // Flush both
                                     // Use canonical lock order: linelock -> outlock -> inlock
-                                    NLib::ScopeSpinlock guard1(&tty->tty->linelock);
-                                    NLib::ScopeSpinlock guard2(&tty->tty->outlock);
-                                    NLib::ScopeSpinlock guard3(&tty->tty->inlock);
+                                    NLib::ScopeIRQSpinlock guard1(&tty->tty->linelock);
+                                    NLib::ScopeIRQSpinlock guard2(&tty->tty->outlock);
+                                    NLib::ScopeIRQSpinlock guard3(&tty->tty->inlock);
                                     tty->tty->inbuffer.clear();
                                     tty->tty->outbuffer.clear();
                                     tty->tty->linebuffer.clear();

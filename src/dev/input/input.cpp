@@ -6,8 +6,7 @@ namespace NDev {
 
         NLib::DoubleList<Device *> devices = NLib::DoubleList<Device *>();
         NLib::DoubleList<struct eventhandler *> handlers = NLib::DoubleList<struct eventhandler *>();
-        NArch::Spinlock devlock;
-        NArch::IRQSpinlock devlockirq = NArch::IRQSpinlock(&devlock);
+        NArch::IRQSpinlock devlock;
 
         enum event::disposition Device::getdispose(uint16_t type, uint16_t *pcode, int32_t *pvalue) {
             int32_t value = *pvalue;
@@ -37,7 +36,7 @@ namespace NDev {
         }
 
         void Device::sendtohandler(struct event ev) {
-            devlockirq.acquire();
+            devlock.acquire();
 
             NLib::DoubleList<struct eventhandler *>::Iterator it = this->handlers.begin();
 
@@ -46,7 +45,7 @@ namespace NDev {
                 it.next();
             }
 
-            devlockirq.release();
+            devlock.release();
         }
 
         void Device::handle(uint16_t type, uint16_t code, int32_t value) {
@@ -86,11 +85,10 @@ namespace NDev {
         void Device::doevent(uint16_t type, uint16_t code, int32_t value) {
             if (this->evsupported & type) { // If we actually support generating this event type, pass it through.
 
-                NArch::IRQSpinlock lock(&this->lock); // We must use an IRQ lock here, because device events typically come from interrupt handlers.
-                lock.acquire();
+                this->lock.acquire();
 
                 this->handle(type, code, value);
-                lock.release();
+                this->lock.release();
             }
         }
 
@@ -107,7 +105,7 @@ namespace NDev {
         }
 
         int registerdevice(Device *dev) {
-            devlockirq.acquire();
+            devlock.acquire();
 
             dev->evsupported |= event::type::SYN; // All devices should accept basic synchronisation events.
 
@@ -118,12 +116,12 @@ namespace NDev {
                 it.next();
             }
 
-            devlockirq.release();
+            devlock.release();
             return 0;
         }
 
         int registerhandler(struct eventhandler *handler) {
-            devlockirq.acquire();
+            devlock.acquire();
 
             NLib::DoubleList<Device *>::Iterator it = devices.begin();
 
@@ -139,7 +137,7 @@ namespace NDev {
 
             handlers.push(handler);
 
-            devlockirq.release();
+            devlock.release();
             return count > 0 ? 0 : -ENODEV; // ENODEV is non-fatal.
         }
     }

@@ -2,6 +2,7 @@
 #define _ARCH__X86_64__CPU_HPP
 
 #include <arch/x86_64/interrupts.hpp>
+#include <arch/x86_64/io.hpp>
 #include <arch/x86_64/sync.hpp>
 #include <lib/string.hpp>
 #include <sched/sched.hpp>
@@ -126,13 +127,14 @@ namespace NArch {
 
             uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
             NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.
-            NSched::Thread *zombies = NULL; // List of zombie threads to be cleaned up.
             size_t schedintr = 1; // Incremented every scheduler interrupt. Used for time-based calculations, as we can approximate a scheduled * NSched::QUANTUMMS = milliseconds conversion.
-            int64_t quantum_left = 0;
+            uint64_t quantumdeadline = 0; // TSC deadline for quantum expiry.
 
             size_t fpusize = 0; // Size of FPU storage. Determines how FPU storage will be allocated when needed.
             bool hasxsave = false; // Does this CPU support XSAVE? (AVX-* systems).
             uint64_t xsavemask = 0;
+
+            bool preemptdisabled = true; // Is preemption disabled on this CPU?
 
             bool setint(bool status) {
                 asm volatile("cli");

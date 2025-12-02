@@ -6,6 +6,7 @@
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <util/kprint.hpp>
+#include <sched/signal.hpp>
 
 namespace NArch {
     namespace VMM {
@@ -92,6 +93,10 @@ namespace NArch {
                 isr->func(isr, ctx); // Call ISR function.
             }
 
+            if ((ctx->cs & 0x3) == 0x3) {
+                NSched::signal_checkpending(ctx);
+            }
+
             CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false;
         }
 
@@ -118,7 +123,7 @@ namespace NArch {
                 if (ctx->err & (1 << 1) && (*pte) & VMM::COW) {
                     void *newpage = PMM::alloc(PAGESIZE);
                     if (!newpage) {
-                        NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL);
+                        NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL, ctx);
                         return;
                     }
 

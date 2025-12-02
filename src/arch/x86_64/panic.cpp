@@ -13,7 +13,6 @@ namespace NArch {
 
         NUtil::oprintlock();
         NUtil::canmutex = false; // Prevent usage of mutexes during panic.
-
         NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: %s", msg);
         for (;;) {
             asm volatile("hlt");

@@ -4,37 +4,62 @@
 #include <arch/x86_64/tsc.hpp>
 #include <sys/timer.hpp>
 
+namespace NSched {
+    extern void schedule(struct NArch::Interrupts::isr *isr, struct NArch::CPU::context *ctx);
+}
+
 namespace NArch {
     namespace Timer {
+        void rearm(void) {
+            // Re-arm LAPIC timer for next timer quantum.
+            APIC::lapiconeshot(1000, 0xfb);
+        }
+
+        static void sched(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+            if (CPU::get()->preemptdisabled) {
+                // Timer interrupts are usually scheduled by the scheduler, but if preemption is disabled we need to re-arm the timer here.
+                rearm();
+                return; // Preemption is disabled, do not attempt to reschedule.
+            }
+
+            uint64_t now = TSC::query();
+            uint64_t deadline = CPU::get()->quantumdeadline;
+            if (deadline != 0) { // Deadline of 0 means no quantum expiry.
+                if (now > deadline) {
+                    NSched::schedule(isr, ctx);
+                    return;
+                }
+            }
+            rearm();
+        }
+
         static void timerisr(struct Interrupts::isr *isr, struct CPU::context *ctx) {
             (void)isr;
             (void)ctx;
 
             uint64_t current = (TSC::query() * 1000) / TSC::hz;
-            NSys::Timer::update(current); // Update timer subsystem with current time in milliseconds.
+            NSys::Timer::update(current); // Update timer subsystem with current time in milliseconds
 
-            if (--CPU::get()->quantum_left <= 0) {
-                CPU::get()->quantum_left = NSched::QUANTUMMS;
-                // Trigger the scheduler interrupt ourselves.
-                APIC::sendipi(CPU::get()->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
-            }
+            sched(isr, ctx);
+        }
+
+        // Scheduler timer ISR for other CPUs in SMP systems.
+        static void schedisr(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+            (void)isr;
+            (void)ctx;
+
+            sched(isr, ctx);
+        }
+
+        void setisr(void) {
+            Interrupts::regisr(0xfb, CPU::get() == CPU::getbsp() ? timerisr : schedisr, true);
         }
 
         void init(void) {
             NSys::Timer::init();
 
-            uint8_t vec = Interrupts::allocvec();
-            Interrupts::regisr(vec, timerisr, true);
-
-            // Setup periodic LAPIC timer
-            uint64_t us = 1000; // 1ms.
-            uint64_t ticks = us * (CPU::get()->lapicfreq / 1000000);
-
-            CPU::get()->quantum_left = NSched::QUANTUMMS;
-
-            APIC::writelapic(APIC::LAPICLVTT, vec | (1 << 17)); // Periodic mode
-            APIC::writelapic(APIC::LAPICDCR, 0b1011); // Divide by 1
-            APIC::writelapic(APIC::LAPICICR, ticks);
+            setisr();
+            NUtil::printf("[arch/x86_64/timer]: Timer subsystem initialised.\n");
         }
     }
 }

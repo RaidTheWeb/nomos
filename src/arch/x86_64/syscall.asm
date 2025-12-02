@@ -23,6 +23,10 @@ extern sys_getpgid
 extern sys_setpgid
 extern sys_setsid
 extern sys_fork
+extern sys_sigaction
+extern sys_sigreturn
+extern sys_kill
+extern sys_sigprocmask
 
 MAXSYSCALLS equ 256
 
@@ -49,6 +53,10 @@ syscall_table:
     dq sys_setpgid
     dq sys_setsid
     dq sys_fork
+    dq sys_sigaction
+    dq sys_sigreturn
+    dq sys_kill
+    dq sys_sigprocmask
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 
@@ -146,6 +154,7 @@ syscall_entry:
 .done:
     cli
 
+    mov rdi, rsp
     call signal_checkpending
 
     add rsp, 24 ; Skip segments (we only want ES onwards).

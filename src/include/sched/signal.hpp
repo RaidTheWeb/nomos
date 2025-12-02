@@ -5,6 +5,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+namespace NArch {
+    namespace CPU {
+        struct context;
+    }
+}
+
 namespace NSched {
     // Default handler actions -> Handled by the kernel, rather than being passed into userspace.
     enum dflactions {
@@ -20,6 +26,7 @@ namespace NSched {
         void (*handler)(int) = SIG_DFL;
         uint64_t mask = 0; // Signals to block during execution of action.
         int flags = 0;
+        void (*restorer)(void) = NULL;
     };
 
     static const size_t NSIG = 64;
@@ -34,7 +41,9 @@ namespace NSched {
     class ProcessGroup;
     class Process;
 
-    void deliversignal(Thread *thread, uint8_t sig);
+    void deliversignal(Thread *thread, uint8_t sig, struct NArch::CPU::context *ctx);
+
+    extern "C" void signal_checkpending(struct NArch::CPU::context *ctx);
 
     int signalproc(Process *proc, uint8_t sig);
     int signalpgrp(ProcessGroup *pgrp, uint8_t sig);

@@ -32,10 +32,10 @@ namespace NArch {
     class IRQSpinlock {
         private:
             bool state;
-            NArch::Spinlock *lock;
+            NArch::Spinlock lock;
         public:
-            IRQSpinlock(NArch::Spinlock *lock) {
-                this->lock = lock;
+            IRQSpinlock(void) {
+                this->state = false;
             }
 
             void acquire(void);

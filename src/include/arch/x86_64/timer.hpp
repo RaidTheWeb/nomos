@@ -3,6 +3,9 @@
 
 namespace NArch {
     namespace Timer {
+        void setisr(void);
+        void rearm(void);
+
         void init(void);
     }
 }

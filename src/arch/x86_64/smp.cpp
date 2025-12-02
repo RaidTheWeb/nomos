@@ -4,6 +4,7 @@
 #include <arch/x86_64/gdt.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/timer.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
@@ -51,6 +52,7 @@ namespace NArch {
 
             NUtil::printf("[arch/x86_64/smp]: Non-BSP CPU%lu initialised.\n", info->processor_id);
 
+            Timer::setisr(); // Setup periodic timer for this CPU.
 
             __atomic_add_fetch(&awakecpus, 1, memory_order_seq_cst); // Increment counter, so that we can tell if all CPUs have been initialised.
             NSched::entry();

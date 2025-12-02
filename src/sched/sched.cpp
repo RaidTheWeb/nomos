@@ -1,8 +1,10 @@
 #ifdef __x86_64__
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/e9.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
+#include <arch/x86_64/timer.hpp>
 #endif
 #include <fs/devfs.hpp>
 #include <lib/assert.hpp>
@@ -267,14 +269,18 @@ namespace NSched {
                     x_parent = x->getparent();
                 } else {
                     if (w->right == NULL || w->right->getcolour() == colour::BLACK) {
-                        if (w->left) w->left->packcolour(colour::BLACK);
+                        if (w->left) {
+                            w->left->packcolour(colour::BLACK);
+                        }
                         w->packcolour(colour::RED);
                         this->rotateright(w);
                         w = x_parent->right;
                     }
                     w->packcolour(x_parent->getcolour());
                     x_parent->packcolour(colour::BLACK);
-                    if (w->right) w->right->packcolour(colour::BLACK);
+                    if (w->right) {
+                        w->right->packcolour(colour::BLACK);
+                    }
                     this->rotateleft(x_parent);
                     x = this->root;
                 }
@@ -293,20 +299,26 @@ namespace NSched {
                     x_parent = x->getparent();
                 } else {
                     if (w->left == NULL || w->left->getcolour() == colour::BLACK) {
-                        if (w->right) w->right->packcolour(colour::BLACK);
+                        if (w->right) {
+                            w->right->packcolour(colour::BLACK);
+                        }
                         w->packcolour(colour::RED);
                         this->rotateleft(w);
                         w = x_parent->left;
                     }
                     w->packcolour(x_parent->getcolour());
                     x_parent->packcolour(colour::BLACK);
-                    if (w->left) w->left->packcolour(colour::BLACK);
+                    if (w->left) {
+                        w->left->packcolour(colour::BLACK);
+                    }
                     this->rotateright(x_parent);
                     x = this->root;
                 }
             }
         }
-        if (x) x->packcolour(colour::BLACK);
+        if (x) {
+            x->packcolour(colour::BLACK);
+        }
     }
 
     size_t RBTree::count(void) {
@@ -443,9 +455,7 @@ namespace NSched {
             return NULL; // We're done here, there's nothing we can do.
         }
 
-        if (!busiest->runqueue.lock.trylock()) {
-            return NULL; // Failed to acquire lock, abort steal to prevent deadlock.
-        }
+        busiest->runqueue.lock.acquire();
         struct RBTree::node *node = busiest->runqueue._last(); // Grab node with highest runtime (least deserving of being run), and incur migration penalty.
         if (!node) {
             busiest->runqueue.lock.release();
@@ -510,18 +520,13 @@ namespace NSched {
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
         (void)isr;
 
+        APIC::lapicstop();
+
         struct CPU::cpulocal *cpu = CPU::get(); // Get an easy local reference to our current CPU.
 
         assert(cpu, "Failed to acquire current CPU.\n");
 
         cpu->setint(false); // Disable interrupts, we don't want our scheduling work to be interrupted.
-
-        // Clean up zombies.
-        while (cpu->zombies) {
-            Thread *zombie = cpu->zombies;
-            cpu->zombies = zombie->nextzombie;
-            delete zombie;
-        }
 
         size_t curintr = __atomic_add_fetch(&cpu->schedintr, 1, memory_order_seq_cst); // Increment the number of times this interrupt has been called.
 
@@ -552,7 +557,7 @@ namespace NSched {
         }
 
         {
-            NLib::ScopeSpinlock guard(&cpu->runqueue.lock); // Lock run queue, so we can gather and remove the next thread.
+            NLib::ScopeIRQSpinlock guard(&cpu->runqueue.lock); // Lock run queue, so we can gather and remove the next thread.
             if (prev != cpu->idlethread) {
                 if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::RUNNING) { // Thread is still "runnable".
 
@@ -586,11 +591,11 @@ namespace NSched {
         if (prev != next) { // We need to context switch.
             bool needswap = prev->process->addrspace != next->process->addrspace;
             if (__atomic_load_n(&prev->tstate, memory_order_acquire) == Thread::state::DEAD) {
-                prev->nextzombie = cpu->zombies;
-                cpu->zombies = prev;
+                delete prev;
             }
 
-            cpu->quantum_left = QUANTUMMS;
+            Timer::rearm();
+            cpu->quantumdeadline = TSC::query() + TSC::hz / 1000 * QUANTUMMS; // Set quantum deadline based on TSC.
 
             switchthread(next, needswap); // Swap to context.
         }
@@ -600,8 +605,9 @@ namespace NSched {
         // We haven't changed anything. We were just given our old thread, this happens most commonly when running the idle thread.
         // It'd be a waste to attempt to context switch when we're working on the same code.
 
+        cpu->quantumdeadline = TSC::query() + TSC::hz / 1000 * QUANTUMMS; // Set quantum deadline based on TSC.
+        Timer::rearm();
         cpu->setint(true); // Although it'll be re-enabled during the context switch, we may have lost track of the interrupt state here. So, we should explicitly reenable it before rescheduling.
-        cpu->quantum_left = QUANTUMMS;
 
         // If it's the same thread, we'll just be dumped right back to where we are.
     }
@@ -609,7 +615,7 @@ namespace NSched {
 
     static size_t pidcounter = 0; // Because kernel process is the first process made, it'll be PID0. The first user process (init) will be PID1!
     Process *kprocess = NULL; // Kernel process.
-    NArch::Spinlock pidtablelock;
+    NArch::IRQSpinlock pidtablelock;
     NLib::KVHashMap<size_t, Process *> *pidtable = NULL;
 
     void Process::init(struct VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
@@ -642,10 +648,6 @@ namespace NSched {
                 this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
             }
         }
-
-        pidtablelock.acquire();
-        pidtable->insert(this->id, this);
-        pidtablelock.release();
     }
 
     Process::~Process(void) {
@@ -668,6 +670,7 @@ namespace NSched {
         if (this->fdtable) {
             delete this->fdtable;
         }
+
 
         if (this->cwd) {
             this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
@@ -693,6 +696,8 @@ namespace NSched {
     }
 
     void yield(void) {
+        APIC::lapicstop();
+
         CPU::get()->setint(true);
 
         // Artificially induce a schedule interrupt, using a "loopback" IPI.
@@ -865,6 +870,7 @@ namespace NSched {
 
         // Create PID 0 for kernel threading. Uses kernel address space so that the process has access to the entire memory map.
         kprocess = new Process(&VMM::kspace);
+        pidtable->insert(kprocess->id, kprocess);
 
         Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process. We need not set any affinity logic, as this thread is never actually *scheduled*.
 
@@ -888,7 +894,9 @@ namespace NSched {
     void await(void) {
         CPU::get()->setint(false);
 
-        CPU::get()->quantum_left = QUANTUMMS;
+        CPU::get()->quantumdeadline = TSC::query() + TSC::hz / 1000 * QUANTUMMS; // Set quantum deadline based on TSC.
+        CPU::get()->preemptdisabled = false; // Enable preemption.
+        Timer::rearm();
 
         CPU::get()->setint(true);
 
@@ -905,14 +913,18 @@ namespace NSched {
     extern "C" uint64_t sys_fork(void) {
         SYSCALL_LOG("sys_fork().\n");
 
+        NLib::ScopeIRQSpinlock pidguard(&pidtablelock);
+
         Process *current = NArch::CPU::get()->currthread->process;
 
-        NLib::ScopeSpinlock guard(&current->lock);
+        NLib::ScopeIRQSpinlock guard(&current->lock);
 
         Process *child = new Process(VMM::forkcontext(current->addrspace), current->fdtable->fork());
         if (!child) {
             return -ENOMEM;
         }
+
+        pidtable->insert(child->id, child);
 
         child->cwd = current->cwd;
         if (child->cwd) {
@@ -966,7 +978,7 @@ namespace NSched {
         SYSCALL_LOG("sys_setsid().\n");
 
         Process *current = NArch::CPU::get()->currthread->process;
-        NLib::ScopeSpinlock guard(&current->lock);
+        NLib::ScopeIRQSpinlock guard(&current->lock);
 
         current->pgrp->lock.acquire();
         if (current->pgrp->id == current->id) {
@@ -1005,7 +1017,7 @@ namespace NSched {
         }
 
         // XXX: Refcount process to prevent it from being freed during work.
-        NLib::ScopeSpinlock guard1(&pidtablelock);
+        NLib::ScopeIRQSpinlock guard1(&pidtablelock);
 
         Process *proc = NULL;
         Process *current = NArch::CPU::get()->currthread->process;
@@ -1020,7 +1032,7 @@ namespace NSched {
             proc = current;
         }
 
-        NLib::ScopeSpinlock guard2(&proc->lock);
+        NLib::ScopeIRQSpinlock guard2(&proc->lock);
 
         if (!(current->session == proc->session && (current == proc->parent || proc == current))) {
             return -EPERM; // We're not allowed to manipulate processes outside our session, or those where we aren't the parent of the process.
@@ -1078,7 +1090,7 @@ namespace NSched {
     extern "C" uint64_t sys_getpgid(int pid) {
         SYSCALL_LOG("sys_getpgid(%d).\n", pid);
 
-        NLib::ScopeSpinlock guard(&pidtablelock);
+        NLib::ScopeIRQSpinlock guard(&pidtablelock);
 
         if (!pid) {
             // Return current process' process group ID.

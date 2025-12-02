@@ -343,17 +343,21 @@ flagbreak:
         char buffer[1024];
         size_t len = vsnprintf(buffer, sizeof(buffer), format, ap);
         len -= 1; // Back out on null termination for this.
-
+        bool writestatus = consolewrite;
 
         // if (canmutex && NArch::CPU::get()->currthread) {
             // mutex.acquire();
         // } else {
-        if (consolewrite) {
+        bool state = false;
+        if (writestatus) {
+            printlock.acquire();
+        } else {
+            state = NArch::CPU::get()->setint(false);
             printlock.acquire();
         }
 
 #ifdef __x86_64__
-        if (consolewrite) {
+        if (writestatus) {
             NLimine::console_write(buffer, len);
         }
 
@@ -366,8 +370,11 @@ flagbreak:
         // if (canmutex && NArch::CPU::get()->currthread) {
             // mutex.release();
         // } else {
-        if (consolewrite) {
+        if (writestatus) {
             printlock.release();
+        } else {
+            printlock.release();
+            NArch::CPU::get()->setint(state);
         }
         // }
         return len;

@@ -27,6 +27,20 @@ namespace NLib {
             }
     };
 
+    class ScopeIRQSpinlock {
+        private:
+            NArch::IRQSpinlock *lock;
+        public:
+            ScopeIRQSpinlock(NArch::IRQSpinlock *lock) {
+                this->lock = lock;
+                this->lock->acquire();
+            }
+
+            ~ScopeIRQSpinlock(void) {
+                this->lock->release();
+            }
+    };
+
     class ScopeMCSSpinlock {
         private:
             NArch::MCSSpinlock *spin;

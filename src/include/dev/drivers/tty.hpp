@@ -109,11 +109,11 @@ namespace NDev {
             struct winsize winsize;
 
             NLib::CircularBuffer<char> inbuffer;
-            NArch::Spinlock inlock;
+            NArch::IRQSpinlock inlock;
             NLib::CircularBuffer<char> outbuffer;
-            NArch::Spinlock outlock;
+            NArch::IRQSpinlock outlock;
             NLib::CircularBuffer<char> linebuffer;
-            NArch::Spinlock linelock;
+            NArch::IRQSpinlock linelock;
 
             // Multi-lock ordering:
             // 1. linelock

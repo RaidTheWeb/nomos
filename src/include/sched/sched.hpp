@@ -73,7 +73,7 @@ namespace NSched {
                 );
             }
 
-            NArch::Spinlock lock;
+            NArch::IRQSpinlock lock;
         private:
 
             size_t nodecount = 0;
@@ -110,36 +110,36 @@ namespace NSched {
 
             // Insert into Red-Black tree using cmp to compare left child against right child, for traversal.
             void insert(struct node *node, int (*cmp)(struct node *, struct node *)) {
-                NLib::ScopeSpinlock guard(&this->lock);
+                NLib::ScopeIRQSpinlock guard(&this->lock);
                 this->_insert(node, cmp);
             }
 
             // Remove a node.
             void erase(struct node *node) {
-                NLib::ScopeSpinlock guard(&this->lock);
+                NLib::ScopeIRQSpinlock guard(&this->lock);
                 this->_erase(node);
             }
 
             // Get first node.
             struct node *first(void) {
-                NLib::ScopeSpinlock guard(&this->lock);
+                NLib::ScopeIRQSpinlock guard(&this->lock);
                 return this->_first();
             }
 
             // Get last node.
             struct node *last(void) {
-                NLib::ScopeSpinlock guard(&this->lock);
+                NLib::ScopeIRQSpinlock guard(&this->lock);
                 return this->_last();
             }
 
             // Get next node.
             struct node *next(struct node *node) {
-                NLib::ScopeSpinlock guard(&this->lock);
+                NLib::ScopeIRQSpinlock guard(&this->lock);
                 return this->_next(node);
             }
 
             struct node *prev(struct node *node) {
-                NLib::ScopeSpinlock guard(&this->lock);
+                NLib::ScopeIRQSpinlock guard(&this->lock);
                 return this->_prev(node);
             }
 
@@ -178,7 +178,7 @@ namespace NSched {
             int uid = 0;
             int gid = 0;
 
-            NArch::Spinlock lock;
+            NArch::IRQSpinlock lock;
 
             Process *parent = NULL;
             NLib::DoubleList<Process *> children;
@@ -203,6 +203,7 @@ namespace NSched {
     };
 
     extern NLib::KVHashMap<size_t, Process *> *pidtable;
+    extern NArch::IRQSpinlock pidtablelock;
 
     extern Process *kprocess; // Kernel process.
 
