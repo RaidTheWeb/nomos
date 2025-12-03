@@ -39,7 +39,7 @@ namespace NDev {
                 this->ctrl = ctrl;
                 this->ns = ns;
                 this->blksize = ns->blksize;
-                this->cache = new BlockCache(this, 2, ns->blksize); // 64MB cache.
+                this->cache = new BlockCache(this, 64 * 1024 * 1024 / ns->blksize, ns->blksize); // 64MB cache.
             }
 
             ~NVMEBlockDevice();

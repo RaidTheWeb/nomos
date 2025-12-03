@@ -58,7 +58,7 @@ namespace NDev {
     struct parttableinfo *getpartinfo(BlockDevice *dev) {
         // Check if MBR or GPT.
         uint8_t mbrsector[512];
-        ssize_t res = dev->readblock(0, mbrsector); // XXX: Use cached read.
+        ssize_t res = dev->readbytes(mbrsector, sizeof(mbrsector), 0, 0);
         if (res != 0) {
             NUtil::printf("[dev/block]: Failed to read MBR sector for partition info (err=%d).\n", (int)res);
             return NULL;

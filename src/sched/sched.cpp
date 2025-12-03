@@ -651,8 +651,8 @@ namespace NSched {
     }
 
     Process::~Process(void) {
-
-        // Dereference address space and free it if there's nothing on it.
+        this->lock.acquire();
+        // XXX: Dereference address space and free it if there's nothing on it.
 
         // this->addrspace->lock.acquire();
         // this->addrspace->ref--;
@@ -676,13 +676,37 @@ namespace NSched {
             this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
         }
 
-        if (this->parent) {
-            NSched::signalproc(this->parent, SIGCHLD); // Signal parent that child exited.
+        if (this->pgrp) {
+            // XXX: Orphan process groups if we're the leader.
 
-            if (children.size()) {
-                // XXX: Reparent now "zombie" processes to init process.
+            this->pgrp->lock.acquire();
+            this->pgrp->procs.remove([](Process *p, void *arg) {
+                return p == ((Process *)arg);
+            }, (void *)this);
+            this->pgrp->lock.release();
+        }
+
+        if (this->parent) {
+            this->parent->lock.acquire();
+            this->parent->children.remove([](Process *p, void *arg) {
+                return p == ((Process *)arg);
+            }, (void *)this);
+            this->parent->lock.release();
+
+            NSched::signalproc(this->parent, SIGCHLD); // Signal parent that child exited.
+        }
+
+        if (children.size()) {
+            // XXX: Reparent now "zombie" processes to init process.
+            NLib::DoubleList<Process *>::Iterator it = this->children.begin();
+            for (; it.valid(); it.next()) {
+                Process *child = *(it.get());
+                child->lock.acquire();
+                child->parent = NULL;
+                child->lock.release();
             }
         }
+        this->lock.release();
     }
 
     void reschedule(Thread *thread) {

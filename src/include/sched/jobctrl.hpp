@@ -15,7 +15,7 @@ namespace NSched {
     class ProcessGroup {
         private:
         public:
-            NArch::Spinlock lock;
+            NArch::IRQSpinlock lock;
 
             Session *session;
 
@@ -26,7 +26,7 @@ namespace NSched {
     class Session {
         private:
         public:
-            NArch::Spinlock lock;
+            NArch::IRQSpinlock lock;
 
             size_t id;
             uint64_t ctty;

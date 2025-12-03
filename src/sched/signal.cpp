@@ -100,11 +100,8 @@ cleanup:
             __atomic_or_fetch(&thread->signal.pending, 1ull << sig, memory_order_seq_cst);
         }
 
-        // __atomic_store_n(&thread->tstate, Thread::state::SUSPENDED, memory_order_release);
-
-        // XXX: What now? Do we force the CPU running the thread to halt? Do we *need* the signal to execute *immediately*?
-        // We can send an IPI to the CPU to tell it to reschedule.
-        // NSched::reschedule(thread);
+        // XXX: If the thread is eepy, we need to wake it so it can handle the signal.
+        // Ensure that waiting threads get woken up and removed from wait queues.
         return 0;
     }
 
@@ -137,7 +134,7 @@ cleanup:
             return -EINVAL;
         }
 
-        NLib::ScopeSpinlock guard(&pgrp->lock);
+        NLib::ScopeIRQSpinlock guard(&pgrp->lock);
         NLib::DoubleList<Process *>::Iterator it = pgrp->procs.begin();
 
         long ret = 0;
