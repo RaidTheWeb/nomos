@@ -85,8 +85,8 @@ namespace NSys {
 
             for (size_t i = 0; i < argc; i++) {
                 size_t len = NLib::strlen(argv[i]) + 1;
-                NLib::memcpy((void *)stackptr, argv[i], len); // Copy argv element into stack.
                 stackptr += len;
+                NLib::memcpy((void *)stackptr, argv[i], len); // Copy argv element into stack.
                 uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                 ((uint64_t *)argvptrs)[i] = calc; // Point the associated argv pointer to the stack location of the element.
             }
@@ -95,9 +95,9 @@ namespace NSys {
             if (envp) {
                 for (size_t i = 0; i < envc; i++) {
                     size_t len = NLib::strlen(envp[i]) + 1;
+                    stackptr += len;
                     NLib::memcpy((void *)stackptr, envp[i], len); // Copy envp element into stack.
 
-                    stackptr += len;
                     uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                     ((uint64_t *)envpptrs)[i] = calc; // Point the associated envp pointer to the stack location of the element.
                 }

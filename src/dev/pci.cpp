@@ -190,7 +190,7 @@ namespace NDev {
 
         void unmapbar(struct bar bar) {
             if (bar.mmio) { // Only unmap MMIO BARs.
-                NLib::ScopeSpinlock guard(&NArch::VMM::kspace.lock);
+                NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
                 NArch::VMM::_unmaprange(&NArch::VMM::kspace, bar.base, bar.len);
                 NArch::VMM::kspace.vmaspace->free((void *)bar.base, bar.len);
             }

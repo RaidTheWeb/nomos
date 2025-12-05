@@ -29,7 +29,7 @@ void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
     using namespace NArch::VMM;
     using namespace NMem::Virt;
 
-    NLib::ScopeSpinlock guard(&kspace.lock);
+    NLib::ScopeIRQSpinlock guard(&kspace.lock);
     uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, VIRT_RW | VIRT_NX);
     NArch::VMM::_maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NLib::alignup(length, NArch::PAGESIZE));
     size_t offset = phys - NLib::aligndown(phys, NArch::PAGESIZE);
@@ -38,7 +38,7 @@ void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
 
 void uacpi_kernel_unmap(void *ptr, uacpi_size length) {
     using namespace NArch::VMM;
-    NLib::ScopeSpinlock guard(&kspace.lock);
+    NLib::ScopeIRQSpinlock guard(&kspace.lock);
 
     NArch::VMM::_unmaprange(&kspace, (uintptr_t)ptr, NLib::alignup(length, NArch::PAGESIZE));
     kspace.vmaspace->free(ptr, length);
@@ -91,7 +91,7 @@ namespace NArch {
         }
 
         void setup(void) {
-            uacpi_setup_early_table_access((void *)((uintptr_t)PMM::alloc(32 * PAGESIZE) + NLimine::hhdmreq.response->offset), 32 * PAGESIZE);
+            uacpi_setup_early_table_access((void *)((uintptr_t)PMM::alloc(32 * PAGESIZE, PMM::FLAGS_DEVICE) + NLimine::hhdmreq.response->offset), 32 * PAGESIZE);
             NUtil::printf("[arch/x86_64/acpi]: Initialised uACPI.\n");
 
             uacpi_table apic;

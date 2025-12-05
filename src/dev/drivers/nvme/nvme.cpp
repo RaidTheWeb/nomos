@@ -21,7 +21,7 @@ namespace NDev {
 
     // Allocate DMA-capable memory.
     static void *dmaalloc(size_t size) {
-        return NArch::hhdmoff(NArch::PMM::alloc(size));
+        return NArch::hhdmoff(NArch::PMM::alloc(size, NArch::PMM::FLAGS_DEVICE));
     }
 
     // Free DMA-capable memory.

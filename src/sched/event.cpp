@@ -4,14 +4,15 @@
 #include <sched/event.hpp>
 
 namespace NSched {
-    void WaitQueue::wait(void) {
-        this->waitinglock.acquire(); // We MUST acquire the lock before setting the thread to waiting, otherwise we'll never be rescheduled when the timeslice expires.
-        NArch::CPU::get()->setint(false); // Disable interrupts to prevent preemption during this critical section.
-        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
+    void WaitQueue::wait(bool locked) {
+        if (!locked) {
+            this->waitinglock.acquire(); // We MUST acquire the lock before setting the thread to waiting, otherwise we'll never be rescheduled when the timeslice expires.
 
+        }
+        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
         this->waiting.pushback(NArch::CPU::get()->currthread);
+
         this->waitinglock.release();
-        NArch::CPU::get()->setint(true); // Re-enable interrupts.
         yield();
     }
 

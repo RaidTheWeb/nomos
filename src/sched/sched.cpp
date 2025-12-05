@@ -622,6 +622,9 @@ namespace NSched {
         // Each new process should be initialised with an atomically incremented PID.
         this->id = __atomic_fetch_add(&pidcounter, 1, memory_order_seq_cst);
         this->addrspace = space;
+        this->addrspace->lock.acquire();
+        this->addrspace->ref++; // Reference address space.
+        this->addrspace->lock.release();
         if (space == &VMM::kspace) {
             this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
         } else { // Only userspace threads should bother creating file descriptor tables.
@@ -652,16 +655,6 @@ namespace NSched {
 
     Process::~Process(void) {
         this->lock.acquire();
-        // XXX: Dereference address space and free it if there's nothing on it.
-
-        // this->addrspace->lock.acquire();
-        // this->addrspace->ref--;
-        // size_t ref = this->addrspace->ref;
-        // this->addrspace->lock.release();
-
-        // if (ref == 0) {
-            // delete this->addrspace;
-        // }
 
         pidtablelock.acquire();
         pidtable->remove(this->id);
@@ -706,6 +699,19 @@ namespace NSched {
                 child->lock.release();
             }
         }
+        // XXX: Dereference address space and free it if there's nothing on it.
+
+        this->addrspace->lock.acquire();
+        this->addrspace->ref--;
+        size_t ref = this->addrspace->ref;
+        NUtil::printf("Process %d: Address space ref count is now %d.\n", this->id, ref);
+        this->addrspace->lock.release();
+
+        if (ref == 0) {
+            NUtil::printf("Process %d: Freeing address space.\n", this->id);
+            delete this->addrspace;
+        }
+
         this->lock.release();
     }
 

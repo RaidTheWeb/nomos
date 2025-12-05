@@ -136,12 +136,11 @@ namespace NArch {
             assert(src, "Invalid source.\n");
             assert(dest, "Invalid destination.\n");
 
-            NLib::ScopeSpinlock sguard(&src->lock);
+            NLib::ScopeIRQSpinlock sguard(&src->lock);
 
             *dest = new struct VMM::addrspace;
-            NLib::ScopeSpinlock dguard(&(*dest)->lock);
+            NLib::ScopeIRQSpinlock dguard(&(*dest)->lock);
 
-            (*dest)->ref = 1;
             (*dest)->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
             assert((*dest)->pml4, "Failed to allocate memory for user space PML4.\n");
             (*dest)->pml4phy = (uintptr_t)(*dest)->pml4;
@@ -150,12 +149,12 @@ namespace NArch {
 
             (*dest)->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000);
 
-            uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
-            assert(entry, "Failed to allocate initial intermediate entry.\n");
-            NLib::memset(hhdmoff(entry), 0, PAGESIZE);
-
-            // Only needs to map entry 0 for the entire userspace address space.
-            (*dest)->pml4->entries[0] = (uint64_t)entry | VMM::WRITEABLE | VMM::USER;
+            for (size_t i = 0; i < 256; i++) { // Map user
+                uint64_t *entry = (uint64_t *)PMM::alloc(PAGESIZE);
+                assert(entry, "Failed to allocate initial intermediate entry.\n");
+                NLib::memset(hhdmoff(entry), 0, PAGESIZE);
+                (*dest)->pml4->entries[i] = (uint64_t)entry | VMM::WRITEABLE | VMM::USER;
+            }
 
             for (size_t i = 256; i < 512; i++) {
                 (*dest)->pml4->entries[i] = src->pml4->entries[i];
@@ -182,11 +181,13 @@ namespace NArch {
 
             if (node->used) { // We should only attempt to duplicate stuff we've used.
 
-                work->dest->vmaspace->reserve(node->start, node->end, node->flags);
+                void *reserved = work->dest->vmaspace->reserve(node->start, node->end, node->flags);
+                assertarg(reserved, "Failed to reserve VMA region %p-%p in destination during fork.\n", (void *)node->start, (void *)node->end);
 
                 size_t size = node->end - node->start;
 
                 bool cowexempt = node->flags & NMem::Virt::VIRT_SHARED; // Is this mapped exempt from CoW?
+                bool readonly = !(node->flags & NMem::Virt::VIRT_RW);
 
                 for (size_t i = 0; i < size; i += PAGESIZE) {
 
@@ -197,24 +198,97 @@ namespace NArch {
                         continue;
                     }
 
+                    PMM::PageMeta *meta = PMM::phystometa(phys);
+                    assertarg(meta, "Failed to get page metadata for physical address %p during address space fork.\n", (void *)phys);
+                    meta->ref();
+
+                    bool make_cow = !cowexempt && !readonly;
+
                     // Map page into destination address space.
-                    assertarg(_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, !cowexempt)), "Failed to destination map page %p during address space fork.\n", node->start + i);
-                    if (!cowexempt) { // Only bother remapping the source if we're doing CoW.
+                    assertarg(_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, make_cow)), "Failed to destination map page %p during address space fork.\n", node->start + i);
+                    if (make_cow) { // Only bother remapping the source if we're doing CoW.
                         assertarg(_mappage(work->src, node->start + i, phys, vmatovmm(node->flags, true)), "Failed to source remap page during %p address space fork.\n", node->start + i);
                     }
                 }
             }
         }
 
+        addrspace::~addrspace(void) {
+            NLib::ScopeIRQSpinlock guard(&this->lock);
+
+            this->vmaspace->traversedata(this->vmaspace->getroot(), [](struct NMem::Virt::vmanode *node, void *data) {
+                struct addrspace *space = (struct addrspace *)data;
+
+                if (node->used) {
+                    size_t size = node->end - node->start;
+
+                    for (size_t i = 0; i < size; i += PAGESIZE) {
+                        uintptr_t phys = VMM::_virt2phys(space, node->start + i);
+                        if (phys == 0) {
+                            continue;
+                        }
+
+                        PMM::PageMeta *meta = PMM::phystometa(phys);
+                        assertarg(meta, "Failed to get page metadata for physical address %p during address space destruction.\n", (void *)phys);
+                        meta->unref();
+                    }
+                }
+            }, this);
+
+            delete this->vmaspace;
+
+            for (size_t i = 0; i < 256; i++) { // Only need to free user tables, kernel tables are static.
+                uint64_t pml4e = this->pml4->entries[i];
+                if (!(pml4e & PRESENT)) {
+                    continue;
+                }
+
+                struct pagetable *pdp = walk(pml4e);
+                if (!pdp) {
+                    continue;
+                }
+
+                for (size_t j = 0; j < 512; j++) {
+                    uint64_t pdpe = pdp->entries[j];
+                    if (!(pdpe & PRESENT)) {
+                        continue;
+                    }
+
+                    struct pagetable *pd = walk(pdpe);
+                    if (!pd) {
+                        continue;
+                    }
+
+                    for (size_t k = 0; k < 512; k++) {
+                        uint64_t pde = pd->entries[k];
+                        if (!(pde & PRESENT)) {
+                            continue;
+                        }
+
+                        struct pagetable *pt = walk(pde);
+                        if (!pt) {
+                            continue;
+                        }
+
+                        PMM::free((void *)hhdmsub(pt), PAGESIZE);
+                    }
+
+                    PMM::free((void *)hhdmsub(pd), PAGESIZE);
+                }
+
+                PMM::free((void *)hhdmsub(pdp), PAGESIZE);
+            }
+            PMM::free((void *)this->pml4phy, PAGESIZE);
+        }
+
         struct addrspace *forkcontext(struct addrspace *src) {
             assert(src, "Invalid source.\n");
 
-            NLib::ScopeSpinlock sguard(&src->lock);
+            NLib::ScopeIRQSpinlock sguard(&src->lock);
 
             struct addrspace *dest = new struct VMM::addrspace;
-            NLib::ScopeSpinlock dguard(&dest->lock);
+            NLib::ScopeIRQSpinlock dguard(&dest->lock);
 
-            dest->ref = 1;
             dest->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
             assert(dest->pml4, "Failed to allocate memory for user space PML4.\n");
             dest->pml4phy = (uintptr_t)dest->pml4;
@@ -243,25 +317,14 @@ namespace NArch {
 
             src->vmaspace->traversedata(src->vmaspace->getroot(), dupvmanode, &work);
 
+            asm volatile("mfence" : : : "memory");
+
             return dest;
         }
 
-        void clonecontext(struct addrspace *space, struct pagetable **pt) {
-            assert(pt != NULL, "Invalid destination for clone.\n");
-
-            *pt = (struct pagetable *)PMM::alloc(PAGESIZE);
-            assert(*pt != NULL, "Failed to allocate top level page for cloned page table.\n");
-            *pt = (struct pagetable *)hhdmoff(*pt);
-
-            // Copy entries into here. The highest level ones are already allocated, so it's just the lower level ones that'll ever change between CPUs, thus, everything stays up to date. The only real thing that needs to be kept consistent manually is the TLB, which can be solved with a shootdown IPI.
-            NLib::memcpy(*pt, space->pml4, sizeof(struct pagetable));
-
-            // We leave it up to whatever uses this function to remember that it belongs to the address space that we cloned.
-        }
-
         void enterucontext(struct pagetable *pt, struct addrspace *space) {
-            NLib::ScopeSpinlock kguard(&kspace.lock);
-            NLib::ScopeSpinlock uguard(&space->lock);
+            NLib::ScopeIRQSpinlock kguard(&kspace.lock);
+            NLib::ScopeIRQSpinlock uguard(&space->lock);
 
             for (size_t i = 0; i < 256; i++) { // Copy lower half userspace tables to kernel map.
                 pt->entries[i] = space->pml4->entries[i];
@@ -354,39 +417,48 @@ namespace NArch {
             // Step through the same process for decoding, but to create non-existent entries.
             struct pagetable *pdp = walk(space->pml4->entries[pml4idx]);
             if (!pdp) { // If this entry hasn't already been allocated.
-                pdp = (struct pagetable *)PMM::alloc(PAGESIZE);
-                if (!pdp) {
+                void *pdp_phys = PMM::alloc(PAGESIZE);
+                if (!pdp_phys) {
                     return false; // Failed to allocate page.
                 }
 
-                // Set pml4 entry to point to new page, has to be a non-higher half address.
-                space->pml4->entries[pml4idx] = (uint64_t)pdp | WRITEABLE | PRESENT | (user ? USER : 0);
-                pdp = (struct pagetable *)hhdmoff(pdp);
+                // Zero the page BEFORE making it visible via the entry.
+                pdp = (struct pagetable *)hhdmoff(pdp_phys);
                 NLib::memset(pdp, 0, PAGESIZE);
+                asm volatile("sfence" : : : "memory"); // Ensure zeroing is visible before entry is set.
+
+                // Set pml4 entry to point to new page, has to be a non-higher half address.
+                space->pml4->entries[pml4idx] = (uint64_t)pdp_phys | WRITEABLE | PRESENT | (user ? USER : 0);
             }
 
             struct pagetable *pd = walk(pdp->entries[pdpidx]);
             if (!pd) { // If this entry hasn't already been allocated.
-                pd = (struct pagetable *)PMM::alloc(PAGESIZE);
-                if (!pd) {
+                void *pd_phys = PMM::alloc(PAGESIZE);
+                if (!pd_phys) {
                     return false; // Failed to allocate page.
                 }
 
-                pdp->entries[pdpidx] = (uint64_t)pd | WRITEABLE | PRESENT | (user ? USER : 0);
-                pd = (struct pagetable *)hhdmoff(pd);
+                // Zero the page BEFORE making it visible via the entry.
+                pd = (struct pagetable *)hhdmoff(pd_phys);
                 NLib::memset(pd, 0, PAGESIZE);
+                asm volatile("sfence" : : : "memory"); // Ensure zeroing is visible before entry is set.
+
+                pdp->entries[pdpidx] = (uint64_t)pd_phys | WRITEABLE | PRESENT | (user ? USER : 0);
             }
 
             struct pagetable *pt = walk(pd->entries[pdidx]);
             if (!pt) { // If this entry hasn't already been allocated.
-                pt = (struct pagetable *)PMM::alloc(PAGESIZE);
-                if (!pt) {
+                void *pt_phys = PMM::alloc(PAGESIZE);
+                if (!pt_phys) {
                     return false; // Failed to allocate page.
                 }
 
-                pd->entries[pdidx] = (uint64_t)pt | WRITEABLE | PRESENT | (user ? USER : 0);
-                pt = (struct pagetable *)hhdmoff(pt);
+                // Zero the page BEFORE making it visible via the entry.
+                pt = (struct pagetable *)hhdmoff(pt_phys);
                 NLib::memset(pt, 0, PAGESIZE);
+                asm volatile("sfence" : : : "memory"); // Ensure zeroing is visible before entry is set.
+
+                pd->entries[pdidx] = (uint64_t)pt_phys | WRITEABLE | PRESENT | (user ? USER : 0);
             }
 
             // At the end of all the indirection:
@@ -489,7 +561,7 @@ namespace NArch {
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
 
             uint64_t vmaflags = prottovma(prot);
             if (flags & MAP_SHARED) {
@@ -583,7 +655,7 @@ namespace NArch {
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
 
             _unmaprange(space, (uintptr_t)ptr, size);
             space->vmaspace->free(ptr, size);
@@ -605,7 +677,7 @@ namespace NArch {
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
 
             uint64_t vmaflags = prottovma(prot);
 
@@ -627,7 +699,6 @@ namespace NArch {
 
         void setup(void) {
 
-            kspace.ref = 1; // Initial reference set.
             kspace.pml4 = (struct pagetable *)PMM::alloc(PAGESIZE);
             assert(kspace.pml4 != NULL, "Failed to allocate top level page for kernel address space.\n");
 

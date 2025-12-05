@@ -580,7 +580,7 @@ namespace NLib {
             }
 
             bool empty(void) {
-                return this->head;
+                return this->head == NULL;
             }
 
             T pop(void) {

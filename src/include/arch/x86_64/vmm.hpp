@@ -116,8 +116,10 @@ namespace NArch {
             // Virtual address space allocation:
             NMem::Virt::VMASpace *vmaspace;
 
-            size_t ref;
-            Spinlock lock;
+            size_t ref = 0;
+            IRQSpinlock lock;
+
+            ~addrspace(void);
         };
 
         // (Unlocked) Resolve physical address of a virtual address.
@@ -147,45 +149,45 @@ namespace NArch {
 
         // Resolve physical address of virtual address.
         static uintptr_t virt2phys(struct addrspace *space, uintptr_t virt) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             return _virt2phys(space, virt);
         }
 
         // Resolve page table entry of a virtual address.
         static uint64_t *resolvepte(struct addrspace *space, uintptr_t virt) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             return _resolvepte(space, virt);
         }
 
         // Map a virtual address with an entry.
         static bool mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             return _mappage(space, virt, phys, flags);
         }
 
         static bool remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             return _remappage(space, virt, newphys, flags);
         }
 
         // Unmap a virtual address.
         static void unmappage(struct addrspace *space, uintptr_t virt) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             _unmappage(space, virt);
         }
 
         static bool maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             return _maprange(space, virt, phys, flags, size);
         }
 
         static bool remaprange(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags, size_t size) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             return _remaprange(space, virt, newphys, flags, size);
         }
 
         static void unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
-            NLib::ScopeSpinlock guard(&space->lock);
+            NLib::ScopeIRQSpinlock guard(&space->lock);
             _unmaprange(space, virt, size);
         }
 

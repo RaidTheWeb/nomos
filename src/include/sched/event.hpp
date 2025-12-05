@@ -9,11 +9,12 @@ namespace NSched {
 
     class WaitQueue {
         private:
-            NArch::Spinlock waitinglock;
             NLib::DoubleList<Thread *> waiting;
         public:
-            // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn.
-            void wait(void);
+
+            NArch::IRQSpinlock waitinglock;
+            // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn. Takes an optional parameter specifying whether the wait queue lock is already held.
+            void wait(bool locked = false);
             // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
             void wake(void);
     };
@@ -22,7 +23,12 @@ namespace NSched {
 #define waitevent(wq, condition) { \
         if (!(condition)) { \
             for (;;) { \
-                (wq)->wait(); \
+                (wq)->waitinglock.acquire(); \
+                if (!(condition)) { \
+                    (wq)->wait(true); \
+                } else { \
+                    (wq)->waitinglock.release(); \
+                } \
                 if ((condition)) { \
                     break; \
                 } \
@@ -34,9 +40,15 @@ namespace NSched {
 #define waiteventlocked(wq, condition, lock) { \
         if (!(condition)) { \
             for (;;) { \
+                (wq)->waitinglock.acquire(); \
                 (lock)->release(); \
-                (wq)->wait(); \
-                (lock)->acquire(); \
+                if (!(condition)) { \
+                    (wq)->wait(true); \
+                    (lock)->acquire(); \
+                } else { \
+                    (wq)->waitinglock.release(); \
+                    (lock)->acquire(); \
+                } \
                 if ((condition)) { \
                     break; \
                 } \

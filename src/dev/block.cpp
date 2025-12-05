@@ -59,7 +59,7 @@ namespace NDev {
         // Check if MBR or GPT.
         uint8_t mbrsector[512];
         ssize_t res = dev->readbytes(mbrsector, sizeof(mbrsector), 0, 0);
-        if (res != 0) {
+        if (res != sizeof(mbrsector)) {
             NUtil::printf("[dev/block]: Failed to read MBR sector for partition info (err=%d).\n", (int)res);
             return NULL;
         }

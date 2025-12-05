@@ -111,18 +111,21 @@ namespace NArch {
                 );
 
                 struct VMM::addrspace *space = NArch::CPU::get()->currthread->process->addrspace;
-                uint64_t *pte = VMM::resolvepte(space, addr);
+                space->lock.acquire();
+                uint64_t *pte = VMM::_resolvepte(space, addr);
 
                 if (!pte || !(*pte & VMM::PRESENT)) {
                     // NSched::deliversignal(NArch::CPU::get()->currthread, SIGSEGV);
                     // return;
+                    space->lock.release();
                     goto pffault;
                 }
 
-
+                // Handle copy-on-write page fault (checks if the fault was caused by a write and the page is marked as copy-on-write).
                 if (ctx->err & (1 << 1) && (*pte) & VMM::COW) {
                     void *newpage = PMM::alloc(PAGESIZE);
                     if (!newpage) {
+                        space->lock.release();
                         NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL, ctx);
                         return;
                     }
@@ -131,21 +134,23 @@ namespace NArch {
                     void *oldpage = (void *)(*pte & VMM::ADDRMASK);
                     NLib::memcpy(hhdmoff(newpage), hhdmoff(oldpage), PAGESIZE);
 
-                    space->lock.acquire();
-                    uint64_t newpte = (uint64_t)newpage | (*pte & ~VMM::ADDRMASK);
+                    // Construct new PTE: use properly masked physical address with preserved flags.
+                    uint64_t newpte = ((uint64_t)newpage & VMM::ADDRMASK) | (*pte & ~VMM::ADDRMASK);
                     newpte |= VMM::WRITEABLE;
                     newpte &= ~VMM::COW;
                     *pte = newpte;
                     space->lock.release();
+
+                    PMM::PageMeta *meta = PMM::phystometa((uintptr_t)oldpage);
+                    assertarg(meta, "Failed to get page metadata for physical address %p during COW page fault handling.\n", (void *)oldpage);
+                    meta->unref(); // Unref old page, free if needed.
 
                     // XXX: Free pages with no more references from any thread.
                     NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
                     return;
                 }
 pffault:
-
-
-                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s.\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor");
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", ctx->err & (1 << 2) ? NArch::CPU::get()->currthread->process->id : 0);
             } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
             } else if ((isr->id & 0xffffffff) == 7) { // #NM

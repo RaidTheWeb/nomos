@@ -4,6 +4,7 @@
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/sync.hpp>
+#include <mm/slab.hpp>
 #include <util/kprint.hpp>
 
 namespace NArch {
@@ -12,11 +13,7 @@ namespace NArch {
         struct zone zone;
         struct bzone bitmapzones[16]; // Allow for 16 disjointed zones at max. The bitmap allocator is given all the smaller regions, as they're usually also above the traditional block size of the buddy allocator.
         size_t numbitmapzones = 0;
-        Spinlock alloclock;
-
-        size_t alloci = 0;
-
-        Spinlock metalock;
+        IRQSpinlock alloclock;
 
         static const char *maptype[] = {
             "USABLE",
@@ -56,7 +53,7 @@ namespace NArch {
 
                 if (entry->type == LIMINE_MEMMAP_USABLE) {
                     uintptr_t regionbase = NLib::alignup(entry->base, PAGESIZE);
-                    uintptr_t regionend = NLib::alignup(entry->base + entry->length, PAGESIZE);
+                    uintptr_t regionend = NLib::aligndown(entry->base + entry->length, PAGESIZE);
                     if (regionend <= regionbase) {
                         continue;
                     }
@@ -155,23 +152,25 @@ namespace NArch {
 
             // Allocate page tracking metadata for all zones.
 
-            zone.meta = (PageMeta *)PMM::alloc((zone.size / PAGESIZE) * sizeof(PageMeta)); // Allocate zone's metadata.
+            zone.meta = (PageMeta *)PMM::alloc((zone.size / PAGESIZE) * sizeof(PageMeta), FLAGS_NOTRACK); // Allocate zone's metadata.
             assert(zone.meta, "Failed to allocate buddy allocator page metadata.\n");
             zone.meta = (PageMeta *)hhdmoff(zone.meta);
 
             for (size_t i = 0; i < zone.size / PAGESIZE; i++) {
                 zone.meta[i].refcount = 0;
                 zone.meta[i].flags = 0;
+                zone.meta[i].addr = (uintptr_t)hhdmsub((void *)zone.addr) + (i * PAGESIZE);
             }
 
             for (size_t i = 0; i < numbitmapzones; i++) {
-                bitmapzones[i].meta = (PageMeta *)PMM::alloc((bitmapzones[i].size / PAGESIZE) * sizeof(PageMeta));
+                bitmapzones[i].meta = (PageMeta *)PMM::alloc((bitmapzones[i].size / PAGESIZE) * sizeof(PageMeta), FLAGS_NOTRACK); // Allocate zone's metadata.
                 assert(bitmapzones[i].meta, "Failed to allocate bitmap page metadata.\n");
                 bitmapzones[i].meta = (PageMeta *)hhdmoff(bitmapzones[i].meta);
 
                 for (size_t j = 0; j < bitmapzones[i].size / PAGESIZE; j++) {
                     bitmapzones[i].meta[j].refcount = 0;
                     bitmapzones[i].meta[j].flags = 0;
+                    bitmapzones[i].meta[j].addr = (uintptr_t)hhdmsub((void *)bitmapzones[i].addr) + (j * PAGESIZE);
                 }
             }
 
@@ -188,7 +187,7 @@ namespace NArch {
 
             NUtil::printf("[arch/x86_64/pmm]: Buddy allocator self-test passed.\n");
 
-            void *test3 = alloc(2 * 1024 * 1000);
+            void *test3 = alloc(2 * 1024 * 1024);
             assert(test3 != NULL, "Failed to allocate large bitmap allocation.\n");
             free(test3, 2 * 1024 * 1024);
 
@@ -201,29 +200,43 @@ namespace NArch {
         }
 
         void PageMeta::ref(void) {
-
+            NLib::ScopeIRQSpinlock guard(&this->pagelock);
+            this->refcount++;
         }
 
         void PageMeta::unref(void) {
+            bool dofree = false;
+            {
+                NLib::ScopeIRQSpinlock guard(&this->pagelock);
+                assert(this->refcount > 0, "Attempting to unref page with zero refcount.\n");
+                this->refcount--;
 
-        }
+                if (this->refcount == 0) {
+                    dofree = true;
+                }
+            }
 
-        void PageMeta::free(void) {
-
+            if (dofree) {
+                if (this->flags & PAGEMETA_DEVICEMAP) {
+                    // Device-mapped memory is not freed.
+                    return;
+                } else {
+                    PMM::free((void *)this->addr, PAGESIZE, false);
+                }
+            }
         }
 
         PageMeta *phystometa(uintptr_t phys) {
             if (phys >= (uintptr_t)hhdmsub((void *)zone.addr) && phys < (uintptr_t)hhdmsub((void *)zone.addr) + zone.size) {
                 // Buddy.
-
-                return &zone.meta[(phys - zone.addr) / PAGESIZE];
+                return &zone.meta[(phys - (uintptr_t)hhdmsub((void *)zone.addr)) / PAGESIZE];
             } else {
                 // Bitmap.
 
                 for (size_t i = 0; i < numbitmapzones; i++) {
-                    if (phys >= bitmapzones[i].addr && phys < bitmapzones[i].addr + bitmapzones[i].size) { // We found our bitmap zone.
+                    if (phys >= (uintptr_t)hhdmsub((void *)bitmapzones[i].addr) && phys < (uintptr_t)hhdmsub((void *)bitmapzones[i].addr) + bitmapzones[i].size) { // We found our bitmap zone.
 
-                        return &bitmapzones[i].meta[(phys - bitmapzones[i].addr) / PAGESIZE];
+                        return &bitmapzones[i].meta[(phys - (uintptr_t)hhdmsub((void *)bitmapzones[i].addr)) / PAGESIZE];
                     }
                 }
             }
@@ -231,7 +244,7 @@ namespace NArch {
             return NULL;
         }
 
-        void *buddyalloc(size_t size) {
+        void *buddyalloc(size_t size, uint8_t flags) {
             // NOTE: Due to the behaviour of a freelist (last block is first in free list), the PMM buddy allocator will grow upwards from the allocatable region base.
 
             // Round up to nearest block size that fits this allocation.
@@ -278,18 +291,23 @@ namespace NArch {
             // We have now reached the point when we can actually pull something off the free list here.
             struct block *alloc = zone.freelist[level];
 
-            metalock.acquire();
-            for (size_t i = 0; i < size; i++) {}
-            PageMeta *meta = phystometa((uintptr_t)hhdmsub(alloc));
-            meta->ref();
-            metalock.release();
+            if (!(flags & FLAGS_NOTRACK)) {
+                // Reference pages in allocation.
+                for (size_t i = 0; i < actual / PAGESIZE; i++) {
+                    PageMeta *meta = &zone.meta[((uintptr_t)hhdmsub((void *)alloc) + (i * PAGESIZE) - (uintptr_t)hhdmsub((void *)zone.addr)) / PAGESIZE];
+                    if (flags & FLAGS_DEVICE) {
+                        meta->flags |= PageMeta::PAGEMETA_DEVICEMAP;
+                    }
+                    meta->ref();
+                }
+            }
 
             zone.freelist[level] = alloc->next; // We're consuming this block now.
             alloc->canary = 0; // Remove canary.
-            return (void *)((uintptr_t)alloc - NLimine::hhdmreq.response->offset); // Return block allocation.
+            return (void *)hhdmsub((void *)alloc); // Return block allocation.
         }
 
-        void *bmapalloc(size_t size) {
+        void *bmapalloc(size_t size, uint8_t flags) {
 
             size_t needed = NLib::alignup(size, PAGESIZE) / PAGESIZE;
             void *res = NULL;
@@ -320,6 +338,18 @@ namespace NArch {
                             for (size_t j = 0; j < needed; j++) {
                                 bmap[(page + j) / 8] |= (1 << ((page + j) % 8)); // Mark.
                             }
+
+                            if (!(flags & FLAGS_NOTRACK)) {
+                                // Reference pages in allocation.
+                                for (size_t j = 0; j < needed; j++) {
+                                    PageMeta *meta = &bitmapzones[i].meta[page + j];
+                                    if (flags & FLAGS_DEVICE) {
+                                        meta->flags |= PageMeta::PAGEMETA_DEVICEMAP;
+                                    }
+                                    meta->ref();
+                                }
+                            }
+
                             res = (void *)((uintptr_t)hhdmsub((void *)(bitmapzones[i].addr + page * PAGESIZE)));
                             goto done;
                         }
@@ -331,17 +361,16 @@ done:
             return res;
         }
 
-        void *alloc(size_t size) {
-            NLib::ScopeSpinlock guard(&alloclock);
+        void *alloc(size_t size, uint8_t flags) {
+            NLib::ScopeIRQSpinlock guard(&alloclock);
 
-            alloci++;
             if (size <= (SMALLESTBLOCK << (ALLOCLEVEL - 1))) { // Allocation could theoretically be made with the buddy allocator.
-                return buddyalloc(size);
+                return buddyalloc(size, flags);
             }
-            return bmapalloc(size);
+            return bmapalloc(size, flags);
         }
 
-        void buddyfree(void *ptr) {
+        void buddyfree(void *ptr, bool track) {
             uintptr_t addr = (uintptr_t)ptr + NLimine::hhdmreq.response->offset;
             assertarg(((struct block *)addr)->canary != CANARY, "Double free occurred on address %p.\n", ptr);
 
@@ -367,9 +396,11 @@ done:
                     prev = &(*prev)->next;
                 }
 
-                if (*prev == buddy) {
-                    *prev = buddy->next; // Remove buddy from freelist (we're merging with it upwards).
+                if (*prev != buddy) {
+                    break; // The buddy has canary but is not in freelist - don't merge!
                 }
+
+                *prev = buddy->next; // Remove buddy from freelist (we're merging with it upwards).
 
                 addr &= ~size; // Raise address to next biggest block size alignment (this will include the buddy).
                 size <<= 1; // Move to higher level.
@@ -384,9 +415,17 @@ done:
             // Direct freelist head to the newly merged block.
             block->next = zone.freelist[level];
             zone.freelist[level] = block;
+
+            if (track) {
+                // Unref pages in allocation.
+                for (size_t i = 0; i < size / PAGESIZE; i++) {
+                    PageMeta *meta = &zone.meta[((uintptr_t)hhdmsub((void *)addr) + (i * PAGESIZE) - (uintptr_t)hhdmsub((void *)zone.addr)) / PAGESIZE];
+                    meta->zeroref();
+                }
+            }
         }
 
-        void bitmapfree(void *ptr, size_t size) {
+        void bitmapfree(void *ptr, size_t size, bool track) {
             size_t pages = NLib::alignup(size, PAGESIZE) / PAGESIZE;
             uintptr_t addr = (uintptr_t)hhdmoff(ptr);
 
@@ -398,6 +437,9 @@ done:
                             break;
                         }
                         bitmapzones[i].bitmap[(page + j) / 8] &= ~(1 << ((page + j) % 8));
+                        if (track) {
+                            bitmapzones[i].meta[page + j].zeroref(); // Unref each page in the block.
+                        }
                     }
                     break;
                 }
@@ -405,21 +447,19 @@ done:
 
         }
 
-        void free(void *ptr, size_t size) {
+        void free(void *ptr, size_t size, bool track) {
             if (!ptr) {
                 return;
             }
 
             // TODO: Defer the merging!
-            NLib::ScopeSpinlock guard(&alloclock);
-
-            alloci--;
+            NLib::ScopeIRQSpinlock guard(&alloclock);
 
             if ((uintptr_t)ptr >= (uintptr_t)hhdmsub((void *)zone.addr) && (uintptr_t)ptr < (uintptr_t)hhdmsub((void *)zone.addr) + zone.size) { // If our pointer exists within the buddy allocator region, we can assume it'll be freed by it.
-                buddyfree(ptr);
+                buddyfree(ptr, track);
             } else {
                 assert(size > 0, "Attempting to free bitmap allocation without size.\n");
-                bitmapfree(ptr, size);
+                bitmapfree(ptr, size, track);
             }
         }
     }

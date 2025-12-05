@@ -19,15 +19,25 @@ namespace NArch {
     static const uint64_t CANARY = 0x4fc0ffee2dead9f5; // Magic "canary" to be stored at the start of free entries, to check for UAF errors.
 
     namespace PMM {
-        // Phyical page metadata.
+        // Physical page metadata.
         class PageMeta {
             public:
-                size_t refcount = 0;
-                uint64_t flags = 0;
+                enum flags {
+                    PAGEMETA_DEVICEMAP  = (1 << 0)       // Page is used for memory-mapped device (no free, allocating context is expected to clean this up).
+                };
+
+                NArch::IRQSpinlock pagelock; // Lock for this page's metadata.
+                uint32_t refcount = 0;
+                uint8_t flags = 0;
+                uintptr_t addr = 0; // Physical address of this page.
 
                 void ref(void);
                 void unref(void);
-                void free(void);
+                void zeroref(void) {
+                    NLib::ScopeIRQSpinlock guard(&this->pagelock);
+                    this->flags = 0;
+                    this->refcount = 0;
+                }
         };
 
         struct block {
@@ -57,8 +67,15 @@ namespace NArch {
         extern size_t alloci;
         void setup(void);
 
-        void *alloc(size_t size);
-        void free(void *ptr, size_t size = 0);
+        enum flags {
+            FLAGS_NOTRACK   = (1 << 0), // Allocation that is not tracked (for early allocations).
+            FLAGS_NOWAIT    = (1 << 1), // Allocation must not block (returns NULL if no memory available, for use in interrupt context).
+            FLAGS_DEVICE    = (1 << 2)  // Device-mapped allocation (not automatically freed).
+        };
+
+        // TODO: Memory reclamation, so FLAGS_NOWAIT has a use.
+        void *alloc(size_t size, uint8_t flags = 0);
+        void free(void *ptr, size_t size = 0, bool track = true);
     }
 }
 
