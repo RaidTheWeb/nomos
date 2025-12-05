@@ -237,7 +237,7 @@ namespace NArch {
 
             delete this->vmaspace;
 
-            for (size_t i = 0; i < 256; i++) { // Only need to free user tables, kernel tables are static.
+            for (size_t i = 0; i < 256; i++) { // Only need to free user tables, kernel tables are shared.
                 uint64_t pml4e = this->pml4->entries[i];
                 if (!(pml4e & PRESENT)) {
                     continue;
