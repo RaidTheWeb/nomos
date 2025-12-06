@@ -26,7 +26,9 @@ namespace NMem {
 
 
         // Userspace safe copy of string to kernel buffer.
-        int strncpy(char *dest, const char *src, size_t size);
+        int strncpyfrom(char *dest, const char *src, size_t size);
+        // Userspace safe copy of string from kernel buffer to userspace.
+        int strncpyto(char *dest, const char *src, size_t size);
         // Userspace safe string length of userspace buffer.
         ssize_t strnlen(const char *src, size_t max);
         // Userspace safe copy from userspace to kernel buffer.

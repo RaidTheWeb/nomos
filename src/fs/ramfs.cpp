@@ -40,6 +40,42 @@ namespace NFS {
             return count;
         }
 
+        ssize_t RAMNode::readdir(void *buf, size_t count, off_t offset) {
+            NLib::ScopeSpinlock guard(&this->metalock);
+
+            if (!VFS::S_ISDIR(this->attr.st_mode)) {
+                return -ENOTDIR;
+            }
+
+            size_t bytesread = 0;
+            size_t curroffset = 0;
+            NLib::HashMap<RAMNode *>::Iterator it = this->children.begin();
+
+            while (it.valid()) {
+                RAMNode *child = *it.value();
+                size_t reclen = sizeof(struct VFS::dirent);
+                if (curroffset >= (size_t)offset) {
+                    if (bytesread + reclen > count) {
+                        break; // No more space.
+                    }
+
+                    struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
+                    dentry->d_ino = child->attr.st_ino;
+                    dentry->d_off = bytesread + reclen;
+                    dentry->d_reclen = (uint16_t)reclen;
+                    dentry->d_type = (child->attr.st_mode & VFS::S_IFMT) >> 12; // File type is stored in the high bits of st_mode.
+                    NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
+                    NLib::strncpy(dentry->d_name, (char *)child->getname(), sizeof(dentry->d_name) - 1);
+
+                    bytesread += reclen;
+                }
+                curroffset += reclen;
+                it.next();
+            }
+
+            return bytesread;
+        }
+
         VFS::INode *RAMNode::resolvesymlink(void) {
             this->datalock.acquire();
 
@@ -97,6 +133,24 @@ namespace NFS {
             }
 
             return this->children.remove(name);
+        }
+
+        int RAMFileSystem::mount(const char *path, VFS::INode *mntnode) {
+            (void)path;
+
+            NLib::ScopeSpinlock guard(&this->spin);
+
+            if (this->mounted) {
+                return -EINVAL;
+            }
+
+            // Set the parent of the root node to the mountpoint node.
+            if (mntnode) {
+                this->root->setparent(mntnode);
+            }
+
+            this->mounted = true;
+            return 0;
         }
 
         int RAMFileSystem::umount(void) {

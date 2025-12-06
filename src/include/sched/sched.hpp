@@ -188,6 +188,9 @@ namespace NSched {
             size_t tidcounter = 1; // Thread ID counter.
             NFS::VFS::FileDescriptorTable *fdtable = NULL;
             NFS::VFS::INode *cwd = NULL;
+
+            // At process creation, these should all be the UID and GID of the runner.
+
             // Effective UID and GID, manipulated by syscalls.
             int euid = 0;
             int egid = 0;

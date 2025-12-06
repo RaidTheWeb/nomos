@@ -7,8 +7,8 @@
 namespace NFS {
     namespace USTAR {
 
-        int USTARFileSystem::mount(const char *path) {
-            int super = this->RAMFS::RAMFileSystem::mount(path); // Super.
+        int USTARFileSystem::mount(const char *path, VFS::INode *mntnode) {
+            int super = this->RAMFS::RAMFileSystem::mount(path, mntnode); // Super.
             if (super != 0) {
                 return super;
             }
@@ -43,12 +43,16 @@ namespace NFS {
                 uint64_t fsize = oct2int(current->size, sizeof(current->size));
                 uint64_t mtime = oct2int(current->mtime, sizeof(current->mtime));
                 uint64_t mode = oct2int(current->mode, sizeof(current->mode));
+                uint64_t uid = oct2int(current->uid, sizeof(current->uid));
+                uint64_t gid = oct2int(current->gid, sizeof(current->gid));
 
                 VFS::INode *node = NULL;
                 switch (current->type) {
                     case type::FILE: {
                         struct VFS::stat attr;
                         attr.st_mode = mode | VFS::S_IFREG;
+                        attr.st_uid = uid;
+                        attr.st_gid = gid;
                         attr.st_mtime = mtime;
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
@@ -60,6 +64,8 @@ namespace NFS {
                     case type::DIR: {
                         struct VFS::stat attr;
                         attr.st_mode = mode | VFS::S_IFDIR;
+                        attr.st_uid = uid;
+                        attr.st_gid = gid;
                         attr.st_mtime = mtime;
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
@@ -68,6 +74,8 @@ namespace NFS {
                     case type::SYMLINK: {
                         struct VFS::stat attr;
                         attr.st_mode = mode | VFS::S_IFLNK;
+                        attr.st_uid = uid;
+                        attr.st_gid = gid;
                         attr.st_mtime = mtime;
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");

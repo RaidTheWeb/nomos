@@ -70,6 +70,21 @@ void operator delete[](void *ptr, size_t size) {
 // Called within the architecture-specific initialisation thread. Stage 1 (early).
 void kpostarch(void) {
 
+    const char *initramfs = NArch::cmdline.get("initramfs");
+    if (initramfs) { // Exists, load it.
+        struct NArch::Module::modinfo mod = NArch::Module::loadmodule(initramfs); // Try to load.
+        assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
+
+        if (NArch::cmdline.get("root") && !NLib::strcmp(NArch::cmdline.get("root"), "initramfs")) { // If the boot command line specifies that the initramfs should be used as the filesystem root, we should load it.
+            NFS::USTAR::USTARFileSystem *fs = new NFS::USTAR::USTARFileSystem(&NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
+            NFS::VFS::vfs.mount("/", fs);
+        }
+    }
+
+    NFS::VFS::vfs.create("/dev", (struct NFS::VFS::stat) {
+        .st_mode = 0755 | NFS::VFS::S_IFDIR,
+    });
+
     NDev::setup(); // Initialise device registry.
 
     NFS::DEVFS::DevFileSystem *devfs = new NFS::DEVFS::DevFileSystem(&NFS::VFS::vfs); // Create and mount device filesystem.
@@ -92,17 +107,6 @@ void kpostarch(void) {
     }
 
     NDev::PCI::init(); // Initialise PCI.
-
-    const char *initramfs = NArch::cmdline.get("initramfs");
-    if (initramfs) { // Exists, load it.
-        struct NArch::Module::modinfo mod = NArch::Module::loadmodule(initramfs); // Try to load.
-        assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
-
-        if (NArch::cmdline.get("root") && !NLib::strcmp(NArch::cmdline.get("root"), "initramfs")) { // If the boot command line specifies that the initramfs should be used as the filesystem root, we should load it.
-            NFS::USTAR::USTARFileSystem *fs = new NFS::USTAR::USTARFileSystem(&NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
-            NFS::VFS::vfs.mount("/", fs);
-        }
-    }
 
     NFS::VFS::INode *node = NFS::VFS::vfs.resolve("/test");
     assert(node, "Failed to locate file.\n");

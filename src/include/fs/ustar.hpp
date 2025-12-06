@@ -50,7 +50,7 @@ namespace NFS {
                     this->modinfo = mod;
                 }
 
-                int mount(const char *path) override;
+                int mount(const char *path, VFS::INode *mntnode) override;
         };
 
         // Convert octal to binary integer.

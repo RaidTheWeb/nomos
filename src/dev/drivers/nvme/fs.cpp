@@ -18,6 +18,10 @@ namespace NDev {
             NVMEBlockDevice *blkdev = (NVMEBlockDevice *)registry->get(dev);
 
             if (blkdev) {
+                if (!NMem::UserCopy::valid(buf, count)) {
+                    return -EFAULT; // Invalid buffer.
+                }
+
                 return blkdev->readbytes(buf, count, offset, fdflags);
             }
             return -ENODEV;
@@ -35,6 +39,10 @@ namespace NDev {
             NVMEBlockDevice *blkdev = (NVMEBlockDevice *)registry->get(dev);
 
             if (blkdev) {
+                if (!NMem::UserCopy::valid(buf, count)) {
+                    return -EFAULT; // Invalid buffer.
+                }
+
                 return blkdev->writebytes(buf, count, offset, fdflags);
             }
             return -ENODEV;

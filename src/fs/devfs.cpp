@@ -19,6 +19,42 @@ namespace NFS {
             return this->device->driver->write(this->attr.st_rdev, buf, count, offset, fdflags);
         }
 
+        ssize_t DevNode::readdir(void *buf, size_t count, off_t offset) {
+            NLib::ScopeSpinlock guard(&this->metalock);
+
+            if (!VFS::S_ISDIR(this->attr.st_mode)) {
+                return -ENOTDIR;
+            }
+
+            size_t bytesread = 0;
+            size_t curroffset = 0;
+            NLib::HashMap<DevNode *>::Iterator it = this->children.begin();
+
+            while (it.valid()) {
+                DevNode *child = *it.value();
+                size_t reclen = sizeof(struct VFS::dirent);
+                if (curroffset >= (size_t)offset) {
+                    if (bytesread + reclen > count) {
+                        break; // No more space.
+                    }
+
+                    struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
+                    dentry->d_ino = child->attr.st_ino;
+                    dentry->d_off = bytesread + reclen;
+                    dentry->d_reclen = (uint16_t)reclen;
+                    dentry->d_type = (child->attr.st_mode & VFS::S_IFMT) >> 12; // File type is stored in the high bits of st_mode.
+                    NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
+                    NLib::strncpy(dentry->d_name, (char *)child->getname(), sizeof(dentry->d_name) - 1);
+
+                    bytesread += reclen;
+                }
+                curroffset += reclen;
+                it.next();
+            }
+
+            return bytesread;
+        }
+
         int DevNode::open(int flags) {
             if (!this->device) {
                 return -ENODEV;
@@ -127,13 +163,18 @@ namespace NFS {
         }
 
 
-        int DevFileSystem::mount(const char *path) {
+        int DevFileSystem::mount(const char *path, VFS::INode *mntnode) {
             (void)path;
 
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (this->mounted) {
                 return -EINVAL;
+            }
+
+            // Set the parent of the root node to the mountpoint node.
+            if (mntnode) {
+                this->root->setparent(mntnode);
             }
 
             this->mounted = true;
@@ -164,6 +205,10 @@ namespace NFS {
                 dnode->setdev(dev);
                 dev->ifnode = dnode; // Give device a reference to the node it is connected to.
             } else {
+                if (VFS::S_ISDIR(attr.st_mode)) {
+                    // Directories can exist without devices.
+                    return dnode;
+                }
                 delete dnode; // Invalid node.
                 return NULL;
             }

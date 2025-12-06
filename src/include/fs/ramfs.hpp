@@ -32,6 +32,7 @@ namespace NFS {
 
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
+                ssize_t readdir(void *buf, size_t count, off_t offset) override;
                 VFS::INode *lookup(const char *name) override;
                 bool add(VFS::INode *node) override;
                 bool remove(const char *name) override;
@@ -49,16 +50,7 @@ namespace NFS {
                     this->root = new RAMNode(this, "", attr);
                 }
 
-                int mount(const char *path) override {
-                    (void)path;
-
-                    NLib::ScopeSpinlock guard(&this->spin);
-                    if (this->mounted) {
-                        return -EINVAL; // Already mounted.
-                    }
-                    this->mounted = true;
-                    return 0;
-                };
+                int mount(const char *path, VFS::INode *mntnode) override;
                 int umount(void) override;
                 int sync(void) override { return 0; }
 

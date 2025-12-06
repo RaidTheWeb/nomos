@@ -114,6 +114,16 @@ namespace NFS {
             return (m & S_IFMT) == S_IFIFO;
         }
 
+        // Is the SUID bit present?
+        constexpr bool S_ISSUID(uint32_t m) {
+            return (m & S_ISUID);
+        }
+
+        // Is the SGID bit present?
+        constexpr bool S_ISSGID(uint32_t m) {
+            return (m & S_ISGID);
+        }
+
         struct stat {
             uint64_t st_dev     = 0;
             uint32_t st_ino     = 0;
@@ -128,6 +138,14 @@ namespace NFS {
             uint64_t st_atime   = 0;
             uint64_t st_mtime   = 0;
             uint64_t st_ctime   = 0;
+        };
+
+        struct dirent {
+            uint32_t d_ino;              // Inode number.
+            off_t d_off;                 // Offset to the next dirent.
+            uint16_t d_reclen;           // Length of this record.
+            uint8_t d_type;              // Type of file.
+            char d_name[256];            // Filename (null-terminated).
         };
 
         enum pollevents {
@@ -285,13 +303,14 @@ namespace NFS {
         // Generic VFS node interface.
         class INode {
             protected:
-                uint32_t refcount = 0;
+                uint32_t refcount = 1; // Start at one because it *exists*.
                 NArch::Spinlock metalock; // Meta lock for this node.
-                IFileSystem *fs;
                 struct stat attr;
                 const char *name;
                 INode *parent = NULL;
             public:
+                IFileSystem *fs;
+
                 INode(IFileSystem *fs, const char *name, struct stat attr) {
                     this->fs = fs;
                     this->attr = attr;
@@ -302,6 +321,7 @@ namespace NFS {
 
                 virtual ssize_t read(void *buf, size_t count, off_t offset, int fdflags) = 0;
                 virtual ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) = 0;
+                virtual ssize_t readdir(void *buf, size_t count, off_t offset) = 0;
                 virtual int open(int flags) {
                     (void)flags;
                     return 0;
@@ -372,11 +392,14 @@ namespace NFS {
                     this->attr = attr;
                 }
 
+                Path getpath(void);
+
                 void ref(void) {
                     __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
                 void unref(void) {
                     __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
+                    // XXX: Delete.
                 }
         };
 
@@ -405,7 +428,7 @@ namespace NFS {
                     return this->vfs;
                 }
 
-                virtual int mount(const char *path) = 0; // Called upon mount -> Good for initialising nodes.
+                virtual int mount(const char *path, INode *mntnode) = 0; // Called upon mount -> Good for initialising nodes.
                 virtual int umount(void) = 0; // Called upon unmount -> Good for clean up.
                 virtual int sync(void) = 0; // Called whenever a sync is required.
 
@@ -414,19 +437,23 @@ namespace NFS {
         };
 
         class VFS {
-            private:
+            public:
                 struct mntpoint {
                     const char *path;
                     IFileSystem *fs;
                     INode *mntnode;
                 };
-                NLib::DoubleList<struct mntpoint> mounts;
+
                 NArch::Spinlock mountlock; // XXX: RW lock?
+
+                NLib::DoubleList<struct mntpoint> mounts;
+            private:
 
                 INode *root = NULL;
 
-                struct mntpoint *findmount(Path *path);
             public:
+                struct mntpoint *findmount(Path *path);
+
                 // Mount filesystem on path.
                 int mount(const char *path, IFileSystem *fs);
                 // Unmount filesystem on path.

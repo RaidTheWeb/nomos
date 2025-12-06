@@ -11,45 +11,83 @@ namespace NFS {
         VFS vfs = VFS();
 
         int VFS::mount(const char *path, IFileSystem *fs) {
-            NLib::ScopeSpinlock guard(&this->mountlock);
-
-            this->mounts.push((struct VFS::mntpoint) { path, fs, NULL });
+            INode *mntnode = NULL;
             Path mntpath = Path(path);
 
-            if (!mntpath.depth() && !this->root) { // Attempt to assign root if we haven't already.
-                this->root = fs->getroot();
+            // Resolve the mountpoint node (except for root mount).
+            if (mntpath.depth() > 0) {
+                mntnode = this->resolve(path, NULL, true);
+                if (!mntnode) {
+                    return -ENOENT; // Mountpoint doesn't exist.
+                }
             }
 
-            if (fs->mount(path) != 0) {
+            {
+                NLib::ScopeSpinlock guard(&this->mountlock);
+                this->mounts.push((struct VFS::mntpoint) { path, fs, mntnode });
+
+                if (!mntpath.depth() && !this->root) { // Attempt to assign root if we haven't already.
+                    this->root = fs->getroot();
+                }
+            }
+
+            if (fs->mount(path, mntnode) != 0) {
                 this->umount(path);
+                if (mntnode) {
+                    mntnode->unref();
+                }
                 return -EINVAL;
             }
             return 0;
         }
 
         int VFS::umount(const char *path) {
-            NLib::ScopeSpinlock guard(&this->mountlock);
+            struct umount_ud {
+                const char *match;
+                IFileSystem *fs;
+                size_t depth;
+                bool found;
+            } ud = { path, NULL, 0, false };
 
-            bool worked = this->mounts.remove([](struct mntpoint mnt, void *udata) {
-                const char *p = (const char *)udata;
-                if (!NLib::strcmp(mnt.path, p)) {
-                    mnt.fs->umount();
-                    return true;
+            {
+                NLib::ScopeSpinlock guard(&this->mountlock);
+
+                bool worked = this->mounts.remove([](struct mntpoint mnt, void *udata) {
+                    struct umount_ud *u = (struct umount_ud *)udata;
+                    if (!NLib::strcmp(mnt.path, u->match)) {
+                        u->fs = mnt.fs;
+                        Path mntpath = Path(mnt.path);
+                        u->depth = mntpath.depth();
+                        u->found = true;
+                        return true;
+                    }
+                    return false;
+                }, (void *)&ud);
+
+                if (ud.found) {
+                    if (!ud.depth && this->root) { // If this was the root mount, clear root reference.
+                        this->root = NULL;
+                    }
                 }
-                return false;
-            }, (void *)path);
 
-            if (worked) {
-                Path mntpath = Path(path);
-                if (!mntpath.depth() && this->root) { // If this is assigned on the root, we should remove the root reference.
-                    this->root = NULL;
+                if (!ud.found) {
+                    return -1;
                 }
             }
 
-            return worked ? 0 : -1;
+            if (ud.fs) {
+                ud.fs->umount();
+            }
+
+            return 0;
         }
 
         struct VFS::mntpoint *VFS::findmount(Path *path) {
+            NLib::ScopeSpinlock guard(&this->mountlock);
+            // Find the best matching mount point for the given path.
+            // The best matching mount point is the one with the longest matching prefix.
+            // However, we must consider mounting points shadowed by others.
+
             struct mntpoint *best = NULL;
             size_t depth = 0;
 
@@ -69,16 +107,11 @@ namespace NFS {
                     }
                 }
 
-                // Handle special case of '/' mounting point.
-                if (!mntpath.depth() && mntpath.isabsolute()) { // Mount path is probably '/'.
-                    if (path->isabsolute()) { // Search path is probably '/'. Add it as a potential match.
-                        best = it.get();
-                        depth = 0;
-                        continue;
-                    }
+                if (!mntpath.depth() && mntpath.isabsolute() && path->isabsolute()) {
+                    matches = true;
                 }
 
-                if (matches && mntpath.depth() > depth) {
+                if (matches && mntpath.depth() >= depth) {
                     best = it.get();
                     depth = mntpath.depth();
                 }
@@ -91,7 +124,11 @@ namespace NFS {
             Path rp = Path(path);
 
             if (!rp.depth()) { // Empty path, we're referring to our current directory.
-                return relativeto ? relativeto : this->root; // If we're working relative to a specific directory, we should return it, otherwise, root.
+                INode *result = relativeto ? relativeto : this->root;
+                if (result) {
+                    result->ref(); // Caller expects a referenced node.
+                }
+                return result;
             }
 
             if (!rp.isabsolute()) {
@@ -128,9 +165,12 @@ namespace NFS {
                     INode *parent = current->getparent();
 
                     if (!parent) {
+                        current->unref(); // Clean up before returning.
                         return NULL; // No parent. Failed.
                     }
 
+                    parent->ref(); // Increment refcount for parent.
+                    current->unref(); // Unreference old current.
                     current = parent;
                     it.next();
                     continue;
@@ -146,10 +186,13 @@ namespace NFS {
                 it.next();
                 current = next;
                 if (symlink && S_ISLNK(current->getattr().st_mode)) { // If this node is a symbolic link.
-                    current = current->resolvesymlink(); // Unwrap into real path.
-                    if (!current) {
+                    INode *resolved = current->resolvesymlink(); // Unwrap into real path.
+                    if (!resolved) {
+                        current->unref(); // Clean up before returning.
                         return NULL; // Invalid symbolic link.
                     }
+                    current->unref(); // Unreference the symlink node.
+                    current = resolved; // Resolved already has refcount from resolvesymlink.
                 }
             }
 
@@ -172,6 +215,7 @@ namespace NFS {
 
             struct mntpoint *mount = this->findmount(&pobj);
             if (!mount) {
+                parent->unref(); // Don't leak parent reference.
                 return NULL; // Invalid mounting point.
             }
 
@@ -182,10 +226,6 @@ namespace NFS {
             }
             parent->add(node);
             parent->unref();
-
-            if (node) {
-                node->unref();
-            }
 
             return node;
         }
@@ -459,7 +499,7 @@ namespace NFS {
                 return -ENOMEM;
             }
 
-            int ret = NMem::UserCopy::strncpy(pathbuf, path, pathsize);
+            int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
             if (ret < 0) {
                 delete[] pathbuf;
                 return ret; // Contains errno.
@@ -484,12 +524,14 @@ namespace NFS {
                 } else {
                     FileDescriptor *desc = proc->fdtable->get(dirfd);
                     if (!desc) {
+                        delete[] pathbuf;
                         return -EBADF;
                     }
 
                     dirnode = desc->getnode();
                     if (!S_ISDIR(dirnode->getattr().st_mode)) {
                         dirnode->unref();
+                        delete[] pathbuf;
                         return -ENOTDIR;
                     }
                 }
@@ -500,6 +542,7 @@ namespace NFS {
 
             if (!node) { // Couldn't find it. Check if there's a reason to create it.
                 if (!(flags & O_CREAT)) {
+                    delete[] pathbuf;
                     return -ENOENT; // Don't bother if there's no create flag.
                 }
                 // Create the node.
@@ -507,9 +550,12 @@ namespace NFS {
                 attr.st_mode = mode;
                 node = vfs.create(pathbuf, attr);
                 if (!node) {
+                    delete[] pathbuf;
                     return -EIO; // Generic I/O error.
                 }
             }
+
+            delete[] pathbuf;
 
             struct stat st = node->getattr();
 
@@ -602,6 +648,198 @@ namespace NFS {
             }
 
             return 0;
+        }
+
+        extern "C" uint64_t sys_getdents(int fd, void *buf, size_t count) {
+            SYSCALL_LOG("sys_getdents(%d, %p, %lu).\n", fd, buf, count);
+
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            if (!buf && count > 0) {
+                return -EFAULT;
+            }
+
+            if (!NMem::UserCopy::valid(buf, count)) {
+                return -EFAULT; // Invalid buffer.
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            INode *node = desc->getnode();
+
+            struct stat st = node->getattr();
+            if (!S_ISDIR(st.st_mode)) {
+                node->unref();
+                return -ENOTDIR;
+            }
+
+            ssize_t read = node->readdir(buf, count, desc->getoff());
+            node->unref();
+            if (read < 0) {
+                return read; // Return error code.
+            }
+
+            desc->addoff(read); // Increment offset.
+
+            return read; // Return the actual number of bytes read.
+        }
+
+        extern "C" uint64_t sys_fchdir(int fd) {
+            SYSCALL_LOG("sys_fchdir(%d).\n", fd);
+
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            INode *node = desc->getnode();
+
+            struct stat st = node->getattr();
+            if (!S_ISDIR(st.st_mode)) {
+                node->unref();
+                return -ENOTDIR;
+            }
+
+            if (proc->cwd) {
+                proc->cwd->unref(); // Unreference old CWD.
+            }
+            proc->cwd = node; // Set new CWD.
+            return 0;
+        }
+
+        extern "C" uint64_t sys_chdir(const char *path) {
+            SYSCALL_LOG("sys_chdir(%s).\n", path);
+
+            ssize_t pathsize = NMem::UserCopy::strnlen(path, 1024); // XXX: Maximum path length.
+            if (pathsize < 0) {
+                return pathsize; // Contains errno.
+            }
+
+            char *pathbuf = new char[pathsize + 1];
+            if (!pathbuf) {
+                return -ENOMEM;
+            }
+
+            int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+            if (ret < 0) {
+                delete[] pathbuf;
+                return ret; // Contains errno.
+            }
+
+            pathbuf[pathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            INode *node = vfs.resolve(pathbuf, proc->cwd, true);
+            delete[] pathbuf;
+
+            if (!node) {
+                return -ENOENT;
+            }
+
+            struct stat st = node->getattr();
+            if (!S_ISDIR(st.st_mode)) {
+                node->unref();
+                return -ENOTDIR;
+            }
+
+            if (proc->cwd) {
+                proc->cwd->unref(); // Unreference old CWD.
+            }
+            proc->cwd = node; // Set new CWD.
+            return 0;
+        }
+
+        extern "C" uint64_t sys_getcwd(char *buf, size_t size) {
+            SYSCALL_LOG("sys_getcwd(%p, %lu).\n", buf, size);
+
+            if (!buf || size == 0) {
+                return -EINVAL;
+            }
+
+            if (!NMem::UserCopy::valid(buf, size)) {
+                return -EFAULT;
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            INode *cwd = proc->cwd;
+            if (!cwd) {
+                cwd = vfs.getroot(); // getroot() increments refcount.
+                if (!cwd) {
+                    return -ENOENT;
+                }
+            } else {
+                cwd->ref(); // Increase reference for our use.
+            }
+
+            // Build path by walking up the parent chain to root.
+            Path resultpath = Path(true); // Start with absolute path.
+            INode *current = cwd;
+            INode *root = vfs.getroot(); // getroot() increments refcount.
+
+            while (current && current != root) {
+                const char *name = current->getname();
+                if (name && name[0] != '\0') {
+                    resultpath.pushcomponent(name, false); // Push to front (we're walking backwards).
+                }
+                INode *parent = current->getparent();
+
+                if (!parent) {
+                    // Reached root without finding VFS root - this shouldn't happen.
+                    current->unref();
+                    root->unref();
+                    return -ENOENT;
+                }
+
+                parent->ref(); // Increment parent refcount.
+                current->unref(); // Decrement current refcount.
+                current = parent;
+            }
+
+            // Clean up remaining references.
+            if (current) {
+                current->unref();
+            }
+            root->unref();
+
+            const char *pathstr = resultpath.construct();
+            if (!pathstr) {
+                return -ENOMEM;
+            }
+
+            size_t pathlen = NLib::strlen(pathstr);
+            if (pathlen + 1 > size) {
+                delete[] pathstr;
+                return -ERANGE;
+            }
+
+            // Copy to userspace.
+            int ret = NMem::UserCopy::copyto(buf, pathstr, pathlen + 1);
+            delete[] pathstr;
+
+            if (ret < 0) {
+                return ret;
+            }
+
+            return (uint64_t)buf; // Return the buffer pointer on success.
         }
 
         extern "C" uint64_t sys_read(int fd, void *buf, size_t count) {

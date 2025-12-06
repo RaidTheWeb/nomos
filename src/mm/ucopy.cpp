@@ -6,8 +6,17 @@
 namespace NMem {
     namespace UserCopy {
 
-        int strncpy(char *dest, const char *src, size_t size) {
+        int strncpyfrom(char *dest, const char *src, size_t size) {
             if (!valid(src, size)) {
+                return -EFAULT;
+            }
+
+            NLib::strncpy(dest, (char *)src, size);
+            return 0;
+        }
+
+        int strncpyto(char *dest, const char *src, size_t size) {
+            if (!valid(dest, size)) {
                 return -EFAULT;
             }
 

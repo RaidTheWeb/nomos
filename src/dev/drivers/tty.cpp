@@ -759,7 +759,6 @@ notspecial:
                     uint32_t num = DEVFS::minor(dev) - 1;
 
                     TTYDevice *tty = ttys[num];
-                    NUtil::printf("TTY ioctl on /dev/tty%u: request 0x%lx, arg 0x%lx\n", num + 1, request, arg);
                     tty->devlock.acquire();
 
                     ssize_t ret = 0;
@@ -924,7 +923,6 @@ notspecial:
                             }
                             ret = NMem::UserCopy::copyto((void *)arg, &tty->tty->winsize, sizeof(struct TTY::winsize));
                             tty->devlock.release();
-                            NUtil::printf("TIOCGWINSZ: rows=%u, cols=%u\n", tty->tty->winsize.row, tty->tty->winsize.col);
                             return ret;
                         case TTY::ioctls::TIOCSWINSZ:
                             if (!arg) {

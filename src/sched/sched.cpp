@@ -663,7 +663,6 @@ namespace NSched {
             delete this->fdtable;
         }
 
-
         if (this->cwd) {
             this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
         }
@@ -671,11 +670,9 @@ namespace NSched {
         this->addrspace->lock.acquire();
         this->addrspace->ref--;
         size_t ref = this->addrspace->ref;
-        NUtil::printf("Process %d: Address space ref count is now %d.\n", this->id, ref);
         this->addrspace->lock.release();
 
         if (ref == 0) {
-            NUtil::printf("Process %d: Freeing address space.\n", this->id);
             delete this->addrspace;
         }
 
@@ -1469,6 +1466,9 @@ namespace NSched {
             return -ENOEXEC;
         }
 
+
+        struct NFS::VFS::stat attr = inode->getattr();
+
         inode->unref();
 
         uintptr_t ustackphy = (uintptr_t)PMM::alloc(1 << 20); // This is the physical memory behind the stack.
@@ -1504,6 +1504,20 @@ namespace NSched {
 
         {
             NLib::ScopeIRQSpinlock guard(&current->lock);
+
+            if (NFS::VFS::S_ISSUID(attr.st_mode)) {
+                current->euid = attr.st_uid; // Run as owner of file.
+            }
+
+            if (NFS::VFS::S_ISSGID(attr.st_mode)) {
+                current->egid = attr.st_gid; // Run as owner of file.
+            }
+
+            // "The effective UID of the process is copied to the saved set-user-ID"
+            current->suid = current->euid;
+            current->sgid = current->egid;
+
+            // RUID and RGID remain unchanged.
 
             current->addrspace->lock.acquire();
             current->addrspace->ref--;
@@ -1653,5 +1667,163 @@ namespace NSched {
         delete zombie; // Reap process.
 
         return zid;
+    }
+
+    extern "C" uint64_t sys_yield(void) {
+        SYSCALL_LOG("sys_yield().\n");
+        yield();
+        return 0;
+    }
+
+    extern "C" uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
+        SYSCALL_LOG("sys_getresuid(%p, %p, %p).\n", ruid, euid, suid);
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        NLib::ScopeIRQSpinlock guard(&current->lock);
+
+        if (ruid) {
+            if (!NMem::UserCopy::valid(ruid, sizeof(int))) {
+                return -EFAULT;
+            }
+            int r = current->uid;
+            if (NMem::UserCopy::copyto(ruid, &r, sizeof(int)) < 0) {
+                return -EFAULT;
+            }
+        }
+
+        if (euid) {
+            if (!NMem::UserCopy::valid(euid, sizeof(int))) {
+                return -EFAULT;
+            }
+            int e = current->euid;
+            if (NMem::UserCopy::copyto(euid, &e, sizeof(int)) < 0) {
+                return -EFAULT;
+            }
+        }
+
+        if (suid) {
+            if (!NMem::UserCopy::valid(suid, sizeof(int))) {
+                return -EFAULT;
+            }
+            int s = current->suid;
+            if (NMem::UserCopy::copyto(suid, &s, sizeof(int)) < 0) {
+                return -EFAULT;
+            }
+        }
+
+        return 0;
+    }
+
+    extern "C" uint64_t sys_getresgid(int *rgid, int *egid, int *sgid) {
+        SYSCALL_LOG("sys_getresgid(%p, %p, %p).\n", rgid, egid, sgid);
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        NLib::ScopeIRQSpinlock guard(&current->lock);
+
+        if (rgid) {
+            if (!NMem::UserCopy::valid(rgid, sizeof(int))) {
+                return -EFAULT;
+            }
+            int r = current->gid;
+            if (NMem::UserCopy::copyto(rgid, &r, sizeof(int)) < 0) {
+                return -EFAULT;
+            }
+        }
+
+        if (egid) {
+            if (!NMem::UserCopy::valid(egid, sizeof(int))) {
+                return -EFAULT;
+            }
+            int e = current->egid;
+            if (NMem::UserCopy::copyto(egid, &e, sizeof(int)) < 0) {
+                return -EFAULT;
+            }
+        }
+
+        if (sgid) {
+            if (!NMem::UserCopy::valid(sgid, sizeof(int))) {
+                return -EFAULT;
+            }
+            int s = current->sgid;
+            if (NMem::UserCopy::copyto(sgid, &s, sizeof(int)) < 0) {
+                return -EFAULT;
+            }
+        }
+
+        return 0;
+    }
+
+    extern "C" uint64_t sys_setresuid(int ruid, int euid, int suid) {
+        SYSCALL_LOG("sys_setresuid(%d, %d, %d).\n", ruid, euid, suid);
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        NLib::ScopeIRQSpinlock guard(&current->lock);
+
+        bool privileged = (NArch::CPU::get()->currthread->process->euid == 0);
+        // setresuid(2):
+        // An unprivileged process may change its real UID, effective UID,
+        // and saved set-user-ID, each to one of: the current real UID, the
+        // current effective UID, or the current saved set-user-ID.
+
+        if (ruid != -1) {
+            if (privileged || ruid == current->uid || ruid == current->euid || ruid == current->suid) {
+                current->uid = ruid;
+            } else {
+                return -EPERM;
+            }
+        }
+        if (euid != -1) {
+            if (privileged || euid == current->uid || euid == current->euid || euid == current->suid) {
+                current->euid = euid;
+            } else {
+                return -EPERM;
+            }
+        }
+        if (suid != -1) {
+            if (privileged || suid == current->uid || suid == current->euid || suid == current->suid) {
+                current->suid = suid;
+            } else {
+                return -EPERM;
+            }
+        }
+
+        return 0;
+    }
+
+    extern "C" uint64_t sys_setresgid(int rgid, int egid, int sgid) {
+        SYSCALL_LOG("sys_setresgid(%d, %d, %d).\n", rgid, egid, sgid);
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        NLib::ScopeIRQSpinlock guard(&current->lock);
+
+        bool privileged = (NArch::CPU::get()->currthread->process->euid == 0);
+        // setresgid(2):
+        // An unprivileged process may change its real GID, effective GID,
+        // and saved set-group-ID, each to one of: the current real GID, the
+        // current effective GID, or the current saved set-group-ID.
+
+        if (rgid != -1) {
+            if (privileged || rgid == current->gid || rgid == current->egid || rgid == current->sgid) {
+                current->gid = rgid;
+            } else {
+                return -EPERM;
+            }
+        }
+        if (egid != -1) {
+            if (privileged || egid == current->gid || egid == current->egid || egid == current->sgid) {
+                current->egid = egid;
+            } else {
+                return -EPERM;
+            }
+        }
+        if (sgid != -1) {
+            if (privileged || sgid == current->gid || sgid == current->egid || sgid == current->sgid) {
+                current->sgid = sgid;
+            } else {
+                return -EPERM;
+            }
+        }
+
+        return 0;
     }
 }

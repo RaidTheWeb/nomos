@@ -29,6 +29,15 @@ extern sys_kill
 extern sys_sigprocmask
 extern sys_execve
 extern sys_waitpid
+extern sys_getdents
+extern sys_chdir
+extern sys_fchdir
+extern sys_getresuid
+extern sys_getresgid
+extern sys_setresuid
+extern sys_setresgid
+extern sys_yield
+extern sys_getcwd
 
 MAXSYSCALLS equ 256
 
@@ -61,6 +70,15 @@ syscall_table:
     dq sys_sigprocmask
     dq sys_execve
     dq sys_waitpid
+    dq sys_getdents
+    dq sys_chdir
+    dq sys_fchdir
+    dq sys_getresuid
+    dq sys_getresgid
+    dq sys_setresuid
+    dq sys_setresgid
+    dq sys_yield
+    dq sys_getcwd
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

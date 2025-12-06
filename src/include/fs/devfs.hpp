@@ -65,6 +65,7 @@ namespace NFS {
 
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
+                ssize_t readdir(void *buf, size_t count, off_t offset) override;
                 int open(int flags) override;
                 int close(int fdflags) override;
                 int mmap(void *addr, size_t offset, uint64_t flags, int fdflags) override;
@@ -88,7 +89,7 @@ namespace NFS {
                     this->root = new DevNode(this, "", attr);
                 }
 
-                int mount(const char *path) override;
+                int mount(const char *path, VFS::INode *mntnode) override;
                 int sync(void) override;
                 int umount(void) override;
                 VFS::INode *create(const char *name, struct VFS::stat attr) override;
