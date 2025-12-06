@@ -2,6 +2,8 @@
 #include <arch/x86_64/pmm.hpp>
 #endif
 
+#include <lib/align.hpp>
+#include <lib/string.hpp>
 #include <mm/vmalloc.hpp>
 
 namespace NMem {
@@ -18,15 +20,16 @@ namespace NMem {
             }
 
             // First, try to allocate a contiguous block of physical memory.
-            void *alloc = NArch::PMM::alloc(size);
-            if (alloc) {
+            // XXX: Consider KVMALLOC here later.
+            //void *alloc = NArch::PMM::alloc(size);
+            //if (alloc) {
                 // Successful, return HHDM offset pointer, as PMM returns physical address.
-                return (void *)NArch::hhdmoff((void *)alloc);
-            }
+                //return (void *)NArch::hhdmoff((void *)alloc);
+            //}
 
             // Failed, no contiguous physical memory available.
             // Now we've got to cobble together enough pages.
-            size_t pagesneeded = (size + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
+            size_t pagesneeded = NLib::alignup(size, NArch::PAGESIZE) / NArch::PAGESIZE;
             void **pages = new void *[pagesneeded];
             if (!pages) {
                 return NULL;
@@ -58,6 +61,10 @@ namespace NMem {
             for (size_t i = 0; i < pagesneeded; i++) {
                 NArch::VMM::_mappage(&NArch::VMM::kspace, (uintptr_t)virt + (i * NArch::PAGESIZE), (uintptr_t)pages[i], NArch::VMM::WRITEABLE | NArch::VMM::PRESENT);
             }
+
+            // Zero the allocated region.
+            NLib::memset(virt, 0, pagesneeded * NArch::PAGESIZE);
+
             delete[] pages;
             return virt;
         }
@@ -67,7 +74,7 @@ namespace NMem {
                 return;
             }
 
-            size_t pagesneeded = (size + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
+            size_t pagesneeded = NLib::alignup(size, NArch::PAGESIZE) / NArch::PAGESIZE;
 
             NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
 
@@ -91,21 +98,21 @@ namespace NMem {
                 ((vmaflags & NMem::Virt::VIRT_NX) ? NArch::VMM::NOEXEC : 0);
         }
 
-        void mapintospace(struct NArch::VMM::addrspace *space, uintptr_t virt, size_t size, uint8_t vmaflags) {
+        void mapintospace(struct NArch::VMM::addrspace *space, uintptr_t virt, uintptr_t newvirt, size_t size, uint8_t vmaflags) {
             NLib::ScopeIRQSpinlock kguard(&NArch::VMM::kspace.lock);
             NLib::ScopeIRQSpinlock uguard(&space->lock);
 
             // Map a vmalloc region into a specific address space.
-            size_t pagesneeded = (size + NArch::PAGESIZE - 1) / NArch::PAGESIZE;
+            size_t pagesneeded = NLib::alignup(size, NArch::PAGESIZE) / NArch::PAGESIZE;
             for (size_t i = 0; i < pagesneeded; i++) {
                 uintptr_t vmallocvirt = virt + (i * NArch::PAGESIZE);
-                uintptr_t physaddr = NArch::VMM::virt2phys(&NArch::VMM::kspace, vmallocvirt);
+                uintptr_t physaddr = NArch::VMM::_virt2phys(&NArch::VMM::kspace, vmallocvirt);
                 if (physaddr) {
-                    NArch::VMM::_mappage(space, vmallocvirt, physaddr, vmatovmm(vmaflags) | NArch::VMM::PRESENT);
+                    NArch::VMM::_mappage(space, newvirt + (i * NArch::PAGESIZE), physaddr, vmatovmm(vmaflags) | NArch::VMM::PRESENT);
                 }
             }
             // Map into VMA space as well.
-            space->vmaspace->reserve(virt, virt + pagesneeded * NArch::PAGESIZE, vmaflags);
+            space->vmaspace->reserve(newvirt, newvirt + pagesneeded * NArch::PAGESIZE, vmaflags);
         }
     }
 }

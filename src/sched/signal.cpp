@@ -7,6 +7,7 @@
 #include <lib/errno.hpp>
 #include <sched/sched.hpp>
 #include <sched/signal.hpp>
+#include <sys/syscall.hpp>
 
 namespace NSched {
 
@@ -151,6 +152,7 @@ cleanup:
     }
 
     extern "C" int sys_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+        SYSCALL_LOG("sys_sigaction(%d, %p, %p).\n", sig, act, oact);
         if (sig < 1 || sig >= (int)NSIG) {
             return -EINVAL;
         }
@@ -168,6 +170,7 @@ cleanup:
     }
 
     extern "C" int sys_kill(size_t pid, int sig) {
+        SYSCALL_LOG("sys_kill(%u, %d).\n", pid, sig);
         if (!pidtable) {
             return -ENOSYS;
         }
@@ -182,6 +185,7 @@ cleanup:
     }
 
     extern "C" int sys_sigreturn(void) {
+        SYSCALL_LOG("sys_sigreturn().\n");
         Thread *t = NArch::CPU::get()->currthread;
         uintptr_t usp = t->sysctx.rsp;
         struct NArch::CPU::context *uctx = (struct NArch::CPU::context *)usp;
@@ -191,6 +195,11 @@ cleanup:
     }
 
     extern "C" int sys_sigprocmask(int how, const uint64_t *set, uint64_t *oldset) {
+        SYSCALL_LOG("sys_sigprocmask(%d, %p, %p).\n", how, set, oldset);
+        if (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
+            return -EINVAL;
+        }
+
         Thread *t = NArch::CPU::get()->currthread;
         if (oldset) {
             *oldset = t->signal.blocked;

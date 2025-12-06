@@ -22,11 +22,11 @@
 #include <lib/bitmap.hpp>
 #include <lib/cmdline.hpp>
 #include <mm/slab.hpp>
+#include <mm/vmalloc.hpp>
 #include <util/kprint.hpp>
 #include <sched/sched.hpp>
 #include <stddef.h>
 #include <sys/elf.hpp>
-
 
 static void hcf(void) {
     for (;;) {
@@ -144,7 +144,9 @@ void kpostarch(void) {
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
 
     // XXX: Be able to pass allocation to thread, so it knows to remove it on free.
-    uintptr_t ustack = (uintptr_t)NArch::PMM::alloc(1 << 20); // Allocate 1MB stack.
+    //uintptr_t ustack = (uintptr_t)NArch::PMM::alloc(1 << 20); // Allocate 1MB stack.
+    //assert(ustack, "Failed to allocate memory for user stack.\n");
+    uintptr_t ustack = (uintptr_t)NMem::VMalloc::alloc(1 << 20); // Allocate 1MB stack.
     assert(ustack, "Failed to allocate memory for user stack.\n");
 
     uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Subtract 4096 byte guard page from absolute maximum of userspace.
@@ -154,19 +156,21 @@ void kpostarch(void) {
     char *argv[] = { (char *)"/test", NULL };
 
     // We pass in the hhdm-offset physical stack top. The user will be given the mapped version.
-    void *phystart = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
-    assert(phystart, "Stack alignment failed.\n");
+    //void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
+    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), argv, NULL, &elfhdr, ustacktop);
+    assert(rsp, "Stack alignment failed.\n");
 
     // Reserve stack location. We don't want to end up allocating into the stack region on requests for virtual memory.
-    uspace->vmaspace->reserve(ustackbottom, ustacktop, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
+    //uspace->vmaspace->reserve(ustackbottom, ustacktop, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
 
     uspace->vmaspace->reserve(ustacktop, 0x0000800000000000, 0); // Reserve guard page.
 
     // Map stack into userspace memory.
-    NArch::VMM::maprange(uspace, ustackbottom, (uintptr_t)ustack, NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::USER | NArch::VMM::PRESENT, (1 << 20)); // Map range.
+    //NArch::VMM::maprange(uspace, ustackbottom, (uintptr_t)ustack, NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::USER | NArch::VMM::PRESENT, (1 << 20)); // Map range.
+    NMem::VMalloc::mapintospace(uspace, ustack, ustackbottom, 1 << 20, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
 
     uthread->ctx.rip = elfhdr.entryoff;
-    uthread->ctx.rsp = (uint64_t)phystart;
+    uthread->ctx.rsp = (uint64_t)rsp;
 
     NLimine::console_write("\x1b[2J\x1b[H", 7);
 

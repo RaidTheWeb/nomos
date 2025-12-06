@@ -85,21 +85,21 @@ namespace NSys {
 
             for (size_t i = 0; i < argc; i++) {
                 size_t len = NLib::strlen(argv[i]) + 1;
-                stackptr += len;
                 NLib::memcpy((void *)stackptr, argv[i], len); // Copy argv element into stack.
                 uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                 ((uint64_t *)argvptrs)[i] = calc; // Point the associated argv pointer to the stack location of the element.
+                stackptr += len;
             }
             ((uint64_t *)argvptrs)[argc] = NULL; // NULL terminator.
 
             if (envp) {
                 for (size_t i = 0; i < envc; i++) {
                     size_t len = NLib::strlen(envp[i]) + 1;
-                    stackptr += len;
                     NLib::memcpy((void *)stackptr, envp[i], len); // Copy envp element into stack.
 
                     uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                     ((uint64_t *)envpptrs)[i] = calc; // Point the associated envp pointer to the stack location of the element.
+                    stackptr += len;
                 }
             }
             ((uint64_t *)envpptrs)[envc] = NULL; // NULL terminator. Needs to be here, regardless of whether we have any environment variables or not.
@@ -129,7 +129,7 @@ namespace NSys {
                 if (phdrs[i].type == PH_LOAD) {
                     size_t misalign = phdrs[i].vaddr % NArch::PAGESIZE;
 
-                    void *phys = NArch::PMM::alloc(phdrs[i].msize + misalign); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
+                    void *phys = NArch::PMM::alloc(NLib::alignup(phdrs[i].msize + misalign, NArch::PAGESIZE)); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
                     if (!phys) {
                         // Failed. Free everything we've currently acquired.
                         delete[] phdrs;
@@ -152,16 +152,16 @@ namespace NSys {
                         phdrs[i].msize
                     )) {
                         // Failed. Free everything we've currently acquired.
-                        delete[] phdrs;
                         NArch::PMM::free(phys, phdrs[i].msize + misalign);
+                        delete[] phdrs;
                         return false;
                     }
 
                     if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
                         // Failed. Free everything we've currently acquired.
                         NArch::VMM::unmaprange(space, phdrs[i].vaddr, phdrs[i].msize); // Unmap range in space.
-                        delete[] phdrs;
                         NArch::PMM::free(phys, phdrs[i].msize + misalign);
+                        delete[] phdrs;
                         return false;
                     }
 

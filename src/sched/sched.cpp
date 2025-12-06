@@ -9,7 +9,10 @@
 #include <fs/devfs.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
+#include <mm/ucopy.hpp>
+#include <sched/event.hpp>
 #include <sched/sched.hpp>
+#include <sys/elf.hpp>
 #include <sys/syscall.hpp>
 #include <sys/timer.hpp>
 
@@ -653,12 +656,8 @@ namespace NSched {
         }
     }
 
-    Process::~Process(void) {
+    void Process::zombify(void) {
         this->lock.acquire();
-
-        pidtablelock.acquire();
-        pidtable->remove(this->id);
-        pidtablelock.release();
 
         if (this->fdtable) {
             delete this->fdtable;
@@ -668,6 +667,34 @@ namespace NSched {
         if (this->cwd) {
             this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
         }
+
+        this->addrspace->lock.acquire();
+        this->addrspace->ref--;
+        size_t ref = this->addrspace->ref;
+        NUtil::printf("Process %d: Address space ref count is now %d.\n", this->id, ref);
+        this->addrspace->lock.release();
+
+        if (ref == 0) {
+            NUtil::printf("Process %d: Freeing address space.\n", this->id);
+            delete this->addrspace;
+        }
+
+        this->pstate = Process::state::ZOMBIE;
+
+        if (this->parent) {
+            // XXX: TODO: Use signals for this.
+            this->parent->exitwq.wake(); // We're done!
+        }
+
+        this->lock.release();
+    }
+
+    Process::~Process(void) {
+        this->lock.acquire();
+
+        pidtablelock.acquire();
+        pidtable->remove(this->id);
+        pidtablelock.release();
 
         if (this->pgrp) {
             // XXX: Orphan process groups if we're the leader.
@@ -698,18 +725,6 @@ namespace NSched {
                 child->parent = NULL;
                 child->lock.release();
             }
-        }
-        // XXX: Dereference address space and free it if there's nothing on it.
-
-        this->addrspace->lock.acquire();
-        this->addrspace->ref--;
-        size_t ref = this->addrspace->ref;
-        NUtil::printf("Process %d: Address space ref count is now %d.\n", this->id, ref);
-        this->addrspace->lock.release();
-
-        if (ref == 0) {
-            NUtil::printf("Process %d: Freeing address space.\n", this->id);
-            delete this->addrspace;
         }
 
         this->lock.release();
@@ -854,9 +869,16 @@ namespace NSched {
     void Thread::destroy(void) {
         PMM::free(hhdmsub(this->stack), this->stacksize); // Free stack.
 
+        this->process->lock.acquire();
+        this->process->threads.remove([](Thread *t, void *arg) {
+            return t == ((Thread *)arg);
+        }, (void *)this);
+        this->process->lock.release();
+
         __atomic_sub_fetch(&this->process->threadcount, 1, memory_order_seq_cst);
         if (__atomic_load_n(&this->process->threadcount, memory_order_seq_cst) == 0) {
-            delete this->process;
+            // Zombify the process if this was the last thread.
+            this->process->zombify();
         }
     }
 
@@ -1171,9 +1193,465 @@ namespace NSched {
         assert(false, "Invalid FPU lazy load trigger!\n");
     }
 
+    static void markdeadandremove(Thread *thread) {
+        __atomic_store_n(&thread->tstate, Thread::state::DEAD, memory_order_release); // Mark thread as dead.
+
+
+        struct CPU::cpulocal *cpu = NArch::SMP::cpulist[thread->cid];
+        if (cpu) {
+            cpu->runqueue.lock.acquire();
+
+            if (__atomic_load_n(&thread->tstate, memory_order_acquire) == Thread::state::SUSPENDED) {
+                cpu->runqueue._erase(&thread->node); // Remove from run queue.
+            }
+
+            cpu->runqueue.lock.release();
+        }
+
+        reschedule(thread); // Reschedule thread to ensure it gets cleaned up.
+    }
+
+    void termothers(Process *proc) {
+        Thread *me = NArch::CPU::get()->currthread;
+
+        proc->lock.acquire();
+
+        NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
+        for (; it.valid(); it.next()) {
+            Thread *thread = *(it.get());
+            if (thread != me) {
+                markdeadandremove(thread);
+            }
+        }
+
+        proc->lock.release(); // Release process lock, letting dying threads proceed.
+
+        while (__atomic_load_n(&proc->threadcount, memory_order_seq_cst) > 1) {
+            yield(); // Yield until all other threads are dead.
+        }
+    }
+
     extern "C" uint64_t sys_exit(int status) {
         SYSCALL_LOG("sys_exit(%d).\n", status);
+
+        Process *proc = NArch::CPU::get()->currthread->process;
+
+        termothers(proc); // Terminate other threads in this process.
+
+        {
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+            proc->exitstatus = (status & 0xff) << 8; // Set exit status.
+        }
+
         exit(); // Exit.
-        return 0;
+        __builtin_unreachable();
+    }
+
+    static void freeargs(char **argv, size_t argc) {
+        for (size_t i = 0; i < argc; i++) {
+            delete[] argv[i];
+        }
+        delete[] argv;
+    }
+
+    static void freeenvs(char **envp, size_t envc) {
+        for (size_t i = 0; i < envc; i++) {
+            delete[] envp[i];
+        }
+        delete[] envp;
+    }
+
+    extern "C" uint64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
+        SYSCALL_LOG("sys_execve(%s, %p, %p).\n", path, argv, envp);
+
+        ssize_t pathlen = NMem::UserCopy::strnlen(path, 4096);
+        if (pathlen <= 0) {
+            return -EFAULT;
+        }
+
+        char *pathbuf = new char[pathlen + 1];
+        if (!pathbuf) {
+            return -ENOMEM;
+        }
+
+        ssize_t ret = NMem::UserCopy::copyfrom(pathbuf, path, pathlen + 1);
+        if (ret < 0) {
+            delete[] pathbuf;
+            return -EFAULT;
+        }
+        pathbuf[pathlen] = 0; // Null terminate.
+
+
+        if (!NMem::UserCopy::valid(argv, sizeof(char *))) {
+            delete[] pathbuf;
+            return -EFAULT;
+        }
+
+        size_t argc = 0;
+        while (true) {
+            if (!NMem::UserCopy::valid(&argv[argc], sizeof(char *))) {
+                delete[] pathbuf;
+                return -EFAULT;
+            }
+            if (!argv[argc]) {
+                break;
+            }
+            argc++;
+            if (argc > 4096) { // XXX: ARGMAX limit.
+                delete[] pathbuf;
+                return -E2BIG;
+            }
+        }
+
+        char **aargv = new char *[argc + 1];
+        if (!aargv) {
+            delete[] pathbuf;
+            return -ENOMEM;
+        }
+        for (size_t i = 0; i < argc; i++) {
+            ssize_t arglen = NMem::UserCopy::strnlen(argv[i], 4096);
+            if (arglen <= 0) {
+                delete[] pathbuf;
+                delete[] aargv;
+                return -EFAULT;
+            }
+
+            aargv[i] = new char[arglen + 1];
+            if (!aargv[i]) {
+                for (size_t j = 0; j < i; j++) {
+                    delete[] aargv[j];
+                }
+                delete[] pathbuf;
+                delete[] aargv;
+                return -ENOMEM;
+            }
+
+            ssize_t r = NMem::UserCopy::copyfrom(aargv[i], argv[i], arglen + 1);
+            if (r < 0) {
+                for (size_t j = 0; j <= i; j++) {
+                    delete[] aargv[j];
+                }
+                delete[] pathbuf;
+                delete[] aargv;
+                return -EFAULT;
+            }
+            aargv[i][arglen] = 0; // Null terminate.
+        }
+        aargv[argc] = NULL; // Null terminate.
+
+        if (!NMem::UserCopy::valid(envp, sizeof(char *))) {
+            freeargs(aargv, argc);
+            delete[] pathbuf;
+            return -EFAULT;
+        }
+
+        // Copy envp array:
+        size_t envc = 0;
+        while (true) {
+            if (!NMem::UserCopy::valid(&envp[envc], sizeof(char *))) {
+                freeargs(aargv, argc);
+                delete[] pathbuf;
+                return -EFAULT;
+            }
+            if (!envp[envc]) {
+                break;
+            }
+            envc++;
+            if (envc > 4096) { // XXX: ARGMAX limit.
+                freeargs(aargv, argc);
+                delete[] pathbuf;
+                return -E2BIG;
+            }
+        }
+
+        char **aenvp = new char *[envc + 1];
+        if (!aenvp) {
+            freeargs(aargv, argc);
+            delete[] pathbuf;
+            return -ENOMEM;
+        }
+        for (size_t i = 0; i < envc; i++) {
+            ssize_t envlen = NMem::UserCopy::strnlen(envp[i], 4096);
+            if (envlen <= 0) {
+                freeargs(aargv, argc);
+                delete[] pathbuf;
+                delete[] aenvp;
+                return -EFAULT;
+            }
+            aenvp[i] = new char[envlen + 1];
+            if (!aenvp[i]) {
+                for (size_t j = 0; j < i; j++) {
+                    delete[] aenvp[j];
+                }
+                freeargs(aargv, argc);
+                delete[] pathbuf;
+                delete[] aenvp;
+                return -ENOMEM;
+            }
+            ssize_t r = NMem::UserCopy::copyfrom(aenvp[i], envp[i], envlen + 1);
+            if (r < 0) {
+                for (size_t j = 0; j <= i; j++) {
+                    delete[] aenvp[j];
+                }
+                freeargs(aargv, argc);
+                delete[] pathbuf;
+                delete[] aenvp;
+                return -EFAULT;
+            }
+            aenvp[i][envlen] = 0; // Null terminate.
+        }
+        aenvp[envc] = NULL; // Null terminate.
+
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        current->lock.acquire();
+
+        NFS::VFS::INode *inode = NFS::VFS::vfs.resolve(pathbuf, current->cwd, true);
+        if (!inode) {
+            current->lock.release();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            delete[] pathbuf;
+            return -ENOENT;
+        }
+        delete[] pathbuf;
+
+        // Check permission against EUID/EGID.
+        if (!NFS::VFS::vfs.checkaccess(inode, NFS::VFS::O_EXEC, current->euid, current->egid)) {
+            inode->unref();
+            current->lock.release();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            return -EACCES;
+        }
+        current->lock.release();
+
+        struct NSys::ELF::header elfhdr;
+        ssize_t res = inode->read(&elfhdr, sizeof(elfhdr), 0, 0);
+        if (res < (ssize_t)sizeof(elfhdr)) {
+            inode->unref();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            return -ENOEXEC;
+        }
+
+        if (!NSys::ELF::verifyheader(&elfhdr)) {
+            inode->unref();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            return -ENOEXEC;
+        }
+
+        if (elfhdr.type != NSys::ELF::ELF_EXECUTABLE) {
+            inode->unref();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            return -ENOEXEC;
+        }
+
+        struct VMM::addrspace *newspace;
+        NArch::VMM::uclonecontext(&NArch::VMM::kspace, &newspace); // Start with a clone of the kernel address space.
+
+        void *ent = NULL;
+        if (!NSys::ELF::loadfile(&elfhdr, inode, newspace, &ent)) {
+            inode->unref();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            delete newspace;
+            return -ENOEXEC;
+        }
+
+        if (!ent || (uintptr_t)ent >= 0x0000800000000000) {
+            inode->unref();
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            delete newspace;
+            return -ENOEXEC;
+        }
+
+        inode->unref();
+
+        uintptr_t ustackphy = (uintptr_t)PMM::alloc(1 << 20); // This is the physical memory behind the stack.
+        if (!ustackphy) {
+            freeargs(aargv, argc);
+            freeargs(aenvp, envc);
+            delete newspace;
+            return -ENOMEM;
+        }
+
+        uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Top of user space, minus a page for safety.
+        uintptr_t ustackbottom = ustacktop - (1 << 20); // Virtual address of bottom of user stack (where ustackphy starts).
+
+        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), aargv, aenvp, &elfhdr, ustacktop);
+        freeargs(aargv, argc);
+        freeargs(aenvp, envc);
+
+        if (!rsp) {
+            PMM::free((void *)ustackphy, 1 << 20);
+            delete newspace;
+            return -ENOMEM;
+        }
+
+        // Reserve user stack region.
+        newspace->vmaspace->reserve(ustackbottom, ustacktop, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
+        newspace->vmaspace->reserve(ustacktop, 0x0000800000000000, 0); // Guard page.
+
+        // Map user stack.
+        NArch::VMM::maprange(newspace, ustackbottom, (uintptr_t)ustackphy, NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::USER | NArch::VMM::PRESENT, 1<< 20);
+
+        // Kill other threads and await their death.
+        termothers(current);
+
+        {
+            NLib::ScopeIRQSpinlock guard(&current->lock);
+
+            current->addrspace->lock.acquire();
+            current->addrspace->ref--;
+            size_t ref = current->addrspace->ref;
+            current->addrspace->lock.release();
+            if (ref == 0) {
+                delete current->addrspace;
+            }
+
+            newspace->ref++;
+            current->addrspace = newspace;
+
+            current->fdtable->doexec(); // Close FDs with O_CLOEXEC.
+
+            for (size_t i = 0; i < SIGMAX; i++) {
+                if ( NArch::CPU::get()->currthread->signal.actions[i].handler != SIG_IGN) {
+                    NArch::CPU::get()->currthread->signal.actions[i].handler = SIG_DFL; // Reset custom signal handlers.
+                }
+            }
+
+
+            NLib::memset(&NArch::CPU::get()->currthread->ctx, 0, sizeof(NArch::CPU::get()->currthread->ctx));
+#ifdef __x86_64__
+            NLib::memset(&NArch::CPU::get()->currthread->xctx, 0, sizeof(NArch::CPU::get()->currthread->xctx));
+
+            NArch::CPU::get()->currthread->ctx.cs = 0x23; // User Code.
+            NArch::CPU::get()->currthread->ctx.ds = 0x1b; // User Data.
+            NArch::CPU::get()->currthread->ctx.es = 0x1b; // Ditto.
+            NArch::CPU::get()->currthread->ctx.ss = 0x1b; // Ditto.
+
+            NArch::CPU::get()->currthread->ctx.rip = (uint64_t)ent;
+            NArch::CPU::get()->currthread->ctx.rsp = (uint64_t)rsp;
+            NArch::CPU::get()->currthread->ctx.rflags = 0x200; // Enable interrupts.
+
+
+            NLib::memset(NArch::CPU::get()->currthread->fctx.fpustorage, 0, CPU::get()->fpusize);
+            NArch::CPU::get()->currthread->fctx.mathused = false; // Mark as unused.
+
+            if (CPU::get()->hasxsave) {
+                uint64_t cr0 = CPU::rdcr0();
+                asm volatile("clts");
+                // Initialise region.
+                asm volatile("xsave (%0)" : : "r"(NArch::CPU::get()->currthread->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+                CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
+            }
+#endif
+
+        }
+        NArch::VMM::swapcontext(newspace);
+        NArch::CPU::ctx_swap(&NArch::CPU::get()->currthread->ctx); // Context switch to new entry point.
+
+        __builtin_unreachable();
+    }
+
+    #define WNOHANG     1 // Don't block.
+    #define WUNTRACED   2 // Report stopped children.
+
+    static Process *findchild(Process *parent, int pid, bool zombie) {
+        NLib::DoubleList<Process *>::Iterator it = parent->children.begin();
+        for (; it.valid(); it.next()) {
+            Process *child = *(it.get());
+
+            bool match = false;
+
+            child->lock.acquire();
+            if (child->pstate != Process::state::ZOMBIE && zombie) {
+                child->lock.release();
+                continue; // Wanted zombies.
+            }
+
+            if (pid == -1) { // Any child.
+                match = true;
+            } else if (pid > 0) { // Specific PID.
+                if (child->id == (size_t)pid) {
+                    match = true;
+                }
+            } else if (pid == 0) { // Any child in our process group.
+                if (child->pgrp == parent->pgrp) {
+                    match = true;
+                }
+            } else { // Negative PID means any child in process group -pid.
+                if (child->pgrp->id == (size_t)(-pid)) {
+                    match = true;
+                }
+            }
+
+            child->lock.release();
+
+            if (match) {
+                return child;
+            }
+        }
+        return NULL;
+    }
+
+    extern "C" uint64_t sys_waitpid(int pid, int *status, int options) {
+        SYSCALL_LOG("sys_waitpid(%d, %p, %d).\n", pid, status, options);
+
+        if (status && !NMem::UserCopy::valid(status, sizeof(int))) {
+            return -EFAULT;
+        }
+
+        Process *current = NArch::CPU::get()->currthread->process;
+        current->lock.acquire();
+
+        // Check if we have any children that match.
+        bool haschildren = findchild(current, pid, false) != NULL;
+
+        if (!haschildren) {
+            current->lock.release();
+            return -ECHILD; // No matching children.
+        }
+
+        Process *zombie = NULL;
+
+        if (options & WNOHANG) {
+            // Non-blocking wait.
+            zombie = findchild(current, pid, true);
+            if (!zombie) {
+                current->lock.release();
+                return 0; // No matching zombies.
+            }
+        } else {
+            // Blocking wait.
+            waiteventlocked(&current->exitwq,
+                (zombie = findchild(current, pid, true)) != NULL,
+                &current->lock);
+        }
+
+        zombie->lock.acquire();
+        int zstatus = zombie->exitstatus;
+        size_t zid = zombie->id;
+
+        if (status) {
+            // Copy status out.
+            if (NMem::UserCopy::copyto(status, &zstatus, sizeof(int)) < 0) {
+                zombie->lock.release();
+                current->lock.release();
+                return -EFAULT;
+            }
+        }
+
+        zombie->pstate = Process::state::DEAD;
+        zombie->lock.release();
+        current->lock.release();
+
+        delete zombie; // Reap process.
+
+        return zid;
     }
 }

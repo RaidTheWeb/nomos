@@ -21,6 +21,9 @@ namespace NSched {
         this->waitinglock.acquire();
         while (!this->waiting.empty()) {
             Thread *thread = this->waiting.pop();
+            if (__atomic_load_n(&thread->tstate, memory_order_acquire) != Thread::state::WAITING) {
+                continue; // Thread is no longer waiting, skip it.
+            }
             towake.push(thread);
         }
         this->waitinglock.release();

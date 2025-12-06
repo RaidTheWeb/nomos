@@ -155,12 +155,34 @@ namespace NSched {
         STDERR_FILENO = 2
     };
 
+    class WaitQueue {
+        private:
+            NLib::DoubleList<Thread *> waiting;
+        public:
+
+            NArch::IRQSpinlock waitinglock;
+            // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn. Takes an optional parameter specifying whether the wait queue lock is already held.
+            void wait(bool locked = false);
+            // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
+            void wake(void);
+    };
+
     class Process {
         private:
             void init(struct NArch::VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable);
         public:
-            // XXX: Free allocations made with mmap.
-            struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space.
+            struct NArch::VMM::addrspace *addrspace = NULL; // Userspace address space. MUST be first member for easy access from thread.
+
+            enum state {
+                RUNNING,
+                ZOMBIE,
+                DEAD
+            };
+
+            enum state pstate = state::RUNNING;
+            int exitstatus = 0;
+            WaitQueue exitwq; // Wait queue to await completion of this process.
+
             bool kernel = false;
             size_t id; // Process ID.
             size_t tidcounter = 1; // Thread ID counter.
@@ -198,6 +220,9 @@ namespace NSched {
             Process(struct NArch::VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
                 this->init(space, fdtable);
             }
+
+            // Called when there are no more threads in the process, to zombify it (it exited).
+            void zombify(void);
 
             ~Process(void);
     };

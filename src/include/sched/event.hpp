@@ -3,21 +3,11 @@
 
 #include <lib/list.hpp>
 #include <lib/sync.hpp>
+
 #include <sched/sched.hpp>
 
+
 namespace NSched {
-
-    class WaitQueue {
-        private:
-            NLib::DoubleList<Thread *> waiting;
-        public:
-
-            NArch::IRQSpinlock waitinglock;
-            // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn. Takes an optional parameter specifying whether the wait queue lock is already held.
-            void wait(bool locked = false);
-            // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
-            void wake(void);
-    };
 
 // Wait on this wait queue, testing for condition().
 #define waitevent(wq, condition) { \

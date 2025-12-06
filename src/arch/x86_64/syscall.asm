@@ -27,6 +27,8 @@ extern sys_sigaction
 extern sys_sigreturn
 extern sys_kill
 extern sys_sigprocmask
+extern sys_execve
+extern sys_waitpid
 
 MAXSYSCALLS equ 256
 
@@ -57,6 +59,8 @@ syscall_table:
     dq sys_sigreturn
     dq sys_kill
     dq sys_sigprocmask
+    dq sys_execve
+    dq sys_waitpid
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

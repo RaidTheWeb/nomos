@@ -5,6 +5,8 @@
 #include <arch/x86_64/sync.hpp>
 #endif
 
+#include <sched/sched.hpp>
+
 #include <lib/list.hpp>
 
 namespace NSched {
