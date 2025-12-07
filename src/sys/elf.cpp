@@ -30,7 +30,7 @@ namespace NSys {
             return true;
         }
 
-        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop) {
+        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t execbase, uintptr_t lnbase, uintptr_t phdraddr) {
             size_t argc = 0;
             size_t argvsize = 0;
             size_t envc = 0;
@@ -47,13 +47,15 @@ namespace NSys {
             }
 
             struct auxv auxv[] = {
-                { 0, 0 }, // NULL entry terminator.
-                { auxvtype::PHDR, 0 },
+                { auxvtype::PHDR, phdraddr },
                 { auxvtype::PHENT, elfhdr->phsize },
                 { auxvtype::PHNUM, elfhdr->phcount },
                 { auxvtype::PAGESZ, NArch::PAGESIZE },
-                { auxvtype::ENTRY, elfhdr->entryoff },
-                { auxvtype::RAND, stacktop - 16 }
+                { auxvtype::BASE, lnbase },
+                { auxvtype::EXECFN, 0 }, // Placeholder, will set below.
+                { auxvtype::ENTRY, execbase + elfhdr->entryoff },
+                { auxvtype::SECURE, 0 },
+                { 0, 0 } // NULL entry terminator - MUST BE LAST
             };
             size_t auxvsize = sizeof(auxv);
 
@@ -80,7 +82,8 @@ namespace NSys {
             uint64_t envpptrs = stackptr; // Save location in stack where envp pointers exist.
             stackptr += (envc + 1) * sizeof(uint64_t);
 
-            NLib::memcpy((void *)stackptr, auxv, auxvsize); // Copy auxiliary vector.
+            size_t auxvoff = stackptr;
+            // Simply advance the stack pointer by the size of the auxiliary vector, we'll fill it in later.
             stackptr += auxvsize;
 
             for (size_t i = 0; i < argc; i++) {
@@ -91,6 +94,11 @@ namespace NSys {
                 stackptr += len;
             }
             ((uint64_t *)argvptrs)[argc] = NULL; // NULL terminator.
+
+            // Point EXECFN to argv[0] location.
+            auxv[5].value = ((uint64_t *)argvptrs)[0];
+
+            NLib::memcpy((void *)auxvoff, auxv, auxvsize); // Copy auxiliary vector.
 
             if (envp) {
                 for (size_t i = 0; i < envc; i++) {
@@ -111,15 +119,66 @@ namespace NSys {
             return (void *)(virttop - (stacktop - sp)); // Points to the beginning of the stack (argc).
         }
 
-        bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry) {
+        char *getinterpreter(struct header *hdr, NFS::VFS::INode *node) {
+            struct pheader *phdrs = new struct pheader[hdr->phcount];
+            if (!phdrs) {
+                return NULL;
+            }
+
+            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != sizeof(struct pheader) * hdr->phcount) {
+                delete[] phdrs;
+                return NULL;
+            }
+
+            for (size_t i = 0; i < hdr->phcount; i++) {
+                if (phdrs[i].type == PH_INTERPRETER) {
+                    char *interp = new char[phdrs[i].fsize + 1];
+                    if (!interp) {
+                        delete[] phdrs;
+                        return NULL;
+                    }
+
+                    if (node->read(interp, phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
+                        delete[] interp;
+                        delete[] phdrs;
+                        return NULL;
+                    }
+
+                    interp[phdrs[i].fsize] = 0; // Null terminate.
+
+                    delete[] phdrs;
+                    return interp;
+                }
+            }
+
+            delete[] phdrs;
+            return NULL;
+        }
+
+        bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry, uintptr_t base, uintptr_t *phdraddr) {
             struct pheader *phdrs = new struct pheader[hdr->phcount];
             if (!phdrs) {
                 return false;
             }
 
             if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != sizeof(struct pheader) * hdr->phcount) {
+                delete[] phdrs;
                 return false;
             }
+
+            // Track successfully loaded segments for cleanup on failure.
+            struct loadedsegment {
+                uintptr_t vaddr;
+                uintptr_t phys;
+                size_t size;
+                size_t misalign;
+            };
+            loadedsegment *loaded = new loadedsegment[hdr->phcount];
+            if (!loaded) {
+                delete[] phdrs;
+                return false;
+            }
+            size_t loadcount = 0;
 
             for (size_t i = 0; i < hdr->phcount; i++) {
                 if (!phdrs[i].type) {
@@ -128,24 +187,30 @@ namespace NSys {
 
                 if (phdrs[i].type == PH_LOAD) {
                     size_t misalign = phdrs[i].vaddr % NArch::PAGESIZE;
+                    uintptr_t vaddr = base + phdrs[i].vaddr;
 
                     void *phys = NArch::PMM::alloc(NLib::alignup(phdrs[i].msize + misalign, NArch::PAGESIZE)); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
                     if (!phys) {
                         // Failed. Free everything we've currently acquired.
+                        for (size_t j = 0; j < loadcount; j++) {
+                            NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
+                            NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
+                        }
+                        delete[] loaded;
                         delete[] phdrs;
                         return false;
                     }
 
                     // Reserve region in VMA space.
                     space->vmaspace->reserve(
-                        NLib::aligndown(phdrs[i].vaddr, NArch::PAGESIZE),
-                        NLib::alignup(phdrs[i].vaddr + phdrs[i].msize, NArch::PAGESIZE),
+                        NLib::aligndown(vaddr, NArch::PAGESIZE),
+                        NLib::alignup(vaddr + phdrs[i].msize, NArch::PAGESIZE),
                         NMem::Virt::VIRT_USER |
                         (phdrs[i].flags & flag::ELF_EXEC ? 0 : NMem::Virt::VIRT_NX) |
                         (phdrs[i].flags & flag::ELF_WRITE ? NMem::Virt::VIRT_RW : 0)
                     );
 
-                    if(!NArch::VMM::maprange(space, phdrs[i].vaddr, (uintptr_t)phys,
+                    if(!NArch::VMM::maprange(space, vaddr, (uintptr_t)phys,
                         NArch::VMM::PRESENT | NArch::VMM::USER |
                         (phdrs[i].flags & flag::ELF_EXEC ? 0 : NArch::VMM::NOEXEC) |
                         (phdrs[i].flags & flag::ELF_WRITE ? NArch::VMM::WRITEABLE : 0),
@@ -153,14 +218,24 @@ namespace NSys {
                     )) {
                         // Failed. Free everything we've currently acquired.
                         NArch::PMM::free(phys, phdrs[i].msize + misalign);
+                        for (size_t j = 0; j < loadcount; j++) {
+                            NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
+                            NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
+                        }
+                        delete[] loaded;
                         delete[] phdrs;
                         return false;
                     }
 
                     if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
                         // Failed. Free everything we've currently acquired.
-                        NArch::VMM::unmaprange(space, phdrs[i].vaddr, phdrs[i].msize); // Unmap range in space.
+                        NArch::VMM::unmaprange(space, vaddr, phdrs[i].msize); // Unmap range in space.
                         NArch::PMM::free(phys, phdrs[i].msize + misalign);
+                        for (size_t j = 0; j < loadcount; j++) {
+                            NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
+                            NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
+                        }
+                        delete[] loaded;
                         delete[] phdrs;
                         return false;
                     }
@@ -169,10 +244,23 @@ namespace NSys {
                         // Fill remaining region of allocation with zeroes.
                         NLib::memset((void *)((uintptr_t)NArch::hhdmoff(phys) + phdrs[i].fsize + misalign), 0, (phdrs[i].msize - phdrs[i].fsize));
                     }
+
+                    // Track this successfully loaded segment.
+                    loaded[loadcount].vaddr = vaddr;
+                    loaded[loadcount].phys = (uintptr_t)phys;
+                    loaded[loadcount].size = phdrs[i].msize;
+                    loaded[loadcount].misalign = misalign;
+                    loadcount++;
+                } else if (phdrs[i].type == PH_PHDR) {
+                    if (phdraddr) {
+                        *phdraddr = base + phdrs[i].vaddr;
+                    }
                 }
             }
 
-            *entry = (void *)hdr->entryoff;
+            *entry = (void *)(base + hdr->entryoff);
+            delete[] loaded;
+            delete[] phdrs;
             return true;
         }
     }

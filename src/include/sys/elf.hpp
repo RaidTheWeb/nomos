@@ -13,10 +13,10 @@ namespace NSys {
     namespace ELF {
 
         enum type {
-            ELF_RELOCATABLE     = 1,
-            ELF_EXECUTABLE      = 2,
-            ELF_SHARED          = 3,
-            ELF_CORE            = 4
+            ET_RELOCATABLE     = 1,
+            ET_EXECUTABLE       = 2,
+            ET_DYNAMIC          = 3,
+            ET_CORE             = 4
         };
 
         enum flag {
@@ -77,7 +77,9 @@ namespace NSys {
             PAGESZ      = 6,
             BASE        = 7,
             ENTRY       = 9,
-            RAND        = 25
+            SECURE      = 23,
+            RAND        = 25,
+            EXECFN      = 31
         };
 
         struct auxv {
@@ -86,8 +88,9 @@ namespace NSys {
         } __attribute__((packed));
 
         bool verifyheader(struct header *hdr);
-        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop);
-        bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry);
+        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t execbase, uintptr_t lnbase, uintptr_t phdraddr);
+        char *getinterpreter(struct header *hdr, NFS::VFS::INode *node);
+        bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry, uintptr_t base, uintptr_t *phdraddr);
     }
 }
 

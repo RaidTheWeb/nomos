@@ -96,6 +96,15 @@ namespace NFS {
         }
 
         int DevNode::stat(struct VFS::stat *st) {
+            DevNode *root = (DevNode *)this->fs->getroot();
+            if (this == root) {
+                root->unref();
+                NLib::ScopeSpinlock guard(&this->metalock);
+                *st = this->attr;
+                return 0;
+            }
+            root->unref();
+
             if (!this->device) {
                 return -ENODEV;
             }
@@ -119,7 +128,12 @@ namespace NFS {
                 return NULL;
             }
             VFS::VFS *vfs = this->fs->getvfs();
-            return vfs->resolve(this->symlinktarget, this, false);
+            VFS::INode *node;
+            ssize_t res = vfs->resolve(this->symlinktarget, &node, this, false);
+            if (res < 0) {
+                return NULL;
+            }
+            return node;
         }
 
         VFS::INode *DevNode::lookup(const char *name) {

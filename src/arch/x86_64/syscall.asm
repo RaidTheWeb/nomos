@@ -38,6 +38,8 @@ extern sys_setresuid
 extern sys_setresgid
 extern sys_yield
 extern sys_getcwd
+extern sys_fcntl
+extern sys_stat
 
 MAXSYSCALLS equ 256
 
@@ -79,6 +81,8 @@ syscall_table:
     dq sys_setresgid
     dq sys_yield
     dq sys_getcwd
+    dq sys_fcntl
+    dq sys_stat
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

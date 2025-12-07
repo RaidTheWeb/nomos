@@ -634,19 +634,19 @@ namespace NSched {
             this->tty = NFS::DEVFS::makedev(4, 1);
             if (!fdtable) {
                 this->fdtable = new NFS::VFS::FileDescriptorTable();
-                NFS::VFS::INode *stdin = NFS::VFS::vfs.resolve("/dev/tty");
-                assert(stdin, "Could not resolve standard input.\n");
+                NFS::VFS::INode *stdin;
+                assert(NFS::VFS::vfs.resolve("/dev/tty", &stdin) == 0, "Could not resolve standard input.\n");
                 stdin->unref();
 
                 this->fdtable->reserve(STDIN_FILENO, stdin, NFS::VFS::O_RDONLY);
 
-                NFS::VFS::INode *stdout = NFS::VFS::vfs.resolve("/dev/tty");
-                assert(stdout, "Could not resolve standard output.\n");
+                NFS::VFS::INode *stdout;
+                assert(NFS::VFS::vfs.resolve("/dev/tty", &stdout) == 0, "Could not resolve standard output.\n");
                 stdout->unref();
 
                 this->fdtable->reserve(STDOUT_FILENO, stdout, NFS::VFS::O_WRONLY | NFS::VFS::O_CLOEXEC);
-                NFS::VFS::INode *stderr = NFS::VFS::vfs.resolve("/dev/tty");
-                assert(stderr, "Could not resolve standard error.\n");
+                NFS::VFS::INode *stderr;
+                assert(NFS::VFS::vfs.resolve("/dev/tty", &stderr) == 0, "Could not resolve standard error.\n");
                 stderr->unref();
 
                 this->fdtable->reserve(STDERR_FILENO, stderr, NFS::VFS::O_WRONLY | NFS::VFS::O_NONBLOCK);
@@ -1244,18 +1244,11 @@ namespace NSched {
         __builtin_unreachable();
     }
 
-    static void freeargs(char **argv, size_t argc) {
-        for (size_t i = 0; i < argc; i++) {
-            delete[] argv[i];
+    static void freeargsenvs(char **arr, size_t arrc) {
+        for (size_t i = 0; i < arrc; i++) {
+            delete[] arr[i];
         }
-        delete[] argv;
-    }
-
-    static void freeenvs(char **envp, size_t envc) {
-        for (size_t i = 0; i < envc; i++) {
-            delete[] envp[i];
-        }
-        delete[] envp;
+        delete[] arr;
     }
 
     extern "C" uint64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
@@ -1337,7 +1330,7 @@ namespace NSched {
         aargv[argc] = NULL; // Null terminate.
 
         if (!NMem::UserCopy::valid(envp, sizeof(char *))) {
-            freeargs(aargv, argc);
+            freeargsenvs(aargv, argc);
             delete[] pathbuf;
             return -EFAULT;
         }
@@ -1346,7 +1339,7 @@ namespace NSched {
         size_t envc = 0;
         while (true) {
             if (!NMem::UserCopy::valid(&envp[envc], sizeof(char *))) {
-                freeargs(aargv, argc);
+                freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 return -EFAULT;
             }
@@ -1355,7 +1348,7 @@ namespace NSched {
             }
             envc++;
             if (envc > 4096) { // XXX: ARGMAX limit.
-                freeargs(aargv, argc);
+                freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 return -E2BIG;
             }
@@ -1363,14 +1356,14 @@ namespace NSched {
 
         char **aenvp = new char *[envc + 1];
         if (!aenvp) {
-            freeargs(aargv, argc);
+            freeargsenvs(aargv, argc);
             delete[] pathbuf;
             return -ENOMEM;
         }
         for (size_t i = 0; i < envc; i++) {
             ssize_t envlen = NMem::UserCopy::strnlen(envp[i], 4096);
             if (envlen <= 0) {
-                freeargs(aargv, argc);
+                freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 delete[] aenvp;
                 return -EFAULT;
@@ -1380,7 +1373,7 @@ namespace NSched {
                 for (size_t j = 0; j < i; j++) {
                     delete[] aenvp[j];
                 }
-                freeargs(aargv, argc);
+                freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 delete[] aenvp;
                 return -ENOMEM;
@@ -1390,7 +1383,7 @@ namespace NSched {
                 for (size_t j = 0; j <= i; j++) {
                     delete[] aenvp[j];
                 }
-                freeargs(aargv, argc);
+                freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 delete[] aenvp;
                 return -EFAULT;
@@ -1403,13 +1396,14 @@ namespace NSched {
         Process *current = NArch::CPU::get()->currthread->process;
         current->lock.acquire();
 
-        NFS::VFS::INode *inode = NFS::VFS::vfs.resolve(pathbuf, current->cwd, true);
-        if (!inode) {
+        NFS::VFS::INode *inode;
+        ret = NFS::VFS::vfs.resolve(pathbuf, &inode, current->cwd, true);
+        if (ret < 0) {
             current->lock.release();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             delete[] pathbuf;
-            return -ENOENT;
+            return ret;
         }
         delete[] pathbuf;
 
@@ -1417,51 +1411,144 @@ namespace NSched {
         if (!NFS::VFS::vfs.checkaccess(inode, NFS::VFS::O_EXEC, current->euid, current->egid)) {
             inode->unref();
             current->lock.release();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             return -EACCES;
         }
         current->lock.release();
 
+        // Check if interpreter script.
+        char shebang[128] = {0};
+
+        ssize_t res = inode->read(shebang, sizeof(shebang) - 1, 0, 0);
+        if (res < 2) { // Failed to read shebang.
+            inode->unref();
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
+            return -ENOEXEC;
+        }
+
+        if (shebang[0] == '#' && shebang[1] == '!') {
+            // TODO: Handle interpreter scripts.
+        }
+
         struct NSys::ELF::header elfhdr;
-        ssize_t res = inode->read(&elfhdr, sizeof(elfhdr), 0, 0);
+        res = inode->read(&elfhdr, sizeof(elfhdr), 0, 0);
         if (res < (ssize_t)sizeof(elfhdr)) {
             inode->unref();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
+            return -ENOEXEC;
+        }
+
+        if (elfhdr.type != NSys::ELF::ET_EXECUTABLE && elfhdr.type != NSys::ELF::ET_DYNAMIC) {
+            inode->unref();
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             return -ENOEXEC;
         }
 
         if (!NSys::ELF::verifyheader(&elfhdr)) {
             inode->unref();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
-            return -ENOEXEC;
-        }
-
-        if (elfhdr.type != NSys::ELF::ELF_EXECUTABLE) {
-            inode->unref();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             return -ENOEXEC;
         }
 
         struct VMM::addrspace *newspace;
         NArch::VMM::uclonecontext(&NArch::VMM::kspace, &newspace); // Start with a clone of the kernel address space.
 
+        bool isdynamic = false;
+
         void *ent = NULL;
-        if (!NSys::ELF::loadfile(&elfhdr, inode, newspace, &ent)) {
+        void *interpent = NULL;
+        uintptr_t execbase = 0;
+        uintptr_t interpbase = 0;
+        uintptr_t phdraddr = 0;
+
+        // Static ELF binary.
+        if (elfhdr.type == NSys::ELF::ET_DYNAMIC) {
+            execbase = 0x400000; // Standard base for PIE.
+        } else {
+            execbase = 0;
+        }
+        if (!NSys::ELF::loadfile(&elfhdr, inode, newspace, &ent, execbase, &phdraddr)) {
             inode->unref();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             delete newspace;
             return -ENOEXEC;
         }
 
+        if (elfhdr.type == NSys::ELF::ET_DYNAMIC) {
+            char *interp = NSys::ELF::getinterpreter(&elfhdr, inode);
+            if (!interp) {
+                inode->unref();
+                freeargsenvs(aargv, argc);
+                freeargsenvs(aenvp, envc);
+                delete newspace;
+                return -ENOEXEC;
+            }
+            isdynamic = true;
+
+            // Load interpreter ELF.
+            NFS::VFS::INode *interpnode;
+            ssize_t r = NFS::VFS::vfs.resolve(interp, &interpnode, current->cwd, true);
+            delete[] interp;
+            if (r < 0) {
+                inode->unref();
+                freeargsenvs(aargv, argc);
+                freeargsenvs(aenvp, envc);
+                delete newspace;
+                return r;
+            }
+
+            struct NSys::ELF::header interpelfhdr;
+            ssize_t rd = interpnode->read(&interpelfhdr, sizeof(interpelfhdr), 0, 0);
+            if (rd < (ssize_t)sizeof(interpelfhdr)) {
+                inode->unref();
+                interpnode->unref();
+                freeargsenvs(aargv, argc);
+                freeargsenvs(aenvp, envc);
+                delete newspace;
+                return -ENOEXEC;
+            }
+
+            if (!NSys::ELF::verifyheader(&interpelfhdr)) {
+                inode->unref();
+                interpnode->unref();
+                freeargsenvs(aargv, argc);
+                freeargsenvs(aenvp, envc);
+                delete newspace;
+                return -ENOEXEC;
+            }
+
+            // Load interpreter at different base address
+            interpbase = 0x40000000;  // Place interpreter at a different address range
+            if (!NSys::ELF::loadfile(&interpelfhdr, interpnode, newspace, &interpent, interpbase, NULL)) {
+                inode->unref();
+                interpnode->unref();
+                freeargsenvs(aargv, argc);
+                freeargsenvs(aenvp, envc);
+                delete newspace;
+                return -ENOEXEC;
+            }
+
+            interpnode->unref();
+
+            if (!interpent || (uintptr_t)interpent >= 0x0000800000000000) {
+                inode->unref();
+                freeargsenvs(aargv, argc);
+                freeargsenvs(aenvp, envc);
+                delete newspace;
+                return -ENOEXEC;
+            }
+        }
+
         if (!ent || (uintptr_t)ent >= 0x0000800000000000) {
             inode->unref();
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             delete newspace;
             return -ENOEXEC;
         }
@@ -1473,8 +1560,8 @@ namespace NSched {
 
         uintptr_t ustackphy = (uintptr_t)PMM::alloc(1 << 20); // This is the physical memory behind the stack.
         if (!ustackphy) {
-            freeargs(aargv, argc);
-            freeargs(aenvp, envc);
+            freeargsenvs(aargv, argc);
+            freeargsenvs(aenvp, envc);
             delete newspace;
             return -ENOMEM;
         }
@@ -1482,9 +1569,9 @@ namespace NSched {
         uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Top of user space, minus a page for safety.
         uintptr_t ustackbottom = ustacktop - (1 << 20); // Virtual address of bottom of user stack (where ustackphy starts).
 
-        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), aargv, aenvp, &elfhdr, ustacktop);
-        freeargs(aargv, argc);
-        freeargs(aenvp, envc);
+        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), aargv, aenvp, &elfhdr, ustacktop, execbase, interpbase, phdraddr);
+        freeargsenvs(aargv, argc);
+        freeargsenvs(aenvp, envc);
 
         if (!rsp) {
             PMM::free((void *)ustackphy, 1 << 20);
@@ -1548,7 +1635,7 @@ namespace NSched {
             NArch::CPU::get()->currthread->ctx.es = 0x1b; // Ditto.
             NArch::CPU::get()->currthread->ctx.ss = 0x1b; // Ditto.
 
-            NArch::CPU::get()->currthread->ctx.rip = (uint64_t)ent;
+            NArch::CPU::get()->currthread->ctx.rip = (uint64_t)isdynamic ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
             NArch::CPU::get()->currthread->ctx.rsp = (uint64_t)rsp;
             NArch::CPU::get()->currthread->ctx.rflags = 0x200; // Enable interrupts.
 

@@ -54,6 +54,9 @@ namespace NFS {
                         attr.st_uid = uid;
                         attr.st_gid = gid;
                         attr.st_mtime = mtime;
+                        attr.st_blksize = 512;
+                        attr.st_atime = mtime;
+                        attr.st_ctime = mtime;
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
 
@@ -67,6 +70,8 @@ namespace NFS {
                         attr.st_uid = uid;
                         attr.st_gid = gid;
                         attr.st_mtime = mtime;
+                        attr.st_atime = mtime;
+                        attr.st_ctime = mtime;
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
                         break;

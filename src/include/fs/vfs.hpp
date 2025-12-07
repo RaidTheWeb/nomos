@@ -126,15 +126,15 @@ namespace NFS {
 
         struct stat {
             uint64_t st_dev     = 0;
-            uint32_t st_ino     = 0;
-            uint32_t st_mode    = 0;
+            uint64_t st_ino     = 0;
             uint32_t st_nlink   = 0;
+            uint32_t st_mode    = 0;
             uint32_t st_uid     = 0;
             uint32_t st_gid     = 0;
             uint64_t st_rdev    = 0;
             off_t st_size       = 0;
-            off_t st_blksize    = 0;
-            off_t st_blocks     = 0;
+            int64_t st_blksize    = 0;
+            int64_t st_blocks     = 0;
             uint64_t st_atime   = 0;
             uint64_t st_mtime   = 0;
             uint64_t st_ctime   = 0;
@@ -354,7 +354,8 @@ namespace NFS {
                     return -EINVAL;
                 }
                 virtual int stat(struct stat *st) {
-                    *st = this->getattr();
+                    NLib::ScopeSpinlock guard(&this->metalock);
+                    *st = this->attr;
                     return 0;
                 }
 
@@ -383,13 +384,9 @@ namespace NFS {
                 virtual INode *resolvesymlink(void) = 0;
 
                 struct stat getattr(void) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
-                    return this->attr;
-                }
-
-                void setattr(struct stat attr) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
-                    this->attr = attr;
+                    struct stat st;
+                    this->stat(&st);
+                    return st;
                 }
 
                 Path getpath(void);
@@ -398,8 +395,11 @@ namespace NFS {
                     __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
                 void unref(void) {
-                    __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
+                    size_t ref = __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
                     // XXX: Delete.
+                    if (ref == 0) {
+                        // Would normally delete here...
+                    }
                 }
         };
 
@@ -468,7 +468,7 @@ namespace NFS {
                 bool checkaccess(INode *node, int flags, uint32_t uid, uint32_t gid);
 
                 // Resolve node by path.
-                INode *resolve(const char *path, INode *relativeto = NULL, bool symlink = true);
+                ssize_t resolve(const char *path, INode **nodeout, INode *relativeto = NULL, bool symlink = true);
 
                 INode *create(const char *path, struct stat attr);
         };
@@ -564,6 +564,9 @@ namespace NFS {
                 FileDescriptorTable *fork(void);
 
                 void doexec(void);
+
+                void setcloseonexec(int fd, bool closeit);
+                bool iscloseonexec(int fd);
 
                 void closeall(void);
         };

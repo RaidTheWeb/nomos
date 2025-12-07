@@ -108,22 +108,23 @@ void kpostarch(void) {
 
     NDev::PCI::init(); // Initialise PCI.
 
-    NFS::VFS::INode *node = NFS::VFS::vfs.resolve("/test");
-    assert(node, "Failed to locate file.\n");
+    NFS::VFS::INode *node;
+    ssize_t ret = NFS::VFS::vfs.resolve("/test", &node);
+    assert(ret == 0, "Failed to locate file.\n");
 
     struct NSys::ELF::header elfhdr;
     assert(node->read(&elfhdr, sizeof(elfhdr), 0, 0) == sizeof(elfhdr), "Failed to read ELF header.\n");
 
     assert(NSys::ELF::verifyheader(&elfhdr), "Failed to validate header.\n");
 
-    assert(elfhdr.type == NSys::ELF::ELF_EXECUTABLE, "ELF is not executable.\n");
+    assert(elfhdr.type == NSys::ELF::ET_EXECUTABLE, "ELF is not executable.\n");
 
     struct NArch::VMM::addrspace *uspace;
     NArch::VMM::uclonecontext(&NArch::VMM::kspace, &uspace);
 
     void *ent = NULL;
-    (void)ent;
-    assert(NSys::ELF::loadfile(&elfhdr, node, uspace, &ent), "Failed to load ELF.\n");
+    uintptr_t phdr = 0;
+    assert(NSys::ELF::loadfile(&elfhdr, node, uspace, &ent, 0, &phdr), "Failed to load ELF.\n");
 
     // PROCESS
     NSched::Process *proc = new NSched::Process(uspace);
@@ -161,7 +162,7 @@ void kpostarch(void) {
 
     // We pass in the hhdm-offset physical stack top. The user will be given the mapped version.
     //void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
-    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), argv, NULL, &elfhdr, ustacktop);
+    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), argv, NULL, &elfhdr, ustacktop, 0, 0, phdr);
     assert(rsp, "Stack alignment failed.\n");
 
     // Reserve stack location. We don't want to end up allocating into the stack region on requests for virtual memory.

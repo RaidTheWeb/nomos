@@ -16,9 +16,9 @@ namespace NFS {
 
             // Resolve the mountpoint node (except for root mount).
             if (mntpath.depth() > 0) {
-                mntnode = this->resolve(path, NULL, true);
-                if (!mntnode) {
-                    return -ENOENT; // Mountpoint doesn't exist.
+                ssize_t ret = this->resolve(path, &mntnode, NULL, true);
+                if (ret < 0) {
+                    return ret; // Mountpoint doesn't exist.
                 }
             }
 
@@ -120,7 +120,7 @@ namespace NFS {
             return best;
         }
 
-        INode *VFS::resolve(const char *path, INode *relativeto, bool symlink) {
+        ssize_t VFS::resolve(const char *path, INode **nodeout, INode *relativeto, bool symlink) {
             Path rp = Path(path);
 
             if (!rp.depth()) { // Empty path, we're referring to our current directory.
@@ -128,7 +128,9 @@ namespace NFS {
                 if (result) {
                     result->ref(); // Caller expects a referenced node.
                 }
-                return result;
+
+                *nodeout = result;
+                return 0;
             }
 
             if (!rp.isabsolute()) {
@@ -147,7 +149,7 @@ namespace NFS {
 
             struct mntpoint *mount = this->findmount(&pobj);
             if (!mount) {
-                return NULL; // Path is invalid. No mountpoint handles this path.
+                return -ENOENT; // Path is invalid. No mountpoint handles this path.
             }
 
             Path mntpath = Path(mount->path);
@@ -166,7 +168,7 @@ namespace NFS {
 
                     if (!parent) {
                         current->unref(); // Clean up before returning.
-                        return NULL; // No parent. Failed.
+                        return -ENOENT; // No parent. Failed.
                     }
 
                     parent->ref(); // Increment refcount for parent.
@@ -176,11 +178,17 @@ namespace NFS {
                     continue;
                 }
 
+                // Check that we have search permission on the current node.
+                if (!this->checkaccess(current, R_OK | X_OK, 0, 0)) {
+                    current->unref();
+                    return -EACCES;
+                }
+
                 INode *next = current->lookup(*it.get());
                 current->unref(); // Unreference old
 
                 if (!next) {
-                    return NULL;
+                    return -ENOENT;
                 }
 
                 it.next();
@@ -189,14 +197,15 @@ namespace NFS {
                     INode *resolved = current->resolvesymlink(); // Unwrap into real path.
                     if (!resolved) {
                         current->unref(); // Clean up before returning.
-                        return NULL; // Invalid symbolic link.
+                        return -ENOENT; // Invalid symbolic link.
                     }
                     current->unref(); // Unreference the symlink node.
                     current = resolved; // Resolved already has refcount from resolvesymlink.
                 }
             }
 
-            return current;
+            *nodeout = current;
+            return 0;
         }
 
         INode *VFS::create(const char *path, struct stat attr) {
@@ -207,9 +216,10 @@ namespace NFS {
             }
 
             const char *parentpath = pobj.dirname();
-            INode *parent = this->resolve(parentpath);
+            INode *parent;
+            ssize_t res = this->resolve(parentpath, &parent);
             delete parentpath; // Caller is expected to free `dirname()`.
-            if (!parent) {
+            if (res < 0) {
                 return NULL; // Parent doesn't already exist.
             }
 
@@ -401,6 +411,30 @@ namespace NFS {
             return newtable;
         }
 
+        bool FileDescriptorTable::iscloseonexec(int fd) {
+            NLib::ScopeSpinlock guard(&this->lock);
+
+            if (fd < 0 || fd >= (int)this->fds.getsize() || !this->openfds.test(fd)) {
+                return false;
+            }
+
+            return this->closeonexec.test(fd);
+        }
+
+        void FileDescriptorTable::setcloseonexec(int fd, bool closeit) {
+            NLib::ScopeSpinlock guard(&this->lock);
+
+            if (fd < 0 || fd >= (int)this->fds.getsize() || !this->openfds.test(fd)) {
+                return;
+            }
+
+            if (closeit) {
+                this->closeonexec.set(fd);
+            } else {
+                this->closeonexec.clear(fd);
+            }
+        }
+
         void FileDescriptorTable::doexec(void) {
             NLib::ScopeSpinlock guard(&this->lock);
 
@@ -537,10 +571,15 @@ namespace NFS {
                 }
             }
 
-            INode *node = vfs.resolve(pathbuf, dirnode, !(flags & O_NOFOLLOW));
+            INode *node;
+            ssize_t res = vfs.resolve(pathbuf, &node, dirnode, !(flags & O_NOFOLLOW));
             dirnode->unref();
+            if (res == -EACCES) { // We don't have permission to traverse the path.
+                delete[] pathbuf;
+                return -EACCES; // Propagate access error.
+            }
 
-            if (!node) { // Couldn't find it. Check if there's a reason to create it.
+            if (res != 0) { // Couldn't find it. Check if there's a reason to create it.
                 if (!(flags & O_CREAT)) {
                     delete[] pathbuf;
                     return -ENOENT; // Don't bother if there's no create flag.
@@ -549,7 +588,7 @@ namespace NFS {
                 struct stat attr = { 0 };
                 attr.st_mode = mode;
                 node = vfs.create(pathbuf, attr);
-                if (!node) {
+                if (res != 0) {
                     delete[] pathbuf;
                     return -EIO; // Generic I/O error.
                 }
@@ -746,11 +785,12 @@ namespace NFS {
 
             NLib::ScopeIRQSpinlock guard(&proc->lock);
 
-            INode *node = vfs.resolve(pathbuf, proc->cwd, true);
+            INode *node;
+            ssize_t res = vfs.resolve(pathbuf, &node, proc->cwd, true);
             delete[] pathbuf;
 
-            if (!node) {
-                return -ENOENT;
+            if (res < 0) {
+                return res;
             }
 
             struct stat st = node->getattr();
@@ -1030,6 +1070,232 @@ namespace NFS {
 
             desc->setoff(newoff); // Set new offset.
             return newoff;
+        }
+
+        #define F_GETFD 1
+        #define F_SETFD 2
+        #define FD_CLOEXEC 1
+
+        extern "C" uint64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
+            SYSCALL_LOG("sys_fcntl(%d, %d, %p).\n", fd, cmd, arg);
+
+            if (fd < 0) {
+                return -EBADF;
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                return -EBADF;
+            }
+
+            switch (cmd) {
+                case F_GETFD:
+                    return (proc->fdtable->iscloseonexec(fd) ? FD_CLOEXEC : 0);
+                case F_SETFD:
+                    if (arg & FD_CLOEXEC) {
+                        proc->fdtable->setcloseonexec(fd, true);
+                    } else {
+                        proc->fdtable->setcloseonexec(fd, false);
+                    }
+                    return 0;
+                default:
+                    return -EINVAL;
+            }
+        }
+
+        #define AT_SYMLINK_NOFOLLOW 0x100
+
+        // Userspace definition of `struct stat`.
+        struct ustat {
+            uint64_t        st_dev;
+            uint64_t        st_ino;
+            uint64_t        st_nlink;
+            uint32_t        st_mode;
+            uint32_t        st_uid;
+            uint32_t        st_gid;
+            uint64_t        st_rdev;
+            int64_t         st_size;
+            int64_t         st_blksize;
+            int64_t         st_blocks;
+            long            st_atime;
+            long            st_atime_nsec;
+            long            st_mtime;
+            long            st_mtime_nsec;
+            long            st_ctime;
+            long            st_ctime_nsec;
+        };
+
+        extern "C" uint64_t sys_stat(int fd, const char *path, size_t len, struct ustat *statbuf, int flags) {
+            SYSCALL_LOG("sys_stat(%d, %s, %lu, %p, %d).\n", fd, path, len, statbuf, flags);
+
+            if (fd == AT_FDCWD) {
+                // Stat is path relative to CWD.
+                ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
+                if (pathsize < 0) {
+                    return pathsize; // Contains errno.
+                }
+                char *pathbuf = new char[pathsize + 1];
+                if (!pathbuf) {
+                    return -ENOMEM;
+                }
+
+                int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+                if (ret < 0) {
+                    delete[] pathbuf;
+                    return ret; // Contains errno.
+                }
+
+                pathbuf[pathsize] = '\0';
+
+                NSched::Process *proc = NArch::CPU::get()->currthread->process;
+                INode *node;
+                ssize_t res = vfs.resolve(pathbuf, &node, proc->cwd, !(flags & AT_SYMLINK_NOFOLLOW));
+                delete[] pathbuf;
+                if (res < 0) {
+                    return res;
+                }
+
+                struct stat st = node->getattr();
+                node->unref();
+
+                struct ustat ust;
+                ust.st_dev = st.st_dev;
+                ust.st_ino = st.st_ino;
+                ust.st_nlink = st.st_nlink;
+                ust.st_mode = st.st_mode;
+                ust.st_uid = st.st_uid;
+                ust.st_gid = st.st_gid;
+                ust.st_rdev = st.st_rdev;
+                ust.st_size = st.st_size;
+                ust.st_blksize = st.st_blksize;
+                ust.st_blocks = st.st_blocks;
+                ust.st_atime = st.st_atime;
+                ust.st_atime_nsec = 0;
+                ust.st_mtime = st.st_mtime;
+                ust.st_mtime_nsec = 0;
+                ust.st_ctime = st.st_ctime;
+                ust.st_ctime_nsec = 0;
+
+                res = NMem::UserCopy::copyto(statbuf, &ust, sizeof(struct ustat));
+                if (res < 0) {
+                    return res;
+                }
+                return 0;
+            } else if (fd >= 0) {
+                if (len == 0) { // Stat should be of an FD.
+                    // Ensure that path is empty string.
+                    char ch;
+                    int res = NMem::UserCopy::copyfrom(&ch, path, 1);
+                    if (res < 0) {
+                        return res;
+                    }
+                    if (ch != '\0') {
+                        return -EINVAL;
+                    }
+
+                    NSched::Process *proc = NArch::CPU::get()->currthread->process;
+                    FileDescriptor *desc = proc->fdtable->get(fd);
+                    if (!desc) {
+                        return -EBADF;
+                    }
+
+                    INode *node = desc->getnode();
+                    struct stat st = node->getattr();
+                    node->unref();
+
+                    struct ustat ust;
+                    ust.st_dev = st.st_dev;
+                    ust.st_ino = st.st_ino;
+                    ust.st_nlink = st.st_nlink;
+                    ust.st_mode = st.st_mode;
+                    ust.st_uid = st.st_uid;
+                    ust.st_gid = st.st_gid;
+                    ust.st_rdev = st.st_rdev;
+                    ust.st_size = st.st_size;
+                    ust.st_blksize = st.st_blksize;
+                    ust.st_blocks = st.st_blocks;
+                    ust.st_atime = st.st_atime;
+                    ust.st_atime_nsec = 0;
+                    ust.st_mtime = st.st_mtime;
+                    ust.st_mtime_nsec = 0;
+                    ust.st_ctime = st.st_ctime;
+                    ust.st_ctime_nsec = 0;
+
+                    int res2 = NMem::UserCopy::copyto(statbuf, &ust, sizeof(struct ustat));
+                    if (res2 < 0) {
+                        return res2;
+                    }
+                    return 0;
+                } else { // Stat is path relative to FD.
+                    ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
+                    if (pathsize < 0) {
+                        return pathsize; // Contains errno.
+                    }
+                    char *pathbuf = new char[pathsize + 1];
+                    if (!pathbuf) {
+                        return -ENOMEM;
+                    }
+
+                    int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+                    if (ret < 0) {
+                        delete[] pathbuf;
+                        return ret; // Contains errno.
+                    }
+
+                    pathbuf[pathsize] = '\0';
+
+                    NSched::Process *proc = NArch::CPU::get()->currthread->process;
+                    FileDescriptor *desc = proc->fdtable->get(fd);
+                    if (!desc) {
+                        delete[] pathbuf;
+                        return -EBADF;
+                    }
+
+                    INode *dirnode = desc->getnode();
+                    if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                        dirnode->unref();
+                        delete[] pathbuf;
+                        return -ENOTDIR;
+                    }
+
+                    INode *node;
+                    ssize_t res = vfs.resolve(pathbuf, &node, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    if (res < 0) {
+                        return res;
+                    }
+
+                    struct stat st = node->getattr();
+                    node->unref();
+                    struct ustat ust;
+                    ust.st_dev = st.st_dev;
+                    ust.st_ino = st.st_ino;
+                    ust.st_nlink = st.st_nlink;
+                    ust.st_mode = st.st_mode;
+                    ust.st_uid = st.st_uid;
+                    ust.st_gid = st.st_gid;
+                    ust.st_rdev = st.st_rdev;
+                    ust.st_size = st.st_size;
+                    ust.st_blksize = st.st_blksize;
+                    ust.st_blocks = st.st_blocks;
+                    ust.st_atime = st.st_atime;
+                    ust.st_atime_nsec = 0;
+                    ust.st_mtime = st.st_mtime;
+                    ust.st_mtime_nsec = 0;
+                    ust.st_ctime = st.st_ctime;
+                    ust.st_ctime_nsec = 0;
+
+                    int res2 = NMem::UserCopy::copyto(statbuf, &ust, sizeof(struct ustat));
+                    if (res2 < 0) {
+                        return res2;
+                    }
+                    return 0;
+                }
+            }
+            return -EBADF; // Invalid FD.
         }
     }
 }

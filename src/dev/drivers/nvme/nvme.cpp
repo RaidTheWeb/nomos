@@ -29,8 +29,7 @@ namespace NDev {
         NArch::PMM::free(NArch::hhdmsub(ptr), size);
     }
 
-
-    static NVMEDriver *instance;
+    static NVMEDriver *instance = NULL;
 
     // Convert a controller ID, namespace ID and partition ID into a block device minor number.
     static inline uint32_t nsblktominor(uint32_t cid, uint32_t nsid, uint32_t pid) {

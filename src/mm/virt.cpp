@@ -363,6 +363,8 @@ namespace NMem {
             // Find the node that contains this region.
             struct vmanode *node = this->containing(this->root, start, end);
             if (!node) {
+                this->dump();
+                NUtil::printf("VMA reserve failed: no containing node for region [%p->%p].\n", start, end);
                 return NULL;
             }
 

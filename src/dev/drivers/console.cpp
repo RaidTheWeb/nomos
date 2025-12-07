@@ -44,7 +44,8 @@ namespace NDev {
                 }
                 char path[1024];
                 NUtil::snprintf(path, sizeof(path), "/dev/%s", target);
-                this->targetnode = VFS::vfs.resolve(path);
+                assert(VFS::vfs.resolve(path, &this->targetnode, NULL, false) == 0, "Failed to resolve syscon target node.\n");
+
                 assert(this->targetnode, "Invalid syscon target.");
                 this->targetnode->unref();
             }

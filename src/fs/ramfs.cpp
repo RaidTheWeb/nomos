@@ -90,8 +90,12 @@ namespace NFS {
             VFS::VFS *vfs = this->fs->getvfs();
 
             // Attempt to resolve the node our data points to. Uses normal resolution function, but it doesn't attempt to resolve symbolic links (we don't want any crazy recursion).
-            VFS::INode *node = vfs->resolve((const char *)this->data, this, false);
+            VFS::INode *node;
+            ssize_t res = vfs->resolve((const char *)this->data, &node, this, false);
             this->datalock.release();
+            if (res < 0) {
+                return NULL;
+            }
             return node;
         }
 
