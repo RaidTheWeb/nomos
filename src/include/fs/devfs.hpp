@@ -66,6 +66,7 @@ namespace NFS {
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t readdir(void *buf, size_t count, off_t offset) override;
+                ssize_t readlink(char *buf, size_t bufsiz) override;
                 int open(int flags) override;
                 int close(int fdflags) override;
                 int mmap(void *addr, size_t offset, uint64_t flags, int fdflags) override;

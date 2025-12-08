@@ -40,6 +40,24 @@ namespace NFS {
             return count;
         }
 
+        ssize_t RAMNode::readlink(char *buf, size_t bufsiz) {
+            this->datalock.acquire();
+
+            if (!VFS::S_ISLNK(this->attr.st_mode)) {
+                this->datalock.release();
+                return -EINVAL;
+            }
+
+            size_t tocopy = this->attr.st_size;
+            if (bufsiz < tocopy) {
+                tocopy = bufsiz;
+            }
+
+            NLib::memcpy(buf, this->data, tocopy);
+            this->datalock.release();
+            return tocopy;
+        }
+
         ssize_t RAMNode::readdir(void *buf, size_t count, off_t offset) {
             NLib::ScopeSpinlock guard(&this->metalock);
 
@@ -90,8 +108,8 @@ namespace NFS {
             VFS::VFS *vfs = this->fs->getvfs();
 
             // Attempt to resolve the node our data points to. Uses normal resolution function, but it doesn't attempt to resolve symbolic links (we don't want any crazy recursion).
-            VFS::INode *node;
-            ssize_t res = vfs->resolve((const char *)this->data, &node, this, false);
+            VFS::INode *node = NULL;
+            ssize_t res = vfs->resolve((const char *)this->data, &node, this->getparent(), false);
             this->datalock.release();
             if (res < 0) {
                 return NULL;

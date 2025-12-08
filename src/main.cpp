@@ -16,7 +16,7 @@
 
 #include <cxxruntime.hpp>
 #include <fs/devfs.hpp>
-#include <fs/ustar.hpp>
+#include <fs/posixtar.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/bitmap.hpp>
@@ -76,7 +76,7 @@ void kpostarch(void) {
         assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
 
         if (NArch::cmdline.get("root") && !NLib::strcmp(NArch::cmdline.get("root"), "initramfs")) { // If the boot command line specifies that the initramfs should be used as the filesystem root, we should load it.
-            NFS::USTAR::USTARFileSystem *fs = new NFS::USTAR::USTARFileSystem(&NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
+            NFS::POSIXTAR::POSIXTARFileSystem *fs = new NFS::POSIXTAR::POSIXTARFileSystem(&NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
             NFS::VFS::vfs.mount("/", fs);
         }
     }

@@ -1,5 +1,5 @@
-#ifndef _FS__USTAR_HPP
-#define _FS__USTAR_HPP
+#ifndef _FS__POSIXTAR_HPP
+#define _FS__POSIXTAR_HPP
 
 #ifdef __x86_64__
 #include <arch/limine/module.hpp>
@@ -9,7 +9,7 @@
 #include <fs/vfs.hpp>
 
 namespace NFS {
-    namespace USTAR {
+    namespace POSIXTAR {
 
         enum type {
             FILE            = '0',
@@ -42,11 +42,11 @@ namespace NFS {
             char prefix[155];
         };
 
-        class USTARFileSystem : public RAMFS::RAMFileSystem {
+        class POSIXTARFileSystem : public RAMFS::RAMFileSystem {
             private:
                 struct NArch::Module::modinfo modinfo;
             public:
-                USTARFileSystem(VFS::VFS *vfs, struct NArch::Module::modinfo mod) : RAMFS::RAMFileSystem(vfs) {
+                POSIXTARFileSystem(VFS::VFS *vfs, struct NArch::Module::modinfo mod) : RAMFS::RAMFileSystem(vfs) {
                     this->modinfo = mod;
                 }
 

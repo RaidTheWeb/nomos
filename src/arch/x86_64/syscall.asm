@@ -40,6 +40,9 @@ extern sys_yield
 extern sys_getcwd
 extern sys_fcntl
 extern sys_stat
+extern sys_access
+extern sys_readlink
+extern sys_uname
 
 MAXSYSCALLS equ 256
 
@@ -83,6 +86,9 @@ syscall_table:
     dq sys_getcwd
     dq sys_fcntl
     dq sys_stat
+    dq sys_access
+    dq sys_readlink
+    dq sys_uname
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

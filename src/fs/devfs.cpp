@@ -19,6 +19,22 @@ namespace NFS {
             return this->device->driver->write(this->attr.st_rdev, buf, count, offset, fdflags);
         }
 
+        ssize_t DevNode::readlink(char *buf, size_t bufsiz) {
+            NLib::ScopeSpinlock guard(&this->metalock);
+
+            if (!VFS::S_ISLNK(this->attr.st_mode)) {
+                return -EINVAL;
+            }
+
+            if (!this->symlinktarget) {
+                return -EINVAL;
+            }
+
+            // XXX: Implement path grabbing for symlink target.
+            // Or, just make symlink target a path.
+            return -ENOSYS;
+        }
+
         ssize_t DevNode::readdir(void *buf, size_t count, off_t offset) {
             NLib::ScopeSpinlock guard(&this->metalock);
 

@@ -15,7 +15,7 @@
 #include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/timer.hpp>
 #include <arch/x86_64/vmm.hpp>
-#include <fs/ustar.hpp>
+#include <fs/posixtar.hpp>
 #include <lib/assert.hpp>
 #include <lib/cmdline.hpp>
 #include <lib/string.hpp>

@@ -382,6 +382,7 @@ namespace NFS {
                 }
 
                 virtual INode *resolvesymlink(void) = 0;
+                virtual ssize_t readlink(char *buf, size_t bufsize) = 0;
 
                 struct stat getattr(void) {
                     struct stat st;
