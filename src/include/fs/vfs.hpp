@@ -375,7 +375,7 @@ namespace NFS {
                     (void)arg;
                     return -EINVAL;
                 }
-                virtual int poll(int events, int *revents, int fdflags) {
+                virtual int poll(short events, short *revents, int fdflags) {
                     (void)events;
                     (void)revents;
                     (void)fdflags;

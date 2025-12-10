@@ -39,6 +39,8 @@ namespace NFS {
                 bool remove(const char *name) override;
                 VFS::INode *resolvesymlink(void) override;
 
+                int poll(short events, short *revents, int fdflags) override;
+
                 bool empty(void) override {
                     NLib::ScopeSpinlock guard(&this->metalock);
                     return this->children.size() == 0;

@@ -339,6 +339,10 @@ flagbreak:
         consolewrite = false;
     }
 
+    void undropwrite(void) {
+        consolewrite = true;
+    }
+
     int vprintf(const char *format, va_list ap) {
         char buffer[1024];
         size_t len = vsnprintf(buffer, sizeof(buffer), format, ap);

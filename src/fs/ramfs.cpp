@@ -3,6 +3,26 @@
 
 namespace NFS {
     namespace RAMFS {
+        int RAMNode::poll(short events, short *revents, int fdflags) {
+            (void)fdflags;
+            NLib::ScopeSpinlock guard(&this->metalock);
+
+            *revents = 0;
+
+            if (events & VFS::POLLIN) {
+                if (this->attr.st_size > 0) {
+                    // Data is available to read.
+                    *revents |= VFS::POLLIN;
+                }
+            }
+
+            if (events & VFS::POLLOUT) {
+                *revents |= VFS::POLLOUT; // Always writable.
+            }
+
+            return 0;
+        }
+
         ssize_t RAMNode::read(void *buf, size_t count, off_t offset, int fdflags) {
             (void)fdflags;
             assert(buf, "Reading into invalid buffer.\n");

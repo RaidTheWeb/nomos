@@ -37,17 +37,15 @@
 #define SIGUNUSED       SIGSYS
 #define SIGCANCEL       32
 #define SIGTIMER        33
-#define SIGRTMIN        35
-#define SIGMAX          36
+#define SIGRTMIN        34
+#define SIGRTMAX        63
 
 #define SIG_BLOCK       0
 #define SIG_UNBLOCK     1
 #define SIG_SETMASK     2
 
 namespace NLib {
-    struct sigset {
-        uint64_t sigs[1024 / (8 * sizeof(uint64_t))];
-    };
+    typedef uint64_t sigset_t;
 }
 
 #endif

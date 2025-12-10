@@ -132,6 +132,8 @@ void kpostarch(void) {
     // PROCESS
     NSched::Process *proc = new NSched::Process(uspace);
 
+    NSched::pidtable->insert(proc->id, proc); // PID 1
+
     // PGRP
     NSched::ProcessGroup *pgrp = new NSched::ProcessGroup();
     pgrp->id = proc->id;
@@ -140,7 +142,6 @@ void kpostarch(void) {
     // SESSION
     NSched::Session *session = new NSched::Session();
     session->id = proc->id;
-    session->ctty = NFS::DEVFS::makedev(4, 1);
     session->pgrps.push(pgrp);
 
     pgrp->session = session;

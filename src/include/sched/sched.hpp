@@ -223,6 +223,8 @@ namespace NSched {
 
             uint64_t tty; // Device ID of process' controlling TTY.
 
+            struct signal signalstate; // Signal state (pending, blocked, handlers).
+
             Process(struct NArch::VMM::addrspace *space) {
                 this->init(space, NULL);
             }
@@ -258,8 +260,9 @@ namespace NSched {
 
             enum state {
                 READY, // Ready for scheduling.
-                SUSPENDED, // Currently sitting in the running queue, but not currently running.
-                WAITING, // Waiting on something like a mutex.
+                SUSPENDED, // Sitting in the running queue, but not currently running (yielding for another thread).
+                WAITING, // Waiting on something like a mutex/wait queue.
+                PAUSED, // Paused via SIGSTOP or awaiting via sys_pause.
                 RUNNING, // Currently running.
                 DEAD // Thread exited.
             };
@@ -267,7 +270,7 @@ namespace NSched {
             struct NArch::CPU::context ctx; // CPU working context (save state).
             struct NArch::CPU::extracontext xctx; // CPU extra context (save state).
             struct NArch::CPU::fpucontext fctx; // CPU fpu context (save state).
-            struct NArch::CPU::context sysctx; // Syscall context (not real context, but provides original values before system call).
+            struct NArch::CPU::context *sysctx; // Syscall context (not real context, but provides original values before system call).
         private:
             enum target targetmode = target::RELAXED;
             uint16_t target = 0xffff; // Target CPU affinity (ideal).
@@ -375,13 +378,16 @@ namespace NSched {
     void sleep(uint64_t ms);
 
     // Exit a kernel thread. REQUIRED for ending kernel threads that return eventually.
-    void exit(void);
+    void exit(int status, int sig = 0);
 
     // Await scheduling. This is run on the BSP to jump into the scheduler.
     void await(void);
 
     // Force CPU of thread to reschedule the thread.
     void reschedule(Thread *thread);
+
+    // Terminate all other threads in a process except the calling thread.
+    void termothers(Process *proc);
 
     class Mutex {
         private:

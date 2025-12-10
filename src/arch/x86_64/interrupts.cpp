@@ -94,15 +94,19 @@ namespace NArch {
             }
 
             if ((ctx->cs & 0x3) == 0x3) {
-                NSched::signal_checkpending(ctx);
+                NSched::signal_checkpending(ctx, NSched::POSTINT); // Check for pending signals before returning to userspace.
             }
 
             CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false;
         }
 
         void exception_handler(struct isr *isr, struct CPU::context *ctx) {
-            (void)ctx;
             char errbuffer[2048];
+
+            // Map exception number to signal for userspace faults.
+            int sig = 0;
+            bool is_userspace = (ctx->cs & 0x3) == 0x3;
+
             if ((isr->id & 0xffffffff) == 14) { // #PF
                 uintptr_t addr = 0;
                 asm volatile(
@@ -115,9 +119,12 @@ namespace NArch {
                 uint64_t *pte = VMM::_resolvepte(space, addr);
 
                 if (!pte || !(*pte & VMM::PRESENT)) {
-                    // NSched::deliversignal(NArch::CPU::get()->currthread, SIGSEGV);
-                    // return;
                     space->lock.release();
+                    // Send SIGSEGV for non-present page in userspace.
+                    if (is_userspace) {
+                        NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
+                        return;
+                    }
                     goto pffault;
                 }
 
@@ -126,9 +133,13 @@ namespace NArch {
                     void *newpage = PMM::alloc(PAGESIZE);
                     if (!newpage) {
                         space->lock.release();
-                        // XXX: Out of memory handling.
-                        //NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL, ctx);
-                        return;
+                        // Out of memory, send SIGKILL to process.
+                        if (is_userspace) {
+                            NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
+                            return;
+                        }
+                        // Kernel OOM is fatal.
+                        panic("Out of memory during COW page fault handling.\n");
                     }
 
                     // Resolve physical page from old address space.
@@ -152,15 +163,42 @@ namespace NArch {
                 }
 pffault:
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", ctx->err & (1 << 2) ? NArch::CPU::get()->currthread->process->id : 0);
+                sig = SIGSEGV;
             } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGSEGV;
             } else if ((isr->id & 0xffffffff) == 7) { // #NM
                 NSched::handlelazyfpu();
                 return;
+            } else if ((isr->id & 0xffffffff) == 0) { // #DE - Divide by zero
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGFPE;
+            } else if ((isr->id & 0xffffffff) == 6) { // #UD - Invalid opcode
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGILL;
+            } else if ((isr->id & 0xffffffff) == 16) { // #MF - x87 FPU error
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGFPE;
+            } else if ((isr->id & 0xffffffff) == 19) { // #XM - SIMD exception
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGFPE;
+            } else if ((isr->id & 0xffffffff) == 5) { // #BR - Bound range exceeded
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGSEGV;
+            } else if ((isr->id & 0xffffffff) == 17) { // #AC - Alignment check
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
+                sig = SIGBUS;
             } else {
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nOccurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);
             }
 
+            // If this is a userspace exception and we have a signal, send it instead of panicking.
+            if (is_userspace && sig > 0) {
+                NSched::signalproc(NArch::CPU::get()->currthread->process, sig);
+                return;
+            }
+
+            // Kernel exceptions are always fatal.
             panic(errbuffer);
         }
 

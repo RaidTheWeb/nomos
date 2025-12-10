@@ -18,6 +18,8 @@ namespace NUtil {
     void oprintlock(void);
     // Drop writing to framebuffer console -> Pre-init.
     void dropwrite(void);
+    // Undrop writing to framebuffer console -> Panic.
+    void undropwrite(void);
 }
 
 #endif

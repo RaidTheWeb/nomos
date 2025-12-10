@@ -193,6 +193,7 @@ syscall_entry:
     cli
 
     mov rdi, rsp
+    mov rsi, 1 ; Indicate post-syscall.
     call signal_checkpending
 
     add rsp, 24 ; Skip segments (we only want ES onwards).

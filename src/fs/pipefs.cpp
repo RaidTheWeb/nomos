@@ -1,7 +1,12 @@
 #include <fs/pipefs.hpp>
 #include <lib/errno.hpp>
 #include <sched/event.hpp>
+#include <sched/signal.hpp>
 #include <mm/ucopy.hpp>
+
+#ifdef __x86_64__
+#include <arch/x86_64/cpu.hpp>
+#endif
 
 namespace NFS {
     namespace PipeFS {
@@ -125,6 +130,8 @@ namespace NFS {
                 // Check if any readers exist
                 if (this->readers == 0) {
                     this->datalock.release();
+                    // Send SIGPIPE to current process for writing to pipe with no readers.
+                    NSched::signalproc(NArch::CPU::get()->currthread->process, SIGPIPE);
                     return -EPIPE;
                 }
 

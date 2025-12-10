@@ -1727,9 +1727,162 @@ namespace NFS {
             long tv_nsec;
         };
 
-        extern "C" uint64_t sys_ppoll(struct pollfd *fds, size_t nfds, struct timespec *tmo_p, struct NLib::sigset *sigmask) {
-            SYSCALL_LOG("sys_ppoll(%p, %u, %p, %p).\n", fds, nfds, tmo_p, sigmask);
-            SYSCALL_RET(-ENOSYS); // Not implemented yet.
+        extern "C" uint64_t sys_ppoll(struct pollfd *fds, size_t nfds, struct timespec *timeout, NLib::sigset_t *sigmask) {
+            SYSCALL_LOG("sys_ppoll(%p, %u, %p, %p).\n", fds, nfds, timeout, sigmask);
+
+            struct pollfd *kfds = NULL;
+            if (nfds > 0) {
+                if (!fds) {
+                    SYSCALL_RET(-EFAULT);
+                }
+
+                size_t fds_size = sizeof(struct pollfd) * nfds;
+                if (!NMem::UserCopy::valid(fds, fds_size)) {
+                    SYSCALL_RET(-EFAULT);
+                }
+
+                kfds = new struct pollfd[nfds];
+                if (!kfds) {
+                    SYSCALL_RET(-ENOMEM);
+                }
+
+                int res = NMem::UserCopy::copyfrom(kfds, fds, fds_size);
+                if (res < 0) {
+                    delete[] kfds;
+                    SYSCALL_RET(res);
+                }
+            } else {
+                // No fds to poll.
+                struct timespec ktmo;
+                if (timeout) { // Simply just wait for the timeout period.
+                    if (!NMem::UserCopy::valid(timeout, sizeof(struct timespec))) {
+                        SYSCALL_RET(-EFAULT);
+                    }
+                    int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct timespec));
+                    if (res < 0) {
+                        SYSCALL_RET(res);
+                    }
+
+                    if (ktmo.tv_sec < 0 || ktmo.tv_nsec < 0 || ktmo.tv_nsec >= 1000000000) {
+                        SYSCALL_RET(-EINVAL);
+                    }
+
+                    uint64_t timeoutms = ktmo.tv_sec * 1000 + ktmo.tv_nsec / 1000000;
+                    NSched::sleep(timeoutms);
+                } else {
+                    // Infinite wait, so just yield (this acts like a sys_pause would).
+
+                    NArch::CPU::get()->setint(false);
+                    // Untracked sleep state, so we won't be woken up until a signal arrives.
+                    __atomic_store_n(&NArch::CPU::get()->currthread->tstate, NSched::Thread::PAUSED, memory_order_release);
+                    NArch::CPU::get()->setint(true);
+                    NSched::yield();
+
+                    SYSCALL_RET(-EINTR); // Indicate we were interrupted by a signal.
+                }
+
+                SYSCALL_RET(0);
+            }
+
+
+            NLib::sigset_t ksigmask;
+            if (sigmask) {
+                if (!NMem::UserCopy::valid(sigmask, sizeof(ksigmask))) {
+                    delete[] kfds;
+                    SYSCALL_RET(-EFAULT);
+                }
+                int res = NMem::UserCopy::copyfrom(&ksigmask, sigmask, sizeof(ksigmask));
+                if (res < 0) {
+                    delete[] kfds;
+                    SYSCALL_RET(res);
+                }
+            } else {
+                // Empty signal mask.
+                NLib::memset(&ksigmask, 0, sizeof(ksigmask));
+            }
+
+            struct timespec ktmo;
+            if (timeout) { // Simply just wait for the timeout period.
+                if (!NMem::UserCopy::valid(timeout, sizeof(struct timespec))) {
+                    SYSCALL_RET(-EFAULT);
+                }
+                int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct timespec));
+                if (res < 0) {
+                    SYSCALL_RET(res);
+                }
+
+                if (ktmo.tv_sec < 0 || ktmo.tv_nsec < 0 || ktmo.tv_nsec >= 1000000000) {
+                    SYSCALL_RET(-EINVAL);
+                }
+            }
+
+            // Apply signal mask for the duration of the poll.
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+            NLib::sigset_t oldmask = proc->signalstate.blocked;
+            proc->signalstate.blocked = ksigmask;
+            proc->lock.release();
+
+            size_t eventcount = 0; // How many fds ended up with non-zero revents.
+
+            while (true) {
+                for (size_t i = 0; i < nfds; i++) {
+                    if (kfds[i].fd < 0) {
+                        continue; // Ignore negative FDs.
+                    }
+
+                    NSched::Process *proc = NArch::CPU::get()->currthread->process;
+                    NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+                    FileDescriptor *desc = proc->fdtable->get(kfds[i].fd);
+                    if (!desc) {
+                        // Restore old signal mask before returning.
+                        proc->signalstate.blocked = oldmask;
+                        delete[] kfds;
+                        SYSCALL_RET(-EBADF);
+                    }
+
+                    struct pollfd *pfd = &kfds[i];
+
+                    INode *node = desc->getnode();
+                    int res = node->poll(pfd->events, &pfd->revents, desc->getflags());
+                    node->unref();
+                    if (res < 0) {
+                        // Restore old signal mask before returning.
+                        proc->signalstate.blocked = oldmask;
+                        delete[] kfds;
+                        SYSCALL_RET(res);
+                    }
+
+                    if (pfd->revents != 0) {
+                        eventcount++;
+                    }
+                }
+
+                if (eventcount > 0) {
+                    // Some events are ready, break and return what we have thus far.
+                    break;
+                }
+
+                // No events ready yet, check if we have a timeout.
+                if (timeout) {
+                    if (ktmo.tv_sec == 0 && ktmo.tv_nsec == 0) {
+                        // Immediate timeout.
+                        break;
+                    }
+                    uint64_t timeoutms = ktmo.tv_sec * 1000 + ktmo.tv_nsec / 1000000;
+                    NSched::sleep(timeoutms);
+                    break; // After sleeping, we return to userspace to re-poll.
+                }
+
+                NSched::yield(); // Yield to avoid thrashing the CPU.
+            }
+            // Restore old signal mask before returning.
+            proc->lock.acquire();
+            proc->signalstate.blocked = oldmask;
+            proc->lock.release();
+
+            SYSCALL_RET(eventcount);
         }
     }
 }

@@ -628,28 +628,22 @@ namespace NSched {
         this->addrspace->lock.acquire();
         this->addrspace->ref++; // Reference address space.
         this->addrspace->lock.release();
+
+        // Initialize signal state to defaults (no pending, no blocked, all handlers SIG_DFL).
+        this->signalstate.pending = 0;
+        this->signalstate.blocked = 0;
+        for (size_t i = 0; i < NSIG; i++) {
+            this->signalstate.actions[i].handler = SIG_DFL;
+            this->signalstate.actions[i].mask = 0;
+            this->signalstate.actions[i].flags = 0;
+            this->signalstate.actions[i].restorer = NULL;
+        }
+
         if (space == &VMM::kspace) {
             this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
         } else { // Only userspace threads should bother creating file descriptor tables.
-            this->tty = NFS::DEVFS::makedev(4, 1);
             if (!fdtable) {
                 this->fdtable = new NFS::VFS::FileDescriptorTable();
-                NFS::VFS::INode *stdin;
-                assert(NFS::VFS::vfs.resolve("/dev/tty", &stdin) == 0, "Could not resolve standard input.\n");
-                stdin->unref();
-
-                this->fdtable->reserve(STDIN_FILENO, stdin, NFS::VFS::O_RDONLY);
-
-                NFS::VFS::INode *stdout;
-                assert(NFS::VFS::vfs.resolve("/dev/tty", &stdout) == 0, "Could not resolve standard output.\n");
-                stdout->unref();
-
-                this->fdtable->reserve(STDOUT_FILENO, stdout, NFS::VFS::O_WRONLY | NFS::VFS::O_CLOEXEC);
-                NFS::VFS::INode *stderr;
-                assert(NFS::VFS::vfs.resolve("/dev/tty", &stderr) == 0, "Could not resolve standard error.\n");
-                stderr->unref();
-
-                this->fdtable->reserve(STDERR_FILENO, stderr, NFS::VFS::O_WRONLY | NFS::VFS::O_NONBLOCK);
             } else {
                 this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
             }
@@ -679,7 +673,8 @@ namespace NSched {
         this->pstate = Process::state::ZOMBIE;
 
         if (this->parent) {
-            // XXX: TODO: Use signals for this.
+            // Send SIGCHLD to parent to notify of child state change.
+            signalproc(this->parent, SIGCHLD);
             this->parent->exitwq.wake(); // We're done!
         }
 
@@ -710,16 +705,30 @@ namespace NSched {
             }, (void *)this);
             this->parent->lock.release();
 
-            // XXX: Signal parent that child exited.
+            // Send SIGCHLD to parent when child is fully reaped.
+            signalproc(this->parent, SIGCHLD);
         }
 
-        if (children.size()) {
-            // XXX: Reparent now "zombie" processes to init process.
+        pidtablelock.acquire();
+        NSched::Process **pinitproc = pidtable->find(1); // Get init process.
+        assert(pinitproc, "Failed to find init process during process destruction.\n");
+        Process *initproc = *pinitproc;
+        pidtablelock.release();
+
+        if (children.size() && this != initproc) {
             NLib::DoubleList<Process *>::Iterator it = this->children.begin();
             for (; it.valid(); it.next()) {
                 Process *child = *(it.get());
                 child->lock.acquire();
-                child->parent = NULL;
+
+                initproc->lock.acquire();
+                child->parent = initproc; // Reparent to init.
+                initproc->children.push(child);
+                initproc->lock.release();
+
+                // Notify init of reparenting, so it can reap if needed.
+                signalproc(initproc, SIGCHLD);
+
                 child->lock.release();
             }
         }
@@ -798,8 +807,25 @@ namespace NSched {
         this->waitqueuelock.release();
     }
 
-    void exit(void) {
+    void exit(int status, int sig) {
         // Thread exit.
+
+        Process *proc = NArch::CPU::get()->currthread->process;
+
+        if (!proc->kernel) { // Only perform process exit logic on user threads.
+
+            if (proc->id == 1) {
+                panic("Init got obliterated (either by itself or someone else).\n");
+            }
+
+            termothers(proc); // Terminate other threads in this process.
+
+            {
+                NLib::ScopeIRQSpinlock guard(&proc->lock);
+                proc->exitstatus = (status << 16) | (sig & 0xff);
+
+            }
+        }
 
         __atomic_store_n(&CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release); // Kill ourselves. We will NOT be rescheduled.
 
@@ -955,7 +981,7 @@ namespace NSched {
     }
 
     extern "C" __attribute__((no_caller_saved_registers)) void sched_savesysstate(struct NArch::CPU::context *state) {
-        NArch::CPU::get()->currthread->sysctx = *state;
+        NArch::CPU::get()->currthread->sysctx = state;
         NArch::CPU::get()->intstatus = true;
     }
 
@@ -1003,7 +1029,7 @@ namespace NSched {
         }
 
 #ifdef __x86_64__
-        cthread->ctx = NArch::CPU::get()->currthread->sysctx; // Initialise using system call context.
+        cthread->ctx = *NArch::CPU::get()->currthread->sysctx; // Initialise using system call context.
 
         cthread->ctx.rax = 0; // Override return to indicate this is the child.
 
@@ -1016,7 +1042,13 @@ namespace NSched {
 
 
 #endif
-        // XXX: Copy signals?
+
+        for (size_t i = 0; i < NSIG; i++) {
+            // Inherit handlers.
+            child->signalstate.actions[i] = current->signalstate.actions[i];
+        }
+        child->signalstate.pending = 0; // Pending signals are NOT inherited.
+        child->signalstate.blocked = current->signalstate.blocked; // Copy signal mask.
 
         NSched::schedulethread(cthread);
 
@@ -1231,16 +1263,7 @@ namespace NSched {
     extern "C" uint64_t sys_exit(int status) {
         SYSCALL_LOG("sys_exit(%d).\n", status);
 
-        Process *proc = NArch::CPU::get()->currthread->process;
-
-        termothers(proc); // Terminate other threads in this process.
-
-        {
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
-            proc->exitstatus = (status & 0xff) << 8; // Set exit status.
-        }
-
-        exit(); // Exit.
+        exit(status); // Exit.
         __builtin_unreachable();
     }
 
@@ -1620,6 +1643,18 @@ namespace NSched {
 
             current->fdtable->doexec(); // Close FDs with O_CLOEXEC.
 
+            // Reset signal handlers to SIG_DFL on exec (except those set to SIG_IGN remain SIG_IGN).
+            for (size_t i = 0; i < NSIG; i++) {
+                if (current->signalstate.actions[i].handler != SIG_IGN) {
+                    current->signalstate.actions[i].handler = SIG_DFL;
+                    current->signalstate.actions[i].mask = 0;
+                    current->signalstate.actions[i].flags = 0;
+                    current->signalstate.actions[i].restorer = NULL;
+                }
+            }
+            // Pending signals are cleared on exec.
+            current->signalstate.pending = 0;
+            // Signal mask is preserved across exec.
 
             NLib::memset(&NArch::CPU::get()->currthread->ctx, 0, sizeof(NArch::CPU::get()->currthread->ctx));
 #ifdef __x86_64__

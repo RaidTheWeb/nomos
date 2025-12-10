@@ -11,6 +11,7 @@ namespace NArch {
 
         CPU::get()->setint(false); // Disable interrupts. We don't want to be woken up.
 
+        NUtil::undropwrite(); // Ensure we can write to console during panic.
         NUtil::oprintlock();
         NUtil::canmutex = false; // Prevent usage of mutexes during panic.
         NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: %s", msg);

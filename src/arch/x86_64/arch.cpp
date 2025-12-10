@@ -40,7 +40,7 @@ namespace NArch {
     void archthreadinit(void) {
         kpostarch();
 
-        NSched::exit();
+        NSched::exit(0);
     }
 
     void init(void) {

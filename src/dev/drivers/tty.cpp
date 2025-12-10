@@ -278,7 +278,8 @@ namespace NDev {
 
             if (signal >= 0) {
                 if (this->fpgrp) {
-                    // XXX: Signal process group.
+                    // Signal the foreground process group.
+                    NSched::signalpgrp(this->fpgrp, signal);
                 }
                 return;
             }
@@ -400,9 +401,61 @@ namespace NDev {
 
     ssize_t TTY::read(char *buf, size_t count, int fdflags) {
         NSched::Thread *thread = NArch::CPU::get()->currthread;
-        if (thread->process->pgrp != this->fpgrp) {
-            // XXX: SIGTTIN handling.
-            return -EIO;
+        NSched::Process *proc = thread->process;
+
+        // Check if this is a background process trying to read.
+        // POSIX: Background processes receive SIGTTIN unless:
+        // 1. SIGTTIN is ignored → return EIO
+        // 2. SIGTTIN is blocked → return EIO
+        // 3. Process group is orphaned → return EIO
+        if (this->fpgrp && proc->pgrp && proc->pgrp != this->fpgrp) {
+            // Check if process is in the same session as the TTY.
+            if (this->session && proc->session == this->session) {
+                bool orphaned = true;
+                proc->pgrp->lock.acquire();
+                NLib::DoubleList<NSched::Process *>::Iterator it = proc->pgrp->procs.begin();
+                for (; it.valid(); it.next()) {
+                    NSched::Process *member = *it.get();
+                    if (!member) {
+                        continue;
+                    }
+                    member->lock.acquire();
+                    NSched::Process *parent = member->parent;
+                    if (parent) {
+                        parent->lock.acquire();
+                        // Parent exists, in same session, different pgrp?
+                        if (parent->session == proc->session && parent->pgrp != proc->pgrp) {
+                            orphaned = false;
+                        }
+                        parent->lock.release();
+                    }
+                    member->lock.release();
+                    if (!orphaned) {
+                        break;
+                    }
+                }
+                proc->pgrp->lock.release();
+
+                if (orphaned) {
+                    // Orphaned process group: return EIO without sending signal.
+                    return -EIO;
+                }
+
+                // Check if SIGTTIN is ignored or blocked.
+                proc->lock.acquire();
+                bool ignored = (NSched::gethandler(&proc->signalstate, SIGTTIN) == SIG_IGN);
+                bool blocked = NSched::isblocked(&proc->signalstate, SIGTTIN);
+                proc->lock.release();
+
+                if (ignored || blocked) {
+                    // SIGTTIN is ignored or blocked: return EIO without sending signal.
+                    return -EIO;
+                }
+
+                // Send SIGTTIN to the background process group.
+                NSched::signalpgrp(proc->pgrp, SIGTTIN);
+                return -EIO;
+            }
         }
 
         if (!count) {
@@ -477,12 +530,67 @@ namespace NDev {
         (void)fdflags;
 
         NSched::Thread *thread = NArch::CPU::get()->currthread;
-        this->fpgrp = thread->process->pgrp;
+        NSched::Process *proc = thread->process;
 
-        if (thread->process->pgrp != this->fpgrp) {
-            // XXX: SIGTTOU handling.
-            return -EIO;
+        // Check if this is a background process trying to write.
+        // POSIX: Background processes receive SIGTTOU if TOSTOP is set, unless:
+        // 1. SIGTTOU is ignored → allow write
+        // 2. SIGTTOU is blocked → allow write
+        // 3. Process group is orphaned → return EIO
+        if (this->fpgrp && proc->pgrp && proc->pgrp != this->fpgrp) {
+            // Only check SIGTTOU if TOSTOP is set.
+            if (this->termios.lflag & TOSTOP) {
+                // Check if process is in the same session as the TTY.
+                if (this->session && proc->session == this->session) {
+                    // Check if SIGTTOU is ignored or blocked.
+                    proc->lock.acquire();
+                    bool ignored = (NSched::gethandler(&proc->signalstate, SIGTTOU) == SIG_IGN);
+                    bool blocked = NSched::isblocked(&proc->signalstate, SIGTTOU);
+                    proc->lock.release();
+
+                    if (ignored || blocked) {
+                        // SIGTTOU is ignored or blocked: allow write to proceed.
+                        goto do_write;
+                    }
+
+                    // Check if process group is orphaned.
+                    bool orphaned = true;
+                    proc->pgrp->lock.acquire();
+                    NLib::DoubleList<NSched::Process *>::Iterator it = proc->pgrp->procs.begin();
+                    for (; it.valid(); it.next()) {
+                        NSched::Process *member = *it.get();
+                        if (!member) {
+                            continue;
+                        }
+                        member->lock.acquire();
+                        NSched::Process *parent = member->parent;
+                        if (parent) {
+                            parent->lock.acquire();
+                            if (parent->session == proc->session && parent->pgrp != proc->pgrp) {
+                                orphaned = false;
+                            }
+                            parent->lock.release();
+                        }
+                        member->lock.release();
+                        if (!orphaned) {
+                            break;
+                        }
+                    }
+                    proc->pgrp->lock.release();
+
+                    if (orphaned) {
+                        // Orphaned process group: return EIO without sending signal.
+                        return -EIO;
+                    }
+
+                    // Send SIGTTOU to the background process group.
+                    NSched::signalpgrp(proc->pgrp, SIGTTOU);
+                    return -EIO;
+                }
+            }
         }
+
+do_write:
 
         if (writefn) {
             writefn(buf, count);
@@ -853,10 +961,49 @@ notspecial:
 
                         case TTY::ioctls::TIOCSCTTY: {
                             NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+                            // Only session leaders can acquire a controlling terminal.
+                            proc->lock.acquire();
+                            bool is_session_leader = proc->session && proc->session->id == proc->id;
+                            NSched::Session *proc_session = proc->session;
+                            proc->lock.release();
+
+                            if (!is_session_leader) {
+                                tty->devlock.release();
+                                return -EPERM;
+                            }
+
+                            // If session already has a controlling terminal, cannot acquire another.
+                            if (proc_session->ctty != 0) {
+                                tty->devlock.release();
+                                return -EPERM;
+                            }
+
+                            // If TTY already has a session, must force it (arg == 1) if we're root.
+                            if (tty->tty->session) {
+                                if (arg != 1) {
+                                    tty->devlock.release();
+                                    return -EPERM;
+                                }
+                                proc->lock.acquire();
+                                if (proc->euid != 0) {
+                                    proc->lock.release();
+                                    tty->devlock.release();
+                                    return -EPERM;
+                                }
+                                proc->lock.release();
+                            }
+
+                            // Set up the controlling terminal.
+                            tty->tty->session = proc_session;
+                            tty->tty->fpgrp = proc->pgrp;
+                            proc_session->ctty = tty->id;
+
+                            // Store TTY device ID in process structure.
                             tty->ifnode->ref();
                             __atomic_store_n(&proc->tty, tty->ifnode->getattr().st_rdev, memory_order_relaxed);
-                            proc->tty = tty->ifnode->getattr().st_rdev;
                             tty->ifnode->unref();
+
                             tty->devlock.release();
                             return 0;
                         }
@@ -891,21 +1038,26 @@ notspecial:
                             }
 
                             NSched::Process **ppgrp = NSched::pidtable->find(requested);
-                            if (!ppgrp) {
+                            if (!ppgrp || !*ppgrp) {
                                 tty->devlock.release();
                                 return -ESRCH;
                             }
                             NSched::ProcessGroup *target = (*ppgrp)->pgrp;
-
-                            // Ensure caller is in the same session as the target process group.
-                            NSched::Process *caller = NArch::CPU::get()->currthread->process;
-                            if (!caller->session || !target->session || caller->session != target->session) {
+                            if (!target) {
                                 tty->devlock.release();
-                                return -EPERM;
+                                return -ESRCH;
                             }
 
-                            // If the TTY has an associated session, ensure the target is in the same session.
-                            if (tty->tty->session && tty->tty->session != target->session) {
+                            NSched::Process *caller = NArch::CPU::get()->currthread->process;
+
+                            // The caller must be in the same session as the TTY.
+                            if (!tty->tty->session || !caller->session || caller->session != tty->tty->session) {
+                                tty->devlock.release();
+                                return -ENOTTY;
+                            }
+
+                            // The target process group must be in the same session as the TTY.
+                            if (!target->session || target->session != tty->tty->session) {
                                 tty->devlock.release();
                                 return -EPERM;
                             }
