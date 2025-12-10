@@ -43,6 +43,9 @@ extern sys_stat
 extern sys_access
 extern sys_readlink
 extern sys_uname
+extern sys_pipe
+extern sys_unlink
+extern sys_ppoll
 
 MAXSYSCALLS equ 256
 
@@ -89,6 +92,9 @@ syscall_table:
     dq sys_access
     dq sys_readlink
     dq sys_uname
+    dq sys_pipe
+    dq sys_unlink
+    dq sys_ppoll
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

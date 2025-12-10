@@ -44,4 +44,10 @@
 #define SIG_UNBLOCK     1
 #define SIG_SETMASK     2
 
+namespace NLib {
+    struct sigset {
+        uint64_t sigs[1024 / (8 * sizeof(uint64_t))];
+    };
+}
+
 #endif

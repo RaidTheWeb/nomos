@@ -55,9 +55,6 @@ namespace NFS {
             X_OK        = 1 // File can be executed.
         };
 
-        static const ssize_t AT_FDCWD = -100; // Special FD for openat that signifies we should use the current working directory.
-
-
         enum seek {
             SEEK_SET = 0,
             SEEK_CUR = 1,
@@ -90,6 +87,28 @@ namespace NFS {
             O_TMPFILE   = 020000000,
 
             O_ACCMODE   = (03 | O_PATH)
+        };
+
+        enum fcntlcmd {
+            F_DUPFD = 0,
+            F_GETFD = 1,
+            F_SETFD = 2,
+            F_GETFL = 3,
+            F_SETFL = 4,
+
+            F_DUPFD_CLOEXEC = 1030
+        };
+
+        enum fdflags {
+            FD_CLOEXEC = 1
+        };
+
+        enum atflags {
+            AT_FDCWD                = -100, // Special value used to indicate current working directory.
+            AT_SYMLINK_NOFOLLOW     = 0x100,
+            AT_REMOVEDIR            = 0x200,
+            AT_SYMLINK_FOLLOW       = 0x400,
+            AT_EACCESS              = 0x200,
         };
 
         constexpr bool S_ISSOCK(uint32_t m) {
@@ -127,7 +146,7 @@ namespace NFS {
         struct stat {
             uint64_t st_dev     = 0;
             uint64_t st_ino     = 0;
-            uint32_t st_nlink   = 0;
+            uint64_t st_nlink   = 1; // Start with a hard link to ourselves. Unlink decrements this, and will delete the node when it reaches 0, and the node has no refcount.
             uint32_t st_mode    = 0;
             uint32_t st_uid     = 0;
             uint32_t st_gid     = 0;
@@ -303,7 +322,16 @@ namespace NFS {
         // Generic VFS node interface.
         class INode {
             protected:
-                uint32_t refcount = 1; // Start at one because it *exists*.
+                // Reference counting semantics are fairly complex.
+                // Each time a process opens a file, the refcount is incremented.
+                // Each time a process closes a file, the refcount is decremented.
+                // Each time a process is forked, refcount is NOT incremented (child shares same open file descriptor).
+                // File hard links increment st_nlink in the stat structure.
+                // Each time unlink is called, st_nlink is decremented.
+                // When st_nlink reaches 0, the file is unlinked from the filesystem namespace.
+                // However, the file's data and node are only deleted when both st_nlink and refcount reach 0.
+                // This ensures that open file descriptors remain valid even after unlinking.
+                size_t refcount = 0;
                 NArch::Spinlock metalock; // Meta lock for this node.
                 struct stat attr;
                 const char *name;
@@ -365,6 +393,23 @@ namespace NFS {
                 virtual bool add(INode *node) = 0;
                 // Remove child node by name.
                 virtual bool remove(const char *name) = 0;
+                virtual bool empty(void) = 0;
+
+                virtual int unlink(uint64_t *nlink = NULL) {
+                    NLib::ScopeSpinlock guard(&this->metalock);
+                    if (this->attr.st_nlink == 0) {
+                        return -ENOENT;
+                    }
+                    this->attr.st_nlink--;
+                    if (nlink) {
+                        *nlink = this->attr.st_nlink; // Return new link count, for filesystems that need it.
+                    }
+                    // Return 0 if node can be deleted.
+                    if (this->attr.st_nlink == 0 && __atomic_load_n(&this->refcount, memory_order_seq_cst) == 0) {
+                        return 0;
+                    }
+                    return 1;
+                }
 
                 void setparent(INode *parent) {
                     NLib::ScopeSpinlock guard(&this->metalock);
@@ -392,15 +437,15 @@ namespace NFS {
 
                 Path getpath(void);
 
+                // When wanting to use this node, call ref() to increase reference count.
                 void ref(void) {
                     __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
+
+                // When done with this node, call unref() to decrease reference count.
+                // This lets the filesystem know when it can safely delete this node (no process is using it anymore).
                 void unref(void) {
-                    size_t ref = __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
-                    // XXX: Delete.
-                    if (ref == 0) {
-                        // Would normally delete here...
-                    }
+                    __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
         };
 
@@ -435,6 +480,7 @@ namespace NFS {
 
                 // Create a node.
                 virtual INode *create(const char *name, struct stat attr) = 0;
+                virtual int unlink(const char *path) = 0; // Unlink a node.
         };
 
         class VFS {
@@ -472,6 +518,7 @@ namespace NFS {
                 ssize_t resolve(const char *path, INode **nodeout, INode *relativeto = NULL, bool symlink = true);
 
                 INode *create(const char *path, struct stat attr);
+                int unlink(const char *path, INode *relativeto = NULL, int flags = 0, int uid = 0, int gid = 0);
         };
 
         class FileDescriptor {
@@ -504,7 +551,11 @@ namespace NFS {
                 }
 
                 int getflags(void) {
-                    return this->flags;
+                    return __atomic_load_n(&this->flags, memory_order_seq_cst);
+                }
+
+                void setflags(int flags) {
+                    __atomic_store_n(&this->flags, flags, memory_order_seq_cst);
                 }
 
                 size_t getoff(void) {
@@ -558,7 +609,7 @@ namespace NFS {
                 int close(int fd);
 
                 int dup(int oldfd);
-                int dup2(int oldfd, int newfd);
+                int dup2(int oldfd, int newfd, bool fcntl = false);
 
                 FileDescriptor *get(int fd);
 

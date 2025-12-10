@@ -1,5 +1,7 @@
 #include <arch/x86_64/cpu.hpp>
 #include <lib/errno.hpp>
+#include <mm/ucopy.hpp>
+#include <sys/syscall.hpp>
 
 namespace NArch {
     namespace CPU {
@@ -63,9 +65,39 @@ namespace NArch {
             }
         }
 
-        extern "C" void sys_debug(char *text) {
+        extern "C" ssize_t sys_debug(char *text) {
             // XXX: Disable in "production".
-            NUtil::printf("%s\n", text);
+            if (!text) {
+                return -EFAULT;
+            }
+
+            // Validate and get string length from userspace
+            ssize_t textlen = NMem::UserCopy::strnlen(text, 4096); // Max 4KB debug string
+            if (textlen < 0) {
+                return -EFAULT;
+            }
+
+            if (textlen == 0) {
+                return 0;
+            }
+
+            // Copy string from userspace to prevent TOCTOU attacks
+            char *kbuf = new char[textlen + 1];
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            ssize_t ret = NMem::UserCopy::copyfrom(kbuf, text, textlen + 1);
+            if (ret < 0) {
+                delete[] kbuf;
+                return -EFAULT;
+            }
+
+            kbuf[textlen] = '\0';
+            NUtil::printf("%s\n", kbuf);
+            delete[] kbuf;
+
+            return 0;
         }
 
         // Entrypoint for system calls.

@@ -74,7 +74,7 @@ SHAREDFLAGS ?= \
 	-fno-stack-check -fno-PIC -ffunction-sections -fdata-sections
 
 ifeq ($(DEBUG),1)
-	CPPFLAGS += -DSYSCALL_DEBUG
+	CPPFLAGS += -DSYSCALL_DEBUG -DSYSCALL_DEBUGRET
 	SHAREDFLAGS += -fsanitize=undefined
 endif
 

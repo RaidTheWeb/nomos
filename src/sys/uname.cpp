@@ -22,7 +22,7 @@ namespace NSys {
         SYSCALL_LOG("sys_uname(%p).\n", buf);
 
         if (!NMem::UserCopy::valid(buf, sizeof(struct utsname))) {
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
 
         struct utsname kbuf;
@@ -35,9 +35,9 @@ namespace NSys {
 #endif
 
         if (NMem::UserCopy::copyto(buf, &kbuf, sizeof(struct utsname)) < 0) {
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
 
-        return 0;
+        SYSCALL_RET(0);
     }
 }

@@ -163,6 +163,13 @@ namespace NSched {
             NArch::IRQSpinlock waitinglock;
             // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn. Takes an optional parameter specifying whether the wait queue lock is already held.
             void wait(bool locked = false);
+            // Atomic wait on condition with external IRQSpinlock held.
+            void waitlocked(NArch::IRQSpinlock *lock);
+            // Atomic wait on condition with external Spinlock held.
+            void waitlocked(NArch::Spinlock *lock);
+            // Atomic wait on condition with external Mutex held.
+            void waitlocked(NSched::Mutex *lock);
+
             // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
             void wake(void);
     };
@@ -269,8 +276,6 @@ namespace NSched {
             int nice = 0; // -20 to +19, used for virtual runtime weighting. Lower values mean higher priority.
 
         public:
-            struct signal signal;
-            struct NArch::CPU::context sctx; // Signal working context.
             bool rescheduling = false;
 
             enum state tstate = state::READY; // Current state of thread.

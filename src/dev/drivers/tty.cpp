@@ -278,7 +278,7 @@ namespace NDev {
 
             if (signal >= 0) {
                 if (this->fpgrp) {
-                    NSched::signalpgrp(this->fpgrp, signal);
+                    // XXX: Signal process group.
                 }
                 return;
             }
@@ -401,7 +401,7 @@ namespace NDev {
     ssize_t TTY::read(char *buf, size_t count, int fdflags) {
         NSched::Thread *thread = NArch::CPU::get()->currthread;
         if (thread->process->pgrp != this->fpgrp) {
-            NSched::signalthread(thread, SIGTTIN);
+            // XXX: SIGTTIN handling.
             return -EIO;
         }
 
@@ -480,7 +480,7 @@ namespace NDev {
         this->fpgrp = thread->process->pgrp;
 
         if (thread->process->pgrp != this->fpgrp) {
-            NSched::signalthread(thread, SIGTTOU);
+            // XXX: SIGTTOU handling.
             return -EIO;
         }
 

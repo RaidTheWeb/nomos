@@ -7,8 +7,8 @@ namespace NSched {
     void WaitQueue::wait(bool locked) {
         if (!locked) {
             this->waitinglock.acquire(); // We MUST acquire the lock before setting the thread to waiting, otherwise we'll never be rescheduled when the timeslice expires.
-
         }
+
         __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
         this->waiting.pushback(NArch::CPU::get()->currthread);
 
@@ -16,14 +16,64 @@ namespace NSched {
         yield();
     }
 
+    void WaitQueue::waitlocked(NArch::IRQSpinlock *lock) {
+        // Acquire waitqueue lock first
+        this->waitinglock.acquire();
+
+        lock->release(); // Release before sleeping.
+
+        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
+        this->waiting.pushback(NArch::CPU::get()->currthread);
+
+        this->waitinglock.release();
+        yield();
+
+        // When we wake up, re-acquire the external lock before returning
+        lock->acquire();
+    }
+
+    void WaitQueue::waitlocked(NArch::Spinlock *lock) {
+        // Acquire waitqueue lock first
+        this->waitinglock.acquire();
+
+        lock->release(); // Release before sleeping.
+
+        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
+        this->waiting.pushback(NArch::CPU::get()->currthread);
+
+        this->waitinglock.release();
+        yield();
+
+        // When we wake up, re-acquire the external lock before returning
+        lock->acquire();
+    }
+
+    void WaitQueue::waitlocked(NSched::Mutex *lock) {
+        // Acquire waitqueue lock first
+        this->waitinglock.acquire();
+
+        lock->release(); // Release before sleeping.
+
+        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::WAITING, memory_order_release);
+        this->waiting.pushback(NArch::CPU::get()->currthread);
+
+        this->waitinglock.release();
+        yield();
+
+        // When we wake up, re-acquire the external lock before returning
+        lock->acquire();
+    }
+
     void WaitQueue::wake(void) {
         NLib::SingleList<Thread *> towake;
         this->waitinglock.acquire();
+        size_t i = 0;
         while (!this->waiting.empty()) {
             Thread *thread = this->waiting.pop();
             if (__atomic_load_n(&thread->tstate, memory_order_acquire) != Thread::state::WAITING) {
                 continue; // Thread is no longer waiting, skip it.
             }
+            i++;
             towake.push(thread);
         }
         this->waitinglock.release();

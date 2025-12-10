@@ -551,7 +551,7 @@ namespace NArch {
             SYSCALL_LOG("sys_mmap(%p, %lu, %u, %u, %d, %lu).\n", hint, size, prot, flags, fd, off);
 
             if (size == 0) {
-                return -EINVAL;
+                SYSCALL_RET(-EINVAL);
             }
 
             size = NLib::alignup(size, PAGESIZE);
@@ -573,19 +573,19 @@ namespace NArch {
             if (flags & MAP_FIXED) {
                 if ((uintptr_t)hint % PAGESIZE != 0) {
                     // Misaligned hint address.
-                    return -EINVAL;
+                    SYSCALL_RET(-EINVAL);
                 }
                 space->vmaspace->free(hint, size); // Free any existing mappings in the range.
                 addr = space->vmaspace->reserve((uintptr_t)hint, (uintptr_t)hint + size, vmaflags);
                 if (!addr) {
                     // Failed to reserve at fixed address.
-                    return -ENOMEM;
+                    SYSCALL_RET(-ENOMEM);
                 }
             } else {
                 // Allocate anywhere, it really doesn't matter.
                 addr = space->vmaspace->alloc(size, vmaflags);
                 if (!addr) {
-                    return -ENOMEM;
+                    SYSCALL_RET(-ENOMEM);
                 }
             }
 
@@ -595,33 +595,33 @@ namespace NArch {
                     if (!page) {
                         _unmaprange(space, (uintptr_t)addr, i);
                         space->vmaspace->free(addr, size);
-                        return -ENOMEM;
+                        SYSCALL_RET(-ENOMEM);
                     }
                     NLib::memset(hhdmoff(page), 0, PAGESIZE);
                     if (!_mappage(space, (uintptr_t)addr + i, (uintptr_t)page, prottovmm(prot))) {
                         _unmaprange(space, (uintptr_t)addr, i);
                         space->vmaspace->free(addr, size);
-                        return -ENOMEM;
+                        SYSCALL_RET(-ENOMEM);
                     }
                 }
             } else { // File-backed mapping.
                 if (fd < 0) {
                     space->vmaspace->free(addr, size);
-                    return -EBADF;
+                    SYSCALL_RET(-EBADF);
                 }
 
                 // We're going to need to get the file descriptor from the process's file descriptor table.
                 NFS::VFS::FileDescriptor *filedesc = proc->fdtable->get(fd);
                 if (!filedesc) {
                     space->vmaspace->free(addr, size);
-                    return -EBADF;
+                    SYSCALL_RET(-EBADF);
                 }
 
                 NFS::VFS::INode *node = filedesc->getnode();
                 if (!node) {
                     filedesc->unref();
                     space->vmaspace->free(addr, size);
-                    return -EBADF;
+                    SYSCALL_RET(-EBADF);
                 }
 
                 // XXX: Dump the ifnode into the vmaspace so we can track during page faults?
@@ -634,18 +634,18 @@ namespace NArch {
 
                 if (ret < 0) {
                     space->vmaspace->free(addr, size);
-                    return ret;
+                    SYSCALL_RET(ret);
                 }
             }
 
-            return (uint64_t)addr;
+            SYSCALL_RET((uint64_t)addr);
         }
 
         extern "C" uint64_t sys_munmap(void *ptr, size_t size) {
             SYSCALL_LOG("sys_munmap(%p, %lu).\n", ptr, size);
 
             if ((uintptr_t)ptr % PAGESIZE != 0 || size == 0) {
-                return -EINVAL;
+                SYSCALL_RET(-EINVAL);
             }
 
             size = NLib::alignup(size, PAGESIZE);
@@ -660,14 +660,14 @@ namespace NArch {
             _unmaprange(space, (uintptr_t)ptr, size);
             space->vmaspace->free(ptr, size);
 
-            return 0;
+            SYSCALL_RET(0);
         }
 
         extern "C" uint64_t sys_mprotect(void *ptr, size_t size, int prot) {
             SYSCALL_LOG("sys_mprotect(%p, %lu, %d).\n", ptr, size, prot);
 
             if ((uintptr_t)ptr % PAGESIZE != 0 || size == 0) {
-                return -EINVAL;
+                SYSCALL_RET(-EINVAL);
             }
 
             size = NLib::alignup(size, PAGESIZE);
@@ -694,7 +694,7 @@ namespace NArch {
                 }
             }
 
-            return 0;
+            SYSCALL_RET(0);
         }
 
         void setup(void) {

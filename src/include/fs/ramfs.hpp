@@ -38,10 +38,16 @@ namespace NFS {
                 bool add(VFS::INode *node) override;
                 bool remove(const char *name) override;
                 VFS::INode *resolvesymlink(void) override;
+
+                bool empty(void) override {
+                    NLib::ScopeSpinlock guard(&this->metalock);
+                    return this->children.size() == 0;
+                }
         };
 
         class RAMFileSystem : public VFS::IFileSystem {
             private:
+                uint64_t nextinode = 1;
             public:
                 RAMFileSystem(VFS::VFS *vfs) {
                     this->vfs = vfs;
@@ -56,6 +62,7 @@ namespace NFS {
                 int sync(void) override { return 0; }
 
                 VFS::INode *create(const char *name, struct VFS::stat attr) override;
+                int unlink(const char *path) override;
         };
     }
 }

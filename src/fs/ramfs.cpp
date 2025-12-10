@@ -188,8 +188,42 @@ namespace NFS {
         }
 
         VFS::INode *RAMFileSystem::create(const char *name, struct VFS::stat attr) {
+            NLib::ScopeSpinlock guard(&this->spin);
             attr.st_blksize = 512;
+            attr.st_ino = this->nextinode++;
             return new RAMNode(this, name, attr);
+        }
+
+        int RAMFileSystem::unlink(const char *path) {
+            VFS::INode *node = NULL;
+            ssize_t res = this->vfs->resolve(path, &node, NULL, true);
+            if (res < 0) {
+                return res; // Failed to resolve.
+            }
+
+            uint64_t ino = node->getattr().st_ino;
+
+            VFS::INode *parent = node->getparent();
+            if (!parent) {
+                node->unref();
+                return -EINVAL; // Cannot unlink root node.
+            }
+            parent->ref();
+
+            // Remove from parent.
+            bool worked = parent->remove(node->getname());
+            parent->unref();
+            node->unref(); // Drop our reference.
+
+            if (!worked) {
+                return -EINVAL; // Removal failed.
+            }
+
+            res = node->unlink(); // Returns 0 if we're good to delete the node.
+            if (res == 0) {
+                delete node; // Delete the node.
+            }
+            return 0;
         }
     }
 }

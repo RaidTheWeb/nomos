@@ -710,7 +710,7 @@ namespace NSched {
             }, (void *)this);
             this->parent->lock.release();
 
-            NSched::signalproc(this->parent, SIGCHLD); // Signal parent that child exited.
+            // XXX: Signal parent that child exited.
         }
 
         if (children.size()) {
@@ -970,7 +970,7 @@ namespace NSched {
 
         Process *child = new Process(VMM::forkcontext(current->addrspace), current->fdtable->fork());
         if (!child) {
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
 
         pidtable->insert(child->id, child);
@@ -999,7 +999,7 @@ namespace NSched {
 
         Thread *cthread = new Thread(child, NSched::DEFAULTSTACKSIZE);
         if (!cthread) {
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
 
 #ifdef __x86_64__
@@ -1020,7 +1020,7 @@ namespace NSched {
 
         NSched::schedulethread(cthread);
 
-        return child->id;
+        SYSCALL_RET(child->id);
     }
 
     extern "C" uint64_t sys_setsid(void) {
@@ -1032,14 +1032,14 @@ namespace NSched {
         current->pgrp->lock.acquire();
         if (current->pgrp->id == current->id) {
             current->pgrp->lock.release();
-            return -EPERM; // Can't create a new session as group leader.
+            SYSCALL_RET(-EPERM); // Can't create a new session as group leader.
         }
         current->pgrp->lock.release();
 
         // We must create a new session.
         Session *session = new Session();
         if (!session) {
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
         session->id = current->id;
         session->ctty = 0;
@@ -1055,14 +1055,14 @@ namespace NSched {
         current->pgrp = pgrp;
         current->session = session;
 
-        return session->id;
+        SYSCALL_RET(session->id);
     }
 
     extern "C" uint64_t sys_setpgid(int pid, int pgid) {
         SYSCALL_LOG("sys_setpgid(%d, %d).\n", pid, pgid);
 
         if (pgid < 0) {
-            return -EINVAL;
+            SYSCALL_RET(-EINVAL);
         }
 
         // XXX: Refcount process to prevent it from being freed during work.
@@ -1074,7 +1074,7 @@ namespace NSched {
         if (pid != 0) { // Non-zero PID means we should actually find one.
             Process **pproc = pidtable->find(pid);
             if (!pproc) {
-                return -ESRCH;
+                SYSCALL_RET(-ESRCH);
             }
             proc = *pproc;
         } else { // Zero PID means we should default to our current process.
@@ -1084,13 +1084,13 @@ namespace NSched {
         NLib::ScopeIRQSpinlock guard2(&proc->lock);
 
         if (!(current->session == proc->session && (current == proc->parent || proc == current))) {
-            return -EPERM; // We're not allowed to manipulate processes outside our session, or those where we aren't the parent of the process.
+            SYSCALL_RET(-EPERM); // We're not allowed to manipulate processes outside our session, or those where we aren't the parent of the process.
         }
 
         proc->pgrp->lock.acquire();
         if (proc->pgrp->id == proc->id) {
             proc->pgrp->lock.release();
-            return -EPERM; // We can't set the process group of a process that is already the leader of its own process group (we'd lose reference to the process group).
+            SYSCALL_RET(-EPERM); // We can't set the process group of a process that is already the leader of its own process group (we'd lose reference to the process group).
         }
         proc->pgrp->lock.release();
 
@@ -1099,19 +1099,19 @@ namespace NSched {
         if (pgid) {
             Process **op = pidtable->find(pgid); // Attempt to find the process that leads this process group.
             if (!op) {
-                return -EINVAL;
+                SYSCALL_RET(-EINVAL);
             }
 
             newpgrp = (*op)->pgrp;
             newpgrp->lock.acquire();
             if (newpgrp->session != proc->session) { // New process group should *also* be in the current session.
                 newpgrp->lock.release();
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         } else { // Zero PGID. Create a new one.
             newpgrp = new ProcessGroup();
             if (!newpgrp) {
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
             newpgrp->id = proc->id; // Make sure that this process is the leader.
             newpgrp->session = proc->session;
@@ -1130,10 +1130,10 @@ namespace NSched {
                 delete newpgrp;
             }
 
-            return -ESRCH;
+            SYSCALL_RET(-ESRCH);
         }
 
-        return 0;
+        SYSCALL_RET(0);
     }
 
     extern "C" uint64_t sys_getpgid(int pid) {
@@ -1143,35 +1143,35 @@ namespace NSched {
 
         if (!pid) {
             // Return current process' process group ID.
-            return NArch::CPU::get()->currthread->process->pgrp->id;
+            SYSCALL_RET(NArch::CPU::get()->currthread->process->pgrp->id);
         }
 
         Process **pproc = pidtable->find(pid);
         if (!pproc) {
-            return -ESRCH;
+            SYSCALL_RET(-ESRCH);
         }
 
         Process *proc = *pproc;
         // Return the process group of whatever we found.
-        return proc->pgrp->id;
+        SYSCALL_RET(proc->pgrp->id);
     }
 
     extern "C" uint64_t sys_gettid(void) {
         SYSCALL_LOG("sys_gettid().\n");
-        return CPU::get()->currthread->id;
+        SYSCALL_RET(CPU::get()->currthread->id);
     }
 
     extern "C" uint64_t sys_getpid(void) {
         SYSCALL_LOG("sys_getpid().\n");
-        return CPU::get()->currthread->process->id;
+        SYSCALL_RET(CPU::get()->currthread->process->id);
     }
 
     extern "C" uint64_t sys_getppid(void) {
         SYSCALL_LOG("sys_getppid().\n");
         if (CPU::get()->currthread->process->parent) {
-            return CPU::get()->currthread->process->parent->id;
+            SYSCALL_RET(CPU::get()->currthread->process->parent->id);
         }
-        return 0; // Default to no parent PID.
+        SYSCALL_RET(0); // Default to no parent PID.
     }
 
     void handlelazyfpu(void) {
@@ -1256,32 +1256,32 @@ namespace NSched {
 
         ssize_t pathlen = NMem::UserCopy::strnlen(path, 4096);
         if (pathlen <= 0) {
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
 
         char *pathbuf = new char[pathlen + 1];
         if (!pathbuf) {
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
 
         ssize_t ret = NMem::UserCopy::copyfrom(pathbuf, path, pathlen + 1);
         if (ret < 0) {
             delete[] pathbuf;
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
         pathbuf[pathlen] = 0; // Null terminate.
 
 
         if (!NMem::UserCopy::valid(argv, sizeof(char *))) {
             delete[] pathbuf;
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
 
         size_t argc = 0;
         while (true) {
             if (!NMem::UserCopy::valid(&argv[argc], sizeof(char *))) {
                 delete[] pathbuf;
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             if (!argv[argc]) {
                 break;
@@ -1289,21 +1289,21 @@ namespace NSched {
             argc++;
             if (argc > 4096) { // XXX: ARGMAX limit.
                 delete[] pathbuf;
-                return -E2BIG;
+                SYSCALL_RET(-E2BIG);
             }
         }
 
         char **aargv = new char *[argc + 1];
         if (!aargv) {
             delete[] pathbuf;
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
         for (size_t i = 0; i < argc; i++) {
             ssize_t arglen = NMem::UserCopy::strnlen(argv[i], 4096);
             if (arglen <= 0) {
                 delete[] pathbuf;
                 delete[] aargv;
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
 
             aargv[i] = new char[arglen + 1];
@@ -1313,7 +1313,7 @@ namespace NSched {
                 }
                 delete[] pathbuf;
                 delete[] aargv;
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
 
             ssize_t r = NMem::UserCopy::copyfrom(aargv[i], argv[i], arglen + 1);
@@ -1323,7 +1323,7 @@ namespace NSched {
                 }
                 delete[] pathbuf;
                 delete[] aargv;
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             aargv[i][arglen] = 0; // Null terminate.
         }
@@ -1332,7 +1332,7 @@ namespace NSched {
         if (!NMem::UserCopy::valid(envp, sizeof(char *))) {
             freeargsenvs(aargv, argc);
             delete[] pathbuf;
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
 
         // Copy envp array:
@@ -1341,7 +1341,7 @@ namespace NSched {
             if (!NMem::UserCopy::valid(&envp[envc], sizeof(char *))) {
                 freeargsenvs(aargv, argc);
                 delete[] pathbuf;
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             if (!envp[envc]) {
                 break;
@@ -1350,7 +1350,7 @@ namespace NSched {
             if (envc > 4096) { // XXX: ARGMAX limit.
                 freeargsenvs(aargv, argc);
                 delete[] pathbuf;
-                return -E2BIG;
+                SYSCALL_RET(-E2BIG);
             }
         }
 
@@ -1358,7 +1358,7 @@ namespace NSched {
         if (!aenvp) {
             freeargsenvs(aargv, argc);
             delete[] pathbuf;
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
         for (size_t i = 0; i < envc; i++) {
             ssize_t envlen = NMem::UserCopy::strnlen(envp[i], 4096);
@@ -1366,7 +1366,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 delete[] aenvp;
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             aenvp[i] = new char[envlen + 1];
             if (!aenvp[i]) {
@@ -1376,7 +1376,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 delete[] aenvp;
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
             ssize_t r = NMem::UserCopy::copyfrom(aenvp[i], envp[i], envlen + 1);
             if (r < 0) {
@@ -1386,7 +1386,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 delete[] pathbuf;
                 delete[] aenvp;
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             aenvp[i][envlen] = 0; // Null terminate.
         }
@@ -1395,27 +1395,28 @@ namespace NSched {
 
         Process *current = NArch::CPU::get()->currthread->process;
         current->lock.acquire();
+        NFS::VFS::INode *cwd = current->cwd;
+        int euid = current->euid;
+        int egid = current->egid;
+        current->lock.release();
 
         NFS::VFS::INode *inode;
-        ret = NFS::VFS::vfs.resolve(pathbuf, &inode, current->cwd, true);
+        ret = NFS::VFS::vfs.resolve(pathbuf, &inode, cwd, true);
         if (ret < 0) {
-            current->lock.release();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
             delete[] pathbuf;
-            return ret;
+            SYSCALL_RET(ret);
         }
         delete[] pathbuf;
 
         // Check permission against EUID/EGID.
-        if (!NFS::VFS::vfs.checkaccess(inode, NFS::VFS::O_EXEC, current->euid, current->egid)) {
+        if (!NFS::VFS::vfs.checkaccess(inode, NFS::VFS::O_EXEC, euid, egid)) {
             inode->unref();
-            current->lock.release();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
-            return -EACCES;
+            SYSCALL_RET(-EACCES);
         }
-        current->lock.release();
 
         // Check if interpreter script.
         char shebang[128] = {0};
@@ -1425,7 +1426,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
-            return -ENOEXEC;
+            SYSCALL_RET(-ENOEXEC);
         }
 
         if (shebang[0] == '#' && shebang[1] == '!') {
@@ -1438,21 +1439,21 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
-            return -ENOEXEC;
+            SYSCALL_RET(-ENOEXEC);
         }
 
         if (elfhdr.type != NSys::ELF::ET_EXECUTABLE && elfhdr.type != NSys::ELF::ET_DYNAMIC) {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
-            return -ENOEXEC;
+            SYSCALL_RET(-ENOEXEC);
         }
 
         if (!NSys::ELF::verifyheader(&elfhdr)) {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
-            return -ENOEXEC;
+            SYSCALL_RET(-ENOEXEC);
         }
 
         struct VMM::addrspace *newspace;
@@ -1477,7 +1478,7 @@ namespace NSched {
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
             delete newspace;
-            return -ENOEXEC;
+            SYSCALL_RET(-ENOEXEC);
         }
 
         if (elfhdr.type == NSys::ELF::ET_DYNAMIC) {
@@ -1487,20 +1488,20 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
                 delete newspace;
-                return -ENOEXEC;
+                SYSCALL_RET(-ENOEXEC);
             }
             isdynamic = true;
 
             // Load interpreter ELF.
             NFS::VFS::INode *interpnode;
-            ssize_t r = NFS::VFS::vfs.resolve(interp, &interpnode, current->cwd, true);
+            ssize_t r = NFS::VFS::vfs.resolve(interp, &interpnode, cwd, true);
             delete[] interp;
             if (r < 0) {
                 inode->unref();
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
                 delete newspace;
-                return r;
+                SYSCALL_RET(r);
             }
 
             struct NSys::ELF::header interpelfhdr;
@@ -1511,7 +1512,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
                 delete newspace;
-                return -ENOEXEC;
+                SYSCALL_RET(-ENOEXEC);
             }
 
             if (!NSys::ELF::verifyheader(&interpelfhdr)) {
@@ -1520,7 +1521,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
                 delete newspace;
-                return -ENOEXEC;
+                SYSCALL_RET(-ENOEXEC);
             }
 
             // Load interpreter at different base address
@@ -1531,7 +1532,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
                 delete newspace;
-                return -ENOEXEC;
+                SYSCALL_RET(-ENOEXEC);
             }
 
             interpnode->unref();
@@ -1541,7 +1542,7 @@ namespace NSched {
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
                 delete newspace;
-                return -ENOEXEC;
+                SYSCALL_RET(-ENOEXEC);
             }
         }
 
@@ -1550,7 +1551,7 @@ namespace NSched {
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
             delete newspace;
-            return -ENOEXEC;
+            SYSCALL_RET(-ENOEXEC);
         }
 
 
@@ -1563,7 +1564,7 @@ namespace NSched {
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
             delete newspace;
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
 
         uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Top of user space, minus a page for safety.
@@ -1576,7 +1577,7 @@ namespace NSched {
         if (!rsp) {
             PMM::free((void *)ustackphy, 1 << 20);
             delete newspace;
-            return -ENOMEM;
+            SYSCALL_RET(-ENOMEM);
         }
 
         // Reserve user stack region.
@@ -1618,12 +1619,6 @@ namespace NSched {
             current->addrspace = newspace;
 
             current->fdtable->doexec(); // Close FDs with O_CLOEXEC.
-
-            for (size_t i = 0; i < SIGMAX; i++) {
-                if ( NArch::CPU::get()->currthread->signal.actions[i].handler != SIG_IGN) {
-                    NArch::CPU::get()->currthread->signal.actions[i].handler = SIG_DFL; // Reset custom signal handlers.
-                }
-            }
 
 
             NLib::memset(&NArch::CPU::get()->currthread->ctx, 0, sizeof(NArch::CPU::get()->currthread->ctx));
@@ -1704,7 +1699,7 @@ namespace NSched {
         SYSCALL_LOG("sys_waitpid(%d, %p, %d).\n", pid, status, options);
 
         if (status && !NMem::UserCopy::valid(status, sizeof(int))) {
-            return -EFAULT;
+            SYSCALL_RET(-EFAULT);
         }
 
         Process *current = NArch::CPU::get()->currthread->process;
@@ -1715,7 +1710,7 @@ namespace NSched {
 
         if (!haschildren) {
             current->lock.release();
-            return -ECHILD; // No matching children.
+            SYSCALL_RET(-ECHILD); // No matching children.
         }
 
         Process *zombie = NULL;
@@ -1725,7 +1720,7 @@ namespace NSched {
             zombie = findchild(current, pid, true);
             if (!zombie) {
                 current->lock.release();
-                return 0; // No matching zombies.
+                SYSCALL_RET(0); // No matching zombies.
             }
         } else {
             // Blocking wait.
@@ -1743,7 +1738,7 @@ namespace NSched {
             if (NMem::UserCopy::copyto(status, &zstatus, sizeof(int)) < 0) {
                 zombie->lock.release();
                 current->lock.release();
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
@@ -1753,13 +1748,13 @@ namespace NSched {
 
         delete zombie; // Reap process.
 
-        return zid;
+        SYSCALL_RET(zid);
     }
 
     extern "C" uint64_t sys_yield(void) {
         SYSCALL_LOG("sys_yield().\n");
         yield();
-        return 0;
+        SYSCALL_RET(0);
     }
 
     extern "C" uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
@@ -1770,35 +1765,35 @@ namespace NSched {
 
         if (ruid) {
             if (!NMem::UserCopy::valid(ruid, sizeof(int))) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             int r = current->uid;
             if (NMem::UserCopy::copyto(ruid, &r, sizeof(int)) < 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
         if (euid) {
             if (!NMem::UserCopy::valid(euid, sizeof(int))) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             int e = current->euid;
             if (NMem::UserCopy::copyto(euid, &e, sizeof(int)) < 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
         if (suid) {
             if (!NMem::UserCopy::valid(suid, sizeof(int))) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             int s = current->suid;
             if (NMem::UserCopy::copyto(suid, &s, sizeof(int)) < 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
-        return 0;
+        SYSCALL_RET(0);
     }
 
     extern "C" uint64_t sys_getresgid(int *rgid, int *egid, int *sgid) {
@@ -1809,35 +1804,35 @@ namespace NSched {
 
         if (rgid) {
             if (!NMem::UserCopy::valid(rgid, sizeof(int))) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             int r = current->gid;
             if (NMem::UserCopy::copyto(rgid, &r, sizeof(int)) < 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
         if (egid) {
             if (!NMem::UserCopy::valid(egid, sizeof(int))) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             int e = current->egid;
             if (NMem::UserCopy::copyto(egid, &e, sizeof(int)) < 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
         if (sgid) {
             if (!NMem::UserCopy::valid(sgid, sizeof(int))) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
             int s = current->sgid;
             if (NMem::UserCopy::copyto(sgid, &s, sizeof(int)) < 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
         }
 
-        return 0;
+        SYSCALL_RET(0);
     }
 
     extern "C" uint64_t sys_setresuid(int ruid, int euid, int suid) {
@@ -1856,25 +1851,25 @@ namespace NSched {
             if (privileged || ruid == current->uid || ruid == current->euid || ruid == current->suid) {
                 current->uid = ruid;
             } else {
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         }
         if (euid != -1) {
             if (privileged || euid == current->uid || euid == current->euid || euid == current->suid) {
                 current->euid = euid;
             } else {
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         }
         if (suid != -1) {
             if (privileged || suid == current->uid || suid == current->euid || suid == current->suid) {
                 current->suid = suid;
             } else {
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         }
 
-        return 0;
+        SYSCALL_RET(0);
     }
 
     extern "C" uint64_t sys_setresgid(int rgid, int egid, int sgid) {
@@ -1893,24 +1888,24 @@ namespace NSched {
             if (privileged || rgid == current->gid || rgid == current->egid || rgid == current->sgid) {
                 current->gid = rgid;
             } else {
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         }
         if (egid != -1) {
             if (privileged || egid == current->gid || egid == current->egid || egid == current->sgid) {
                 current->egid = egid;
             } else {
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         }
         if (sgid != -1) {
             if (privileged || sgid == current->gid || sgid == current->egid || sgid == current->sgid) {
                 current->sgid = sgid;
             } else {
-                return -EPERM;
+                SYSCALL_RET(-EPERM);
             }
         }
 
-        return 0;
+        SYSCALL_RET(0);
     }
 }

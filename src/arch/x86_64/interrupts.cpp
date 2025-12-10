@@ -126,7 +126,8 @@ namespace NArch {
                     void *newpage = PMM::alloc(PAGESIZE);
                     if (!newpage) {
                         space->lock.release();
-                        NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL, ctx);
+                        // XXX: Out of memory handling.
+                        //NSched::deliversignal(NArch::CPU::get()->currthread, SIGKILL, ctx);
                         return;
                     }
 

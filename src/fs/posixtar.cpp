@@ -14,8 +14,6 @@ namespace NFS {
                 return super;
             }
 
-            NLib::ScopeSpinlock guard(&this->spin);
-
             size_t size = this->modinfo.size;
             uintptr_t loc = this->modinfo.loc;
 
@@ -87,6 +85,7 @@ namespace NFS {
                         attr.st_mtime = mtime;
                         attr.st_atime = mtime;
                         attr.st_ctime = mtime;
+                        attr.st_nlink = 2; // Directories start with 2 links (self and parent).
                         node = VFS::vfs.create(name, attr);
                         assert(node, "Failed to allocate VFS node.\n");
                         node->unref();

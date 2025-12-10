@@ -1,6 +1,7 @@
 #ifdef __x86_64__
 #include <arch/x86_64/cpu.hpp>
 #endif
+#include <fs/pipefs.hpp>
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
 #include <mm/ucopy.hpp>
@@ -267,6 +268,77 @@ namespace NFS {
             return node;
         }
 
+        int VFS::unlink(const char *path, INode *relativeto, int flags, int uid, int gid) {
+            Path pobj = Path(path);
+
+            if (!pobj.depth()) {
+                return -EINVAL; // Cannot unlink root.
+            }
+
+            // Resolve the node to unlink.
+            INode *node = NULL;
+            ssize_t res = this->resolve(path, &node, relativeto, true);
+            if (res < 0) {
+                return res; // Failed to resolve path.
+            }
+
+            // Get parent directory.
+            INode *parent = node->getparent();
+            if (!parent) {
+                node->unref();
+                return -EINVAL; // Cannot unlink root node.
+            }
+            parent->ref();
+
+            // Check if we're trying to unlink a directory.
+            struct stat st = node->getattr();
+            if (S_ISDIR(st.st_mode)) {
+                if (!(flags & AT_REMOVEDIR)) {
+                    // Trying to unlink a directory without AT_REMOVEDIR flag.
+                    parent->unref();
+                    node->unref();
+                    return -EISDIR;
+                }
+                if (!node->empty()) {
+                    // Directory is not empty.
+                    parent->unref();
+                    node->unref();
+                    return -ENOTEMPTY;
+                }
+            } else {
+                if (flags & AT_REMOVEDIR) {
+                    // AT_REMOVEDIR specified but target is not a directory.
+                    parent->unref();
+                    node->unref();
+                    return -ENOTDIR;
+                }
+            }
+
+            if (!this->checkaccess(parent, O_RDWR | O_EXEC, uid, gid)) {
+                parent->unref();
+                node->unref();
+                return -EACCES; // No write/search permission on parent directory.
+            }
+
+            // Find the mountpoint for this path to call filesystem-specific unlink.
+            struct mntpoint *mount = this->findmount(&pobj);
+            if (!mount) {
+                parent->unref();
+                node->unref();
+                return -EINVAL; // Invalid mounting point.
+            }
+
+            // Call filesystem-specific unlink.
+            const char *pathstr = pobj.construct();
+            int ret = mount->fs->unlink(pathstr);
+            delete[] pathstr;
+
+            parent->unref();
+            node->unref();
+
+            return ret;
+        }
+
         int FileDescriptorTable::open(INode *node, int flags) {
             NLib::ScopeSpinlock guard(&this->lock);
 
@@ -293,6 +365,10 @@ namespace NFS {
             this->fds[fd] = new FileDescriptor(node, flags);
             if (!this->fds[fd]) {
                 return -ENOMEM;
+            }
+
+            if (flags & O_CLOEXEC) {
+                this->closeonexec.set(fd);
             }
 
             this->openfds.set(fd);
@@ -359,13 +435,53 @@ namespace NFS {
             return newfd;
         }
 
-        int FileDescriptorTable::dup2(int oldfd, int newfd) {
+        int FileDescriptorTable::dup2(int oldfd, int newfd, bool fcntl) {
             NLib::ScopeSpinlock guard(&this->lock);
 
             if (oldfd < 0 || oldfd >= (int)this->fds.getsize() || !this->fds[oldfd] || !this->openfds.test(oldfd)) { // Discard if we can tell that the FD is bad.
                 return -EBADF;
             }
 
+            if (fcntl) {
+                if (newfd < 0) {
+                    return -EINVAL;
+                }
+
+                // Find lowest-numbered available fd >= newfd.
+                int candidate = -1;
+                for (int i = newfd; i < (int)this->openfds.getsize(); i++) {
+                    if (!this->openfds.test(i)) {
+                        candidate = i;
+                        break;
+                    }
+                }
+
+                if (candidate == -1) {
+                    candidate = this->openfds.getsize();
+                    if (candidate + 32 > MAXFDS) {
+                        return -EMFILE;
+                    }
+
+                    if (!this->fds.resize(candidate + 32)) {
+                        return -ENOMEM;
+                    }
+
+                    if (!this->openfds.resize(candidate + 32)) {
+                        return -ENOMEM;
+                    }
+
+                    if (!this->closeonexec.resize(candidate + 32)) {
+                        return -ENOMEM;
+                    }
+                }
+
+                this->fds[candidate] = this->fds[oldfd];
+                this->fds[candidate]->ref();
+                this->openfds.set(candidate);
+                return candidate;
+            }
+
+            // Non-fcntl (dup2) semantics: newfd is exact target.
             if (newfd < 0 || newfd > MAXFDS) { // Discard if this is a negative. Positive FDs are still valid, because we can just expand the FD table. Arbitrary maximum is imposed to prevent rampant memory consumption.
                 return -EBADF;
             }
@@ -426,6 +542,14 @@ namespace NFS {
                     newtable->fds[i] = this->fds[i]; // Copy reference.
                     newtable->fds[i]->ref(); // Increase refcount.
                     newtable->openfds.set(i); // Mark as allocated.
+
+                    INode *node = newtable->fds[i]->getnode();
+                    if (S_ISFIFO(node->getattr().st_mode)) {
+                        // Pipes get special treatment, and need to have open called on them again to update reader/writer counts.
+                        node->open(newtable->fds[i]->getflags());
+                    }
+                    node->unref();
+
                     if (this->closeonexec.test(i)) { // If this is also marked as close on exec.
                         newtable->closeonexec.set(i); // Mark as allocated.
                     }
@@ -552,18 +676,18 @@ namespace NFS {
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, 1024); // XXX: Maximum path length.
             if (pathsize < 0) {
-                return pathsize; // Contains errno.
+                SYSCALL_RET(pathsize); // Contains errno.
             }
 
             char *pathbuf = new char[pathsize + 1];
             if (!pathbuf) {
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
 
             int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
             if (ret < 0) {
                 delete[] pathbuf;
-                return ret; // Contains errno.
+                SYSCALL_RET(ret); // Contains errno.
             }
 
             pathbuf[pathsize] = '\0';
@@ -571,7 +695,7 @@ namespace NFS {
             INode *dirnode = NULL;
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
-            proc->lock.acquire();
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
 
             if (pathbuf[0] == '/') { // Absolute path invalidates dirfd.
                 dirnode = vfs.getroot();
@@ -587,31 +711,30 @@ namespace NFS {
                     FileDescriptor *desc = proc->fdtable->get(dirfd);
                     if (!desc) {
                         delete[] pathbuf;
-                        return -EBADF;
+                        SYSCALL_RET(-EBADF);
                     }
 
                     dirnode = desc->getnode();
                     if (!S_ISDIR(dirnode->getattr().st_mode)) {
                         dirnode->unref();
                         delete[] pathbuf;
-                        return -ENOTDIR;
+                        SYSCALL_RET(-ENOTDIR);
                     }
                 }
             }
-            proc->lock.release();
 
             INode *node;
             ssize_t res = vfs.resolve(pathbuf, &node, dirnode, !(flags & O_NOFOLLOW));
             dirnode->unref();
             if (res == -EACCES) { // We don't have permission to traverse the path.
                 delete[] pathbuf;
-                return -EACCES; // Propagate access error.
+                SYSCALL_RET(-EACCES); // Propagate access error.
             }
 
             if (res != 0) { // Couldn't find it. Check if there's a reason to create it.
                 if (!(flags & O_CREAT)) {
                     delete[] pathbuf;
-                    return res; // Don't bother if there's no create flag.
+                    SYSCALL_RET(res); // Don't bother if there's no create flag.
                 }
                 // Create the node.
                 struct stat attr = { 0 };
@@ -619,7 +742,7 @@ namespace NFS {
                 node = vfs.create(pathbuf, attr);
                 if (res != 0) {
                     delete[] pathbuf;
-                    return -EIO; // Generic I/O error.
+                    SYSCALL_RET(-EIO); // Generic I/O error.
                 }
             }
 
@@ -629,16 +752,18 @@ namespace NFS {
 
             if ((flags & O_DIRECTORY) && !S_ISDIR(st.st_mode)) { // If we're supposed to open a directory, we'd have to verify that the node is a directory.
                 node->unref();
-                return -ENOTDIR;
+                SYSCALL_RET(-ENOTDIR);
             }
-            proc->lock.acquire();
+
+            if ((flags & O_RDWR) && S_ISFIFO(st.st_mode)) { // Can't open FIFOs in read-write mode.
+                node->unref();
+                SYSCALL_RET(-EINVAL);
+            }
 
             if (!vfs.checkaccess(node, flags, proc->euid, proc->egid)) { // Check if current process' effective UID and GID are valid for access the node in this way.
                 node->unref();
-                proc->lock.release();
-                return -EACCES;
+                SYSCALL_RET(-EACCES);
             }
-            proc->lock.release();
 
             int accmode = flags & O_ACCMODE;
 
@@ -646,19 +771,19 @@ namespace NFS {
                 case O_RDONLY:
                     if (flags & O_TRUNC) {
                         node->unref();
-                        return -EINVAL; // Can't truncate without write access.
+                        SYSCALL_RET(-EINVAL); // Can't truncate without write access.
                     }
                     break;
                 case O_WRONLY:
                 case O_RDWR:
                     if (S_ISDIR(st.st_mode)) {
                         node->unref();
-                        return -EISDIR; // Can't write to directory.
+                        SYSCALL_RET(-EISDIR); // Can't write to directory.
                     }
                     break;
                 default:
                     node->unref();
-                    return -EINVAL;
+                    SYSCALL_RET(-EINVAL);
             }
 
             // if ((flags & O_TRUNC) && S_ISREG(st.st_mode)) {
@@ -669,7 +794,7 @@ namespace NFS {
             node->open(flags); // Trigger open hook.
             node->unref(); // Unreference. FD table will handle the reference.
 
-            return fd;
+            SYSCALL_RET(fd);
         }
 
         extern "C" uint64_t sys_dup(int fd, int flags) {
@@ -677,7 +802,7 @@ namespace NFS {
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
-            return proc->fdtable->dup(fd);
+            SYSCALL_RET(proc->fdtable->dup(fd));
         }
 
         extern "C" uint64_t sys_dup2(int fd, int flags, int newfd) {
@@ -685,62 +810,62 @@ namespace NFS {
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
-            return proc->fdtable->dup2(fd, newfd);
+            SYSCALL_RET(proc->fdtable->dup2(fd, newfd));
         }
 
         extern "C" uint64_t sys_close(int fd) {
             SYSCALL_LOG("sys_close(%d).\n", fd);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             if (fd == NSched::STDIN_FILENO || fd == NSched::STDOUT_FILENO || fd == NSched::STDERR_FILENO) {
-                return 0; // Refuse to close standard streams.
+                SYSCALL_RET(0); // Refuse to close standard streams.
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             INode *node = desc->getnode();
             int res = node->close(desc->getflags()); // Trigger close hook.
             node->unref();
             if (res < 0) {
-                return res;
+                SYSCALL_RET(res);
             }
 
             res = proc->fdtable->close(fd);
             if (res < 0) {
-                return res;
+                SYSCALL_RET(res);
             }
 
-            return 0;
+            SYSCALL_RET(0);
         }
 
         extern "C" uint64_t sys_getdents(int fd, void *buf, size_t count) {
             SYSCALL_LOG("sys_getdents(%d, %p, %lu).\n", fd, buf, count);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             if (!buf && count > 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
 
             if (!NMem::UserCopy::valid(buf, count)) {
-                return -EFAULT; // Invalid buffer.
+                SYSCALL_RET(-EFAULT); // Invalid buffer.
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             INode *node = desc->getnode();
@@ -748,25 +873,25 @@ namespace NFS {
             struct stat st = node->getattr();
             if (!S_ISDIR(st.st_mode)) {
                 node->unref();
-                return -ENOTDIR;
+                SYSCALL_RET(-ENOTDIR);
             }
 
             ssize_t read = node->readdir(buf, count, desc->getoff());
             node->unref();
             if (read < 0) {
-                return read; // Return error code.
+                SYSCALL_RET(read); // Return error code.
             }
 
             desc->addoff(read); // Increment offset.
 
-            return read; // Return the actual number of bytes read.
+            SYSCALL_RET(read); // Return the actual number of bytes read.
         }
 
         extern "C" uint64_t sys_fchdir(int fd) {
             SYSCALL_LOG("sys_fchdir(%d).\n", fd);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
@@ -774,7 +899,7 @@ namespace NFS {
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             INode *node = desc->getnode();
@@ -782,14 +907,14 @@ namespace NFS {
             struct stat st = node->getattr();
             if (!S_ISDIR(st.st_mode)) {
                 node->unref();
-                return -ENOTDIR;
+                SYSCALL_RET(-ENOTDIR);
             }
 
             if (proc->cwd) {
                 proc->cwd->unref(); // Unreference old CWD.
             }
             proc->cwd = node; // Set new CWD.
-            return 0;
+            SYSCALL_RET(0);
         }
 
         extern "C" uint64_t sys_chdir(const char *path) {
@@ -797,18 +922,18 @@ namespace NFS {
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, 1024); // XXX: Maximum path length.
             if (pathsize < 0) {
-                return pathsize; // Contains errno.
+                SYSCALL_RET(pathsize); // Contains errno.
             }
 
             char *pathbuf = new char[pathsize + 1];
             if (!pathbuf) {
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
 
             int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
             if (ret < 0) {
                 delete[] pathbuf;
-                return ret; // Contains errno.
+                SYSCALL_RET(ret); // Contains errno.
             }
 
             pathbuf[pathsize] = '\0';
@@ -822,31 +947,31 @@ namespace NFS {
             delete[] pathbuf;
 
             if (res < 0) {
-                return res;
+                SYSCALL_RET(res);
             }
 
             struct stat st = node->getattr();
             if (!S_ISDIR(st.st_mode)) {
                 node->unref();
-                return -ENOTDIR;
+                SYSCALL_RET(-ENOTDIR);
             }
 
             if (proc->cwd) {
                 proc->cwd->unref(); // Unreference old CWD.
             }
             proc->cwd = node; // Set new CWD.
-            return 0;
+            SYSCALL_RET(0);
         }
 
         extern "C" uint64_t sys_getcwd(char *buf, size_t size) {
             SYSCALL_LOG("sys_getcwd(%p, %lu).\n", buf, size);
 
             if (!buf || size == 0) {
-                return -EINVAL;
+                SYSCALL_RET(-EINVAL);
             }
 
             if (!NMem::UserCopy::valid(buf, size)) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
@@ -856,7 +981,7 @@ namespace NFS {
             if (!cwd) {
                 cwd = vfs.getroot(); // getroot() increments refcount.
                 if (!cwd) {
-                    return -ENOENT;
+                    SYSCALL_RET(-ENOENT);
                 }
             } else {
                 cwd->ref(); // Increase reference for our use.
@@ -878,7 +1003,7 @@ namespace NFS {
                     // Reached root without finding VFS root - this shouldn't happen.
                     current->unref();
                     root->unref();
-                    return -ENOENT;
+                    SYSCALL_RET(-ENOENT);
                 }
 
                 parent->ref(); // Increment parent refcount.
@@ -894,13 +1019,13 @@ namespace NFS {
 
             const char *pathstr = resultpath.construct();
             if (!pathstr) {
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
 
             size_t pathlen = NLib::strlen(pathstr);
             if (pathlen + 1 > size) {
                 delete[] pathstr;
-                return -ERANGE;
+                SYSCALL_RET(-ERANGE);
             }
 
             // Copy to userspace.
@@ -908,37 +1033,37 @@ namespace NFS {
             delete[] pathstr;
 
             if (ret < 0) {
-                return ret;
+                SYSCALL_RET(ret);
             }
 
-            return (uint64_t)buf; // Return the buffer pointer on success.
+            SYSCALL_RET((uint64_t)buf); // Return the buffer pointer on success.
         }
 
         extern "C" uint64_t sys_read(int fd, void *buf, size_t count) {
             SYSCALL_LOG("sys_read(%d, %p, %lu).\n", fd, buf, count);
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             if (!buf && count > 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
 
             if (!NMem::UserCopy::valid(buf, count)) {
-                return -EFAULT; // Invalid buffer.
+                SYSCALL_RET(-EFAULT); // Invalid buffer.
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             int accmode = desc->getflags() & O_ACCMODE;
 
             if (accmode != O_RDONLY && accmode != O_RDWR) {
-                return -EBADF; // Not open for read.
+                SYSCALL_RET(-EBADF); // Not open for read.
             }
 
             INode *node = desc->getnode();
@@ -947,58 +1072,58 @@ namespace NFS {
 
             if (S_ISDIR(st.st_mode)) {
                 node->unref();
-                return -EISDIR;
+                SYSCALL_RET(-EISDIR);
             }
 
             if (S_ISLNK(st.st_mode)) {
                 node->unref();
-                return -EINVAL;
+                SYSCALL_RET(-EINVAL);
             }
 
             ssize_t read = node->read(buf, count, desc->getoff(), desc->getflags());
             node->unref();
             if (read < 0) {
-                return read; // Return error code.
+                SYSCALL_RET(read); // Return error code.
             }
 
             desc->addoff(read); // Increment offset.
 
-            return read; // Return the actual number of bytes read.
+            SYSCALL_RET(read); // Return the actual number of bytes read.
         }
 
         extern "C" uint64_t sys_write(int fd, const void *buf, size_t count) {
             SYSCALL_LOG("sys_write(%d, %p, %lu).\n", fd, buf, count);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             if (!buf && count > 0) {
-                return -EFAULT;
+                SYSCALL_RET(-EFAULT);
             }
 
             if (!NMem::UserCopy::valid(buf, count)) {
-                return -EFAULT; // Invalid buffer.
+                SYSCALL_RET(-EFAULT); // Invalid buffer.
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             int accmode = desc->getflags() & O_ACCMODE;
 
             if (accmode != O_WRONLY && accmode != O_RDWR) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             INode *node = desc->getnode();
             struct stat st = node->getattr();
             if (S_ISDIR(st.st_mode)) {
                 node->unref();
-                return -EISDIR;
+                SYSCALL_RET(-EISDIR);
             }
 
             uint64_t wroff = desc->getoff();
@@ -1009,36 +1134,31 @@ namespace NFS {
             ssize_t written = node->write(buf, count, wroff, desc->getflags());
             node->unref();
             if (written < 0) {
-                return written;
+                SYSCALL_RET(written);
             }
 
             if (!(desc->getflags() & O_APPEND)) {
                 desc->setoff(wroff + written); // New offset should be here.
             }
 
-            return written;
+            SYSCALL_RET(written);
         }
 
         extern "C" uint64_t sys_ioctl(int fd, unsigned long request, uint64_t arg) {
             SYSCALL_LOG("sys_ioctl(%d, %lu, %p).\n", fd, request, arg);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
-            if (!arg) {
-                return -EFAULT;
-            }
-
-            if (!NMem::UserCopy::valid((void *)arg, 1)) {
-                return -EFAULT;
-            }
+            // Note: arg validation is request-specific and handled by ioctl implementation
+            // Some ioctls use arg as an integer value, not a pointer
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             INode *node = desc->getnode();
@@ -1047,26 +1167,26 @@ namespace NFS {
 
             if (!S_ISCHR(st.st_mode)) {
                 node->unref();
-                return -ENOTTY; // Not character special.
+                SYSCALL_RET(-ENOTTY); // Not character special.
             }
             int ret = node->ioctl(request, arg);
             node->unref();
 
-            return ret;
+            SYSCALL_RET(ret);
         }
 
         extern "C" uint64_t sys_seek(int fd, off_t off, int whence) {
             SYSCALL_LOG("sys_seek(%d, %ld, %d).\n", fd, off, whence);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             INode *node = desc->getnode();
@@ -1075,7 +1195,7 @@ namespace NFS {
 
             if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) {
                 node->unref();
-                return -ESPIPE;
+                SYSCALL_RET(-ESPIPE);
             }
             node->unref();
 
@@ -1095,47 +1215,55 @@ namespace NFS {
             }
 
             if (newoff < 0) {
-                return -EINVAL; // Ultimately, invalid offset.
+                SYSCALL_RET(-EINVAL); // Ultimately, invalid offset.
             }
 
             desc->setoff(newoff); // Set new offset.
-            return newoff;
+            SYSCALL_RET(newoff);
         }
-
-        #define F_GETFD 1
-        #define F_SETFD 2
-        #define FD_CLOEXEC 1
 
         extern "C" uint64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
             SYSCALL_LOG("sys_fcntl(%d, %d, %p).\n", fd, cmd, arg);
 
             if (fd < 0) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
-                return -EBADF;
+                SYSCALL_RET(-EBADF);
             }
 
             switch (cmd) {
+                case F_DUPFD:
+                    SYSCALL_RET(proc->fdtable->dup2(fd, (int)arg, true));
                 case F_GETFD:
-                    return (proc->fdtable->iscloseonexec(fd) ? FD_CLOEXEC : 0);
+                    SYSCALL_RET(proc->fdtable->iscloseonexec(fd) ? FD_CLOEXEC : 0);
                 case F_SETFD:
                     if (arg & FD_CLOEXEC) {
                         proc->fdtable->setcloseonexec(fd, true);
                     } else {
                         proc->fdtable->setcloseonexec(fd, false);
                     }
-                    return 0;
+                    SYSCALL_RET(0);
+                case F_GETFL:
+                    SYSCALL_RET(desc->getflags());
+                case F_SETFL:
+                    desc->setflags((int)arg);
+                    SYSCALL_RET(0);
+                case F_DUPFD_CLOEXEC: {
+                    int newfd = proc->fdtable->dup2(fd, (int)arg, true);
+                    if (newfd >= 0) {
+                        proc->fdtable->setcloseonexec(newfd, true);
+                    }
+                    SYSCALL_RET(newfd);
+                }
                 default:
-                    return -EINVAL;
+                    SYSCALL_RET(-EINVAL);
             }
         }
-
-        #define AT_SYMLINK_NOFOLLOW 0x100
 
         // Userspace definition of `struct stat`.
         struct ustat {
@@ -1164,17 +1292,17 @@ namespace NFS {
                 // Stat is path relative to CWD.
                 ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
                 if (pathsize < 0) {
-                    return pathsize; // Contains errno.
+                    SYSCALL_RET(pathsize); // Contains errno.
                 }
                 char *pathbuf = new char[pathsize + 1];
                 if (!pathbuf) {
-                    return -ENOMEM;
+                    SYSCALL_RET(-ENOMEM);
                 }
 
                 int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
                 if (ret < 0) {
                     delete[] pathbuf;
-                    return ret; // Contains errno.
+                    SYSCALL_RET(ret); // Contains errno.
                 }
 
                 pathbuf[pathsize] = '\0';
@@ -1186,7 +1314,7 @@ namespace NFS {
                 proc->lock.release();
                 delete[] pathbuf;
                 if (res < 0) {
-                    return res;
+                    SYSCALL_RET(res);
                 }
 
                 struct stat st = node->getattr();
@@ -1212,25 +1340,25 @@ namespace NFS {
 
                 res = NMem::UserCopy::copyto(statbuf, &ust, sizeof(struct ustat));
                 if (res < 0) {
-                    return res;
+                    SYSCALL_RET(res);
                 }
-                return 0;
+                SYSCALL_RET(0);
             } else if (fd >= 0) {
                 if (len == 0) { // Stat should be of an FD.
                     // Ensure that path is empty string.
                     char ch;
                     int res = NMem::UserCopy::copyfrom(&ch, path, 1);
                     if (res < 0) {
-                        return res;
+                        SYSCALL_RET(res);
                     }
                     if (ch != '\0') {
-                        return -EINVAL;
+                        SYSCALL_RET(-EINVAL);
                     }
 
                     NSched::Process *proc = NArch::CPU::get()->currthread->process;
                     FileDescriptor *desc = proc->fdtable->get(fd);
                     if (!desc) {
-                        return -EBADF;
+                        SYSCALL_RET(-EBADF);
                     }
 
                     INode *node = desc->getnode();
@@ -1257,23 +1385,23 @@ namespace NFS {
 
                     int res2 = NMem::UserCopy::copyto(statbuf, &ust, sizeof(struct ustat));
                     if (res2 < 0) {
-                        return res2;
+                        SYSCALL_RET(res2);
                     }
-                    return 0;
+                    SYSCALL_RET(0);
                 } else { // Stat is path relative to FD.
                     ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
                     if (pathsize < 0) {
-                        return pathsize; // Contains errno.
+                        SYSCALL_RET(pathsize); // Contains errno.
                     }
                     char *pathbuf = new char[pathsize + 1];
                     if (!pathbuf) {
-                        return -ENOMEM;
+                        SYSCALL_RET(-ENOMEM);
                     }
 
                     int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
                     if (ret < 0) {
                         delete[] pathbuf;
-                        return ret; // Contains errno.
+                        SYSCALL_RET(ret); // Contains errno.
                     }
 
                     pathbuf[pathsize] = '\0';
@@ -1282,14 +1410,14 @@ namespace NFS {
                     FileDescriptor *desc = proc->fdtable->get(fd);
                     if (!desc) {
                         delete[] pathbuf;
-                        return -EBADF;
+                        SYSCALL_RET(-EBADF);
                     }
 
                     INode *dirnode = desc->getnode();
                     if (!S_ISDIR(dirnode->getattr().st_mode)) {
                         dirnode->unref();
                         delete[] pathbuf;
-                        return -ENOTDIR;
+                        SYSCALL_RET(-ENOTDIR);
                     }
 
                     INode *node;
@@ -1297,7 +1425,7 @@ namespace NFS {
                     dirnode->unref();
                     delete[] pathbuf;
                     if (res < 0) {
-                        return res;
+                        SYSCALL_RET(res);
                     }
 
                     struct stat st = node->getattr();
@@ -1322,12 +1450,12 @@ namespace NFS {
 
                     int res2 = NMem::UserCopy::copyto(statbuf, &ust, sizeof(struct ustat));
                     if (res2 < 0) {
-                        return res2;
+                        SYSCALL_RET(res2);
                     }
-                    return 0;
+                    SYSCALL_RET(0);
                 }
             }
-            return -EBADF; // Invalid FD.
+            SYSCALL_RET(-EBADF); // Invalid FD.
         }
 
         extern "C" uint64_t sys_access(int fd, const char *path, size_t len, int mode) {
@@ -1335,17 +1463,17 @@ namespace NFS {
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
             if (pathsize < 0) {
-                return pathsize; // Contains errno.
+                SYSCALL_RET(pathsize); // Contains errno.
             }
             char *pathbuf = new char[pathsize + 1];
             if (!pathbuf) {
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
 
             int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
             if (ret < 0) {
                 delete[] pathbuf;
-                return ret; // Contains errno.
+                SYSCALL_RET(ret); // Contains errno.
             }
 
             pathbuf[pathsize] = '\0';
@@ -1366,7 +1494,7 @@ namespace NFS {
                 if (!desc) {
                     delete[] pathbuf;
                     proc->lock.release();
-                    return -EBADF;
+                    SYSCALL_RET(-EBADF);
                 }
 
                 dirnode = desc->getnode();
@@ -1374,7 +1502,7 @@ namespace NFS {
                     dirnode->unref();
                     delete[] pathbuf;
                     proc->lock.release();
-                    return -ENOTDIR;
+                    SYSCALL_RET(-ENOTDIR);
                 }
             }
             proc->lock.release();
@@ -1384,7 +1512,7 @@ namespace NFS {
             dirnode->unref();
             delete[] pathbuf;
             if (res < 0) {
-                return res;
+                SYSCALL_RET(res);
             }
 
             int accflags = 0;
@@ -1408,28 +1536,91 @@ namespace NFS {
             proc->lock.release();
             node->unref();
             if (ok) {
-                return 0;
+                SYSCALL_RET(0);
             } else {
-                return -EACCES;
+                SYSCALL_RET(-EACCES);
             }
         }
 
+        extern "C" uint64_t sys_pipe(int pipefd[2], int flags) {
+            SYSCALL_LOG("sys_pipe(%p).\n", pipefd);
+
+            if (!pipefd) {
+                SYSCALL_RET(-EFAULT);
+            }
+
+            if (!NMem::UserCopy::valid(pipefd, sizeof(int) * 2)) {
+                SYSCALL_RET(-EFAULT);
+            }
+
+            if (!(flags & O_CLOEXEC || flags & O_NONBLOCK || flags == 0)) {
+                SYSCALL_RET(-EINVAL);
+            }
+
+            struct stat attr {
+                .st_ino = 1,
+                .st_mode = S_IFIFO | 0666
+            };
+
+            PipeFS::PipeNode *pipe = (PipeFS::PipeNode *)PipeFS::pipefs->create("", attr);
+            if (!pipe) {
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            // Open read end.
+            int readfd = proc->fdtable->open(pipe, O_RDONLY | (flags & (O_CLOEXEC | O_NONBLOCK)));
+            if (readfd < 0) {
+                pipe->unref();
+                SYSCALL_RET(readfd);
+            }
+            pipe->open(O_RDONLY); // Trigger open hook.
+
+            // Open write end.
+            int writefd = proc->fdtable->open(pipe, O_WRONLY | (flags & (O_CLOEXEC | O_NONBLOCK)));
+            if (writefd < 0) {
+                proc->fdtable->close(readfd);
+                pipe->unref();
+                SYSCALL_RET(writefd);
+            }
+            pipe->open(O_WRONLY); // Trigger open hook.
+
+            pipe->unref(); // FD table holds references now.
+
+            int res = NMem::UserCopy::copyto(pipefd, &readfd, sizeof(int));
+            if (res < 0) {
+                proc->fdtable->close(readfd);
+                proc->fdtable->close(writefd);
+                SYSCALL_RET(res);
+            }
+            res = NMem::UserCopy::copyto(pipefd + 1, &writefd, sizeof(int));
+            if (res < 0) {
+                proc->fdtable->close(readfd);
+                proc->fdtable->close(writefd);
+                SYSCALL_RET(res);
+            }
+
+            SYSCALL_RET(0);
+        }
+
         extern "C" uint64_t sys_readlink(int fd, const char *path, size_t len, char *buf, size_t bufsize) {
-            SYSCALL_LOG("sys_readlink(%d, %p, %lu, %p, %lu).\n", fd, path, len, buf, bufsize);
+            SYSCALL_LOG("sys_readlink(%d, %s, %lu, %p, %lu).\n", fd, path, len, buf, bufsize);
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
             if (pathsize < 0) {
-                return pathsize; // Contains errno.
+                SYSCALL_RET(pathsize); // Contains errno.
             }
             char *pathbuf = new char[pathsize + 1];
             if (!pathbuf) {
-                return -ENOMEM;
+                SYSCALL_RET(-ENOMEM);
             }
 
             int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
             if (ret < 0) {
                 delete[] pathbuf;
-                return ret; // Contains errno.
+                SYSCALL_RET(ret); // Contains errno.
             }
 
             pathbuf[pathsize] = '\0';
@@ -1450,7 +1641,7 @@ namespace NFS {
                 if (!desc) {
                     delete[] pathbuf;
                     proc->lock.release();
-                    return -EBADF;
+                    SYSCALL_RET(-EBADF);
                 }
 
                 dirnode = desc->getnode();
@@ -1458,7 +1649,7 @@ namespace NFS {
                     dirnode->unref();
                     delete[] pathbuf;
                     proc->lock.release();
-                    return -ENOTDIR;
+                    SYSCALL_RET(-ENOTDIR);
                 }
             }
             proc->lock.release();
@@ -1468,16 +1659,77 @@ namespace NFS {
             dirnode->unref();
             delete[] pathbuf;
             if (res < 0) {
-                return res;
+                SYSCALL_RET(res);
             }
 
             ssize_t read = node->readlink(buf, bufsize);
             node->unref();
             if (read < 0) {
-                return read; // Return error code.
+                SYSCALL_RET(read); // Return error code.
             }
 
-            return read; // Return number of bytes read.
+            SYSCALL_RET(read); // Return number of bytes read.
+        }
+
+        extern "C" ssize_t sys_unlink(int fd, const char *path, size_t len, int flags) {
+            SYSCALL_LOG("sys_unlink(%d, %p, %lu, %d).\n", fd, path, len, flags);
+
+            ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
+            if (pathsize < 0) {
+                SYSCALL_RET(pathsize); // Contains errno.
+            }
+            char *pathbuf = new char[pathsize + 1];
+            if (!pathbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+            int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+            if (ret < 0) {
+                delete[] pathbuf;
+                SYSCALL_RET(ret); // Contains errno.
+            }
+            pathbuf[pathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+            INode *dirnode;
+            if (fd == AT_FDCWD) {
+                dirnode = proc->cwd;
+                if (!dirnode) {
+                    dirnode = vfs.getroot();
+                } else {
+                    dirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(fd);
+                if (!desc) {
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                dirnode = desc->getnode();
+                if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            ssize_t res = vfs.unlink(pathbuf, dirnode, flags, proc->uid, proc->gid);
+            proc->lock.release();
+            dirnode->unref();
+            delete[] pathbuf;
+            SYSCALL_RET(res); // Return result of unlink operation.
+        }
+
+        struct timespec {
+            long tv_sec;
+            long tv_nsec;
+        };
+
+        extern "C" uint64_t sys_ppoll(struct pollfd *fds, size_t nfds, struct timespec *tmo_p, struct NLib::sigset *sigmask) {
+            SYSCALL_LOG("sys_ppoll(%p, %u, %p, %p).\n", fds, nfds, tmo_p, sigmask);
+            SYSCALL_RET(-ENOSYS); // Not implemented yet.
         }
     }
 }

@@ -16,6 +16,7 @@
 
 #include <cxxruntime.hpp>
 #include <fs/devfs.hpp>
+#include <fs/pipefs.hpp>
 #include <fs/posixtar.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
@@ -81,8 +82,10 @@ void kpostarch(void) {
         }
     }
 
+    NFS::PipeFS::pipefs = new NFS::PipeFS::PipeFileSystem(&NFS::VFS::vfs); // Create global PipeFS instance.
+
     NFS::VFS::vfs.create("/dev", (struct NFS::VFS::stat) {
-        .st_mode = 0755 | NFS::VFS::S_IFDIR,
+        .st_mode = 0755 | NFS::VFS::S_IFDIR
     });
 
     NDev::setup(); // Initialise device registry.
