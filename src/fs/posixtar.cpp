@@ -4,6 +4,7 @@
 #include <lib/errno.hpp>
 #include <lib/string.hpp>
 #include <util/kprint.hpp>
+#include <std/stddef.h>
 
 namespace NFS {
     namespace POSIXTAR {
@@ -69,8 +70,8 @@ namespace NFS {
                         attr.st_blksize = 512;
                         attr.st_atime = mtime;
                         attr.st_ctime = mtime;
-                        node = VFS::vfs.create(name, attr);
-                        assert(node, "Failed to allocate VFS node.\n");
+                        ssize_t res = VFS::vfs.create(name, &node, attr);
+                        assert(res == 0, "Failed to allocate VFS node.\n");
 
                         size_t count = node->write((void *)((uintptr_t)current + 512), fsize, 0, 0);
                         assert(count == fsize, "Failed to write VFS node data.\n");
@@ -86,8 +87,8 @@ namespace NFS {
                         attr.st_atime = mtime;
                         attr.st_ctime = mtime;
                         attr.st_nlink = 2; // Directories start with 2 links (self and parent).
-                        node = VFS::vfs.create(name, attr);
-                        assert(node, "Failed to allocate VFS node.\n");
+                        ssize_t res = VFS::vfs.create(name, &node, attr);
+                        assert(res == 0, "Failed to allocate VFS node.\n");
                         node->unref();
                         break;
                     }
@@ -97,8 +98,8 @@ namespace NFS {
                         attr.st_uid = uid;
                         attr.st_gid = gid;
                         attr.st_mtime = mtime;
-                        node = VFS::vfs.create(name, attr);
-                        assert(node, "Failed to allocate VFS node.\n");
+                        ssize_t res = VFS::vfs.create(name, &node, attr);
+                        assert(res == 0, "Failed to allocate VFS node.\n");
 
                         size_t len = 0;
                         while (len < sizeof(current->linkname) && lname[len] != '\0') {

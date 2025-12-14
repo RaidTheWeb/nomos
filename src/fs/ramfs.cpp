@@ -1,8 +1,17 @@
 #include <fs/ramfs.hpp>
 #include <lib/errno.hpp>
+#include <fs/pipefs.hpp>
 
 namespace NFS {
     namespace RAMFS {
+        RAMNode::RAMNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr) : VFS::INode(fs, name, attr) {
+            if (VFS::S_ISFIFO(attr.st_mode)) { // Named pipe (FIFO) special handling.
+                // Set redirect so that operations on this FIFO node are redirected to a PipeNode in PipeFS.
+                // XXX: Consider a different approach later on: potentially, only create the PipeNode when the FIFO is opened for the first time?
+                this->redirect = new PipeFS::PipeNode(PipeFS::pipefs, name, attr, true);
+            }
+        }
+
         int RAMNode::poll(short events, short *revents, int fdflags) {
             (void)fdflags;
             NLib::ScopeSpinlock guard(&this->metalock);
@@ -207,11 +216,12 @@ namespace NFS {
             return 0;
         }
 
-        VFS::INode *RAMFileSystem::create(const char *name, struct VFS::stat attr) {
+        ssize_t RAMFileSystem::create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) {
             NLib::ScopeSpinlock guard(&this->spin);
             attr.st_blksize = 512;
             attr.st_ino = this->nextinode++;
-            return new RAMNode(this, name, attr);
+            *nodeout = new RAMNode(this, name, attr);
+            return 0;
         }
 
         int RAMFileSystem::unlink(const char *path) {

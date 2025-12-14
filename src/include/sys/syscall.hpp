@@ -1,5 +1,5 @@
-#ifndef __SYS__SYSCALL_HPP
-#define __SYS__SYSCALL_HPP
+#ifndef _SYS__SYSCALL_HPP
+#define _SYS__SYSCALL_HPP
 
 #include <std/stddef.h>
 #include <util/kprint.hpp>

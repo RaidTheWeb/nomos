@@ -46,6 +46,15 @@ extern sys_uname
 extern sys_pipe
 extern sys_unlink
 extern sys_ppoll
+extern sys_futex
+extern sys_newthread
+extern sys_exitthread
+extern sys_mknodat
+extern sys_clock
+extern sys_chmod
+extern sys_chown
+extern sys_umask
+extern sys_sleep
 
 MAXSYSCALLS equ 256
 
@@ -95,6 +104,15 @@ syscall_table:
     dq sys_pipe
     dq sys_unlink
     dq sys_ppoll
+    dq sys_futex
+    dq sys_newthread
+    dq sys_exitthread
+    dq sys_mknodat
+    dq sys_clock
+    dq sys_chmod
+    dq sys_chown
+    dq sys_umask
+    dq sys_sleep
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

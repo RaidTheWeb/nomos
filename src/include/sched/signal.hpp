@@ -36,9 +36,8 @@ namespace NSched {
 
     static const size_t NSIG = 64; // Total number of signals.
 
-    struct signal {
-        uint64_t pending = 0; // Pending signals.
-        uint64_t blocked = 0; // Signals blocked in general.
+    struct signal { // Per-process signal state.
+        NLib::sigset_t pending = 0; // Pending signals.
         struct sigaction actions[NSIG];
     };
 
@@ -57,23 +56,23 @@ namespace NSched {
         sigstate->pending |= (1ULL << (sig - 1));
     }
 
-    static inline void setblocked(struct signal *sigstate, uint8_t sig) {
+    static inline void setblocked(NLib::sigset_t *sigstate, uint8_t sig) {
         // Set blocked bit, sig is 1-indexed.
-        sigstate->blocked |= (1ULL << (sig - 1));
+        __atomic_fetch_or(sigstate, (1ULL << (sig - 1)), memory_order_acq_rel); // Acquire-release semantics here, because we acquire on fetch, and release on OR.
     }
 
-    static inline bool isblocked(struct signal *sigstate, uint8_t sig) {
+    static inline bool isblocked(NLib::sigset_t *sigstate, uint8_t sig) {
         // Check blocked bit, sig is 1-indexed.
-        return (sigstate->blocked & (1ULL << (sig - 1))) != 0;
+        return __atomic_load_n(sigstate, memory_order_acquire) & (1ULL << (sig - 1));
     }
 
-    static inline void clearblocked(struct signal *sigstate, uint8_t sig) {
+    static inline void clearblocked(NLib::sigset_t *sigstate, uint8_t sig) {
         // Clear blocked bit, sig is 1-indexed.
-        sigstate->blocked &= ~(1ULL << (sig - 1));
+        __atomic_fetch_and(sigstate, ~(1ULL << (sig - 1)), memory_order_acq_rel); // Ditto.
     }
 
     static inline void (*gethandler(struct signal *sigstate, uint8_t sig))(int) {
-        return sigstate->actions[sig].handler;
+        return sigstate->actions[sig - 1].handler;
     }
 
     class Thread;

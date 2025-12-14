@@ -109,6 +109,7 @@ namespace NFS {
             AT_REMOVEDIR            = 0x200,
             AT_SYMLINK_FOLLOW       = 0x400,
             AT_EACCESS              = 0x200,
+            AT_EMPTY_PATH           = 0x1000
         };
 
         constexpr bool S_ISSOCK(uint32_t m) {
@@ -336,6 +337,9 @@ namespace NFS {
                 struct stat attr;
                 const char *name;
                 INode *parent = NULL;
+
+                // Special redirect node for abstracting operations to another node (e.g., for FIFOs).
+                INode *redirect = NULL;
             public:
                 IFileSystem *fs;
 
@@ -358,7 +362,7 @@ namespace NFS {
                     (void)fdflags;
                     return 0;
                 }
-                virtual int mmap(void *addr, size_t offset, uint64_t flags, int fdflags) {
+                virtual int mmap(void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
                     (void)addr;
                     (void)offset;
                     (void)flags;
@@ -426,6 +430,15 @@ namespace NFS {
                     return this->name;
                 }
 
+                INode *getredirect(void) {
+                    NLib::ScopeSpinlock guard(&this->metalock);
+                    if (!this->redirect) {
+                        return NULL;
+                    }
+                    this->redirect->ref();
+                    return this->redirect;
+                }
+
                 virtual INode *resolvesymlink(void) = 0;
                 virtual ssize_t readlink(char *buf, size_t bufsize) = 0;
 
@@ -433,6 +446,11 @@ namespace NFS {
                     struct stat st;
                     this->stat(&st);
                     return st;
+                }
+
+                void setattr(struct stat attr) {
+                    NLib::ScopeSpinlock guard(&this->metalock);
+                    this->attr = attr;
                 }
 
                 Path getpath(void);
@@ -479,7 +497,7 @@ namespace NFS {
                 virtual int sync(void) = 0; // Called whenever a sync is required.
 
                 // Create a node.
-                virtual INode *create(const char *name, struct stat attr) = 0;
+                virtual ssize_t create(const char *name, INode **nodeout, struct stat attr) = 0;
                 virtual int unlink(const char *path) = 0; // Unlink a node.
         };
 
@@ -517,7 +535,7 @@ namespace NFS {
                 // Resolve node by path.
                 ssize_t resolve(const char *path, INode **nodeout, INode *relativeto = NULL, bool symlink = true);
 
-                INode *create(const char *path, struct stat attr);
+                ssize_t create(const char *path, INode **nodeout, struct stat attr, INode *relativeto = NULL);
                 int unlink(const char *path, INode *relativeto = NULL, int flags = 0, int uid = 0, int gid = 0);
         };
 

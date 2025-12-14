@@ -1,5 +1,5 @@
-#ifndef __DEV__BLOCK_HPP
-#define __DEV__BLOCK_HPP
+#ifndef _DEV__BLOCK_HPP
+#define _DEV__BLOCK_HPP
 
 #include <dev/dev.hpp>
 #include <dev/blockcache.hpp>

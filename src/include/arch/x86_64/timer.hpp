@@ -1,5 +1,5 @@
-#ifndef __ARCH__X86_64__TIMER_HPP
-#define __ARCH__X86_64__TIMER_HPP
+#ifndef _ARCH__X86_64__TIMER_HPP
+#define _ARCH__X86_64__TIMER_HPP
 
 namespace NArch {
     namespace Timer {

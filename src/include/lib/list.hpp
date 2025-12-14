@@ -36,10 +36,18 @@ namespace NLib {
                 }
             }
 
+            void pushfront(T item) {
+                if (this->count < this->capacity) {
+                    this->head = (this->head + this->capacity - 1) % this->capacity;
+                    this->buffer[this->head] = item;
+                    this->count++;
+                }
+            }
+
             T popback(void) {
                 if (this->count > 0) {
                     T item = this->buffer[this->tail];
-                    this->tail = (this->tail - 1) % this->capacity;
+                    this->tail = (this->tail + this->capacity - 1) % this->capacity;
                     this->count--;
                     return item;
                 }
@@ -781,6 +789,10 @@ namespace NLib {
 
                 if (node == this->head) {
                     this->head = node->next; // Adjust head.
+                }
+
+                if (node == this->tail) {
+                    this->tail = node->prev; // Adjust tail.
                 }
 
                 this->length--;

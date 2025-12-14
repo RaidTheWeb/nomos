@@ -31,12 +31,15 @@ namespace NDev {
         this->termios.cc.verase = '\b';
         this->termios.cc.vkill = 0x15;
         this->termios.cc.veof = 0x04;
+        this->termios.cc.vswtch = 0;
         this->termios.cc.vstart = 0x11;
         this->termios.cc.vstop = 0x13;
         this->termios.cc.vsusp = 0x1a;
         this->termios.cc.veol = 0;
         this->termios.cc.vtime = 0;
         this->termios.cc.vreprint = 0x12;
+        this->termios.cc.vdiscard = 0x0f;
+        this->termios.cc.vwerase = 0x17;
         this->termios.cc.vlnext = 0x16;
 
         size_t rows;
@@ -144,6 +147,7 @@ namespace NDev {
         '4',    // KKPAD4
         '5',    // KKPAD5
         '6',    // KKPAD6
+        '7',    // KKPAD7
         '8',    // KKPAD8
         '9',    // KKPAD9
         '*',    // KKPADMUL
@@ -249,6 +253,7 @@ namespace NDev {
         '4',    // KKPAD4
         '5',    // KKPAD5
         '6',    // KKPAD6
+        '7',    // KKPAD7
         '8',    // KKPAD8
         '9',    // KKPAD9
         '*',    // KKPADMUL
@@ -261,7 +266,7 @@ namespace NDev {
 
     void TTY::process(char c, void (*writefn)(const char *, size_t)) {
         bool canwrite = writefn != NULL;
-
+        NUtil::printf("TTY: Processing character 0x%02x ('%c')\n", c, (c >= 32 && c <= 126) ? c : '.');
 
         if (termios.lflag & ISIG) {
             int signal = -1;
@@ -441,10 +446,11 @@ namespace NDev {
                     return -EIO;
                 }
 
-                // Check if SIGTTIN is ignored or blocked.
+                // Check if SIGTTIN is ignored or blocked (per-thread).
+                NSched::Thread *thread = NArch::CPU::get()->currthread;
                 proc->lock.acquire();
                 bool ignored = (NSched::gethandler(&proc->signalstate, SIGTTIN) == SIG_IGN);
-                bool blocked = NSched::isblocked(&proc->signalstate, SIGTTIN);
+                bool blocked = NSched::isblocked(&thread->blocked, SIGTTIN);
                 proc->lock.release();
 
                 if (ignored || blocked) {
@@ -478,11 +484,18 @@ namespace NDev {
             }
 
             // Wait for a full line.
-            waiteventlocked(
+            int ret;
+            waiteventinterruptiblelocked(
                 &this->readwait,
                 hasline(&this->linebuffer, this->termios.cc.veol, this->termios.cc.veof),
-                &this->linelock
+                &this->linelock,
+                ret
             );
+
+            if (ret < 0) {
+                this->linelock.release();
+                return ret; // Interrupted by signal.
+            }
 
             size_t tocopy = this->linebuffer.size();
             if (tocopy > count) { // If there is more data in the line than the user wants, we should only copy out as much the caller wants.
@@ -503,11 +516,18 @@ namespace NDev {
             }
 
             // Wait until we have enough data.
-            waiteventlocked(
+            int ret;
+            waiteventinterruptiblelocked(
                 &this->readwait,
                 this->inbuffer.size() >= this->termios.cc.vmin, // Wait until we have at least VMIN characters.
-                &this->inlock
+                &this->inlock,
+                ret
             );
+
+            if (ret < 0) {
+                this->inlock.release();
+                return ret; // Interrupted by signal.
+            }
 
             size_t toread = this->inbuffer.size();
 
@@ -542,15 +562,16 @@ namespace NDev {
             if (this->termios.lflag & TOSTOP) {
                 // Check if process is in the same session as the TTY.
                 if (this->session && proc->session == this->session) {
-                    // Check if SIGTTOU is ignored or blocked.
+                    // Check if SIGTTOU is ignored or blocked (per-thread).
+                    NSched::Thread *thread = NArch::CPU::get()->currthread;
                     proc->lock.acquire();
                     bool ignored = (NSched::gethandler(&proc->signalstate, SIGTTOU) == SIG_IGN);
-                    bool blocked = NSched::isblocked(&proc->signalstate, SIGTTOU);
+                    bool blocked = NSched::isblocked(&thread->blocked, SIGTTOU);
                     proc->lock.release();
 
                     if (ignored || blocked) {
                         // SIGTTOU is ignored or blocked: allow write to proceed.
-                        goto do_write;
+                        goto dowrite;
                     }
 
                     // Check if process group is orphaned.
@@ -590,7 +611,7 @@ namespace NDev {
             }
         }
 
-do_write:
+dowrite:
 
         if (writefn) {
             writefn(buf, count);
@@ -602,6 +623,44 @@ do_write:
         }
         return count;
     }
+
+    int TTY::poll(short events, short *revents, int fdflags) {
+        (void)fdflags;
+        *revents = 0;
+
+        if ((events & VFS::POLLIN) || (events & VFS::POLLRDNORM)) {
+            if (this->termios.lflag & ICANON) {
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
+                if (hasline(&this->linebuffer, this->termios.cc.veol, this->termios.cc.veof)) {
+                    *revents |= (events & (VFS::POLLIN | VFS::POLLRDNORM));
+                }
+            } else {
+                NLib::ScopeIRQSpinlock guard(&this->inlock);
+                if (this->inbuffer.size() >= this->termios.cc.vmin) {
+                    *revents |= (events & (VFS::POLLIN | VFS::POLLRDNORM));
+                }
+            }
+        }
+
+        if ((events & VFS::POLLOUT) || (events & VFS::POLLWRNORM)) {
+            NLib::ScopeIRQSpinlock guard(&this->outlock);
+            if (!this->outbuffer.full()) {
+                *revents |= (events & (VFS::POLLOUT | VFS::POLLWRNORM));
+            }
+        }
+
+        return 0;
+    }
+
+
+
+
+
+    // Driver implementation begins here.
+
+
+
+
 
     static TTYDevice *ttys[63];
     static size_t currentvt = 1; // Current VT index.
@@ -646,12 +705,17 @@ do_write:
                     .st_blksize = 1024
                 };
 
-                assert(VFS::vfs.create("/dev/tty0", st), "Failed to create device node."); // Create abstract /dev/tty0.
+                VFS::INode *devnode;
+                ssize_t res = VFS::vfs.create("/dev/tty0", &devnode, st);
+                assert(res == 0, "Failed to create device node."); // Create device node.
+                devnode->unref();
 
                 st.st_rdev = CURDEVICEID;
                 // Should be rw by all users. It's not an actual device itself, it just points to the current one.
                 st.st_mode = (VFS::S_IRUSR | VFS::S_IWUSR | VFS::S_IRGRP | VFS::S_IWGRP | VFS::S_IROTH | VFS::S_IWOTH) | VFS::S_IFCHR;
-                assert(VFS::vfs.create("/dev/tty", st), "Failed to create device node."); // Create abstract /dev/tty.
+                res = VFS::vfs.create("/dev/tty", &devnode, st);
+                assert(res == 0, "Failed to create device node."); // Create abstract /dev/tty.
+                devnode->unref();
 
                 for (size_t i = 0; i < MAXTTYS; i++) {
                     uint32_t minor = MINMINOR + i; // Device ID minor.
@@ -669,7 +733,11 @@ do_write:
                     char path[512];
                     NUtil::snprintf(path, sizeof(path), "/dev/tty%lu", minor);
 
-                    assert(VFS::vfs.create(path, st), "Failed to create device node."); // Create device node. This will automatically assign the TTYDevice to the node, and give the TTYDevice reference to its node.
+
+                    VFS::INode *devnode;
+                    ssize_t res = VFS::vfs.create(path, &devnode, st);
+                    assert(res == 0, "Failed to create device node."); // Create device node. This will automatically assign the TTYDevice to the node, and give the TTYDevice reference to its node.
+                    devnode->unref();
                 }
 
                 handler.connect = NULL;
@@ -1087,6 +1155,24 @@ notspecial:
                     }
                 }
                 return -EINVAL;
+            }
+
+            int poll(uint64_t dev, short events, short *revents, int fdflags) override {
+                if (dev == CURDEVICEID) {
+                    VFS::INode *ifnode = this->getctty();
+                    int ret = ifnode->poll(events, revents, fdflags);
+                    ifnode->unref();
+                    return ret;
+                } else if (dev == CURVTDEVICEID) {
+                    return poll(DEVFS::makedev(MAJOR, currentvt), events, revents, fdflags);
+                } else {
+                    uint32_t num = DEVFS::minor(dev) - 1;
+
+                    TTYDevice *tty = ttys[num];
+                    int ret = tty->tty->poll(events, revents, fdflags);
+                    return ret;
+                }
+                return 0;
             }
     };
 

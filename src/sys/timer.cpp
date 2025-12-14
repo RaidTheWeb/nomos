@@ -28,7 +28,7 @@ namespace NSys {
             }
             ticks = current;
             for (size_t i = 0; i < events.getsize(); i++) {
-                if (events[i].expire_time <= ticks) {
+                if (events[i].expiry <= ticks) {
                     OneshotEvent event = events[i];
                     events[i] = events.back();
                     events.resize(events.getsize() - 1);
@@ -40,10 +40,6 @@ namespace NSys {
                 }
             }
             lock.release();
-        }
-
-        void init(void) {
-
         }
     }
 }

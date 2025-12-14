@@ -2,6 +2,7 @@
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/tsc.hpp>
+#include <sys/clock.hpp>
 #include <sys/timer.hpp>
 
 namespace NSched {
@@ -24,7 +25,7 @@ namespace NArch {
 
             uint64_t now = TSC::query();
             uint64_t deadline = CPU::get()->quantumdeadline;
-            if (deadline != 0) { // Deadline of 0 means no quantum expiry.
+            if (deadline != 0) { // Deadline of 0 means no quantum expiry (never reschedules).
                 if (now > deadline) {
                     NSched::schedule(isr, ctx);
                     return;
@@ -33,6 +34,7 @@ namespace NArch {
             rearm();
         }
 
+        // Scheduler timer ISR for the BSP.
         static void timerisr(struct Interrupts::isr *isr, struct CPU::context *ctx) {
             (void)isr;
             (void)ctx;
@@ -56,9 +58,8 @@ namespace NArch {
         }
 
         void init(void) {
-            NSys::Timer::init();
-
             setisr();
+            NSys::Clock::init(); // Initialize clock subsystem after TSC calibration.
             NUtil::printf("[arch/x86_64/timer]: Timer subsystem initialised.\n");
         }
     }

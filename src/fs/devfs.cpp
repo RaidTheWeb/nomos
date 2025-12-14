@@ -1,4 +1,5 @@
 #include <fs/devfs.hpp>
+#include <mm/ucopy.hpp>
 
 namespace NFS {
     namespace DEVFS {
@@ -30,9 +31,16 @@ namespace NFS {
                 return -EINVAL;
             }
 
-            // XXX: Implement path grabbing for symlink target.
-            // Or, just make symlink target a path.
-            return -ENOSYS;
+            size_t tocopy = NLib::strlen(this->symlinktarget);
+            if (bufsiz < tocopy) {
+                tocopy = bufsiz;
+            }
+            ssize_t res = NMem::UserCopy::copyto(buf, this->symlinktarget, tocopy);
+            if (res < 0) {
+                return res;
+            }
+
+            return tocopy;
         }
 
         ssize_t DevNode::readdir(void *buf, size_t count, off_t offset) {
@@ -72,6 +80,13 @@ namespace NFS {
         }
 
         int DevNode::open(int flags) {
+            DevNode *root = (DevNode *)this->fs->getroot();
+            if (this == root) {
+                root->unref();
+                return 0;
+            }
+            root->unref();
+
             if (!this->device) {
                 return -ENODEV;
             }
@@ -80,6 +95,13 @@ namespace NFS {
         }
 
         int DevNode::close(int fdflags) {
+            DevNode *root = (DevNode *)this->fs->getroot();
+            if (this == root) {
+                root->unref();
+                return 0;
+            }
+            root->unref();
+
             if (!this->device) {
                 return -ENODEV;
             }
@@ -87,12 +109,20 @@ namespace NFS {
             return this->device->driver->close(this->attr.st_rdev, fdflags);
         }
 
-        int DevNode::mmap(void *addr, size_t offset, uint64_t flags, int fdflags) {
+        int DevNode::poll(short events, short *revents, int fdflags) {
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->mmap(this->attr.st_rdev, addr, offset, flags, fdflags);
+            return this->device->driver->poll(this->attr.st_rdev, events, revents, fdflags);
+        }
+
+        int DevNode::mmap(void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
+            if (!this->device) {
+                return -ENODEV;
+            }
+
+            return this->device->driver->mmap(this->attr.st_rdev, addr, count, offset, flags, fdflags);
         }
 
         int DevNode::munmap(void *addr, int fdflags) {
@@ -228,7 +258,7 @@ namespace NFS {
             return 0;
         }
 
-        VFS::INode *DevFileSystem::create(const char *name, struct VFS::stat attr) {
+        ssize_t DevFileSystem::create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) {
             NLib::ScopeSpinlock guard(&this->spin);
             attr.st_ino = this->nextinode++;
 
@@ -240,12 +270,14 @@ namespace NFS {
             } else {
                 if (VFS::S_ISDIR(attr.st_mode)) {
                     // Directories can exist without devices.
-                    return dnode;
+                    *nodeout = dnode;
+                    return 0;
                 }
                 delete dnode; // Invalid node.
-                return NULL;
+                return -EINVAL;
             }
-            return dnode;
+            *nodeout = dnode;
+            return 0;
         }
 
         int DevFileSystem::unlink(const char *path) {

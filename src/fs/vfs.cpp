@@ -232,15 +232,26 @@ namespace NFS {
                 }
             }
 
+            if (!current) {
+                return -ENOENT;
+            }
+
+            // Special handling for named pipes (FIFOs).
+            if (current->getredirect()) {
+                INode *redirected = current->getredirect();
+                current->unref();
+                current = redirected; // Follow redirect.
+            }
+
             *nodeout = current;
             return 0;
         }
 
-        INode *VFS::create(const char *path, struct stat attr) {
+        ssize_t VFS::create(const char *path, INode **nodeout, struct stat attr, INode *relativeto) {
             Path pobj = Path(path);
 
             if (!pobj.depth()) {
-                return NULL; // Cannot create root.
+                return -EINVAL; // Cannot create root.
             }
 
             const char *parentpath = pobj.dirname();
@@ -248,24 +259,26 @@ namespace NFS {
             ssize_t res = this->resolve(parentpath, &parent);
             delete parentpath; // Caller is expected to free `dirname()`.
             if (res < 0) {
-                return NULL; // Parent doesn't already exist.
+                return res; // Parent doesn't already exist.
             }
 
             struct mntpoint *mount = this->findmount(&pobj);
             if (!mount) {
                 parent->unref(); // Don't leak parent reference.
-                return NULL; // Invalid mounting point.
+                return -ENOENT; // Invalid mounting point.
             }
 
-            INode *node = mount->fs->create(pobj.basename(), attr);
-            if (!node) {
+            INode *node = NULL;
+            res = mount->fs->create(pobj.basename(), &node, attr);
+            if (res < 0) {
                 parent->unref();
-                return NULL; // Creation failed.
+                return res; // Creation failed.
             }
             parent->add(node);
             parent->unref();
 
-            return node;
+            *nodeout = node;
+            return 0;
         }
 
         int VFS::unlink(const char *path, INode *relativeto, int flags, int uid, int gid) {
@@ -695,7 +708,7 @@ namespace NFS {
             INode *dirnode = NULL;
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
+            proc->lock.acquire();
 
             if (pathbuf[0] == '/') { // Absolute path invalidates dirfd.
                 dirnode = vfs.getroot();
@@ -711,6 +724,7 @@ namespace NFS {
                     FileDescriptor *desc = proc->fdtable->get(dirfd);
                     if (!desc) {
                         delete[] pathbuf;
+                        proc->lock.release();
                         SYSCALL_RET(-EBADF);
                     }
 
@@ -718,6 +732,7 @@ namespace NFS {
                     if (!S_ISDIR(dirnode->getattr().st_mode)) {
                         dirnode->unref();
                         delete[] pathbuf;
+                        proc->lock.release();
                         SYSCALL_RET(-ENOTDIR);
                     }
                 }
@@ -728,21 +743,24 @@ namespace NFS {
             dirnode->unref();
             if (res == -EACCES) { // We don't have permission to traverse the path.
                 delete[] pathbuf;
+                proc->lock.release();
                 SYSCALL_RET(-EACCES); // Propagate access error.
             }
 
             if (res != 0) { // Couldn't find it. Check if there's a reason to create it.
                 if (!(flags & O_CREAT)) {
                     delete[] pathbuf;
+                    proc->lock.release();
                     SYSCALL_RET(res); // Don't bother if there's no create flag.
                 }
                 // Create the node.
                 struct stat attr = { 0 };
                 attr.st_mode = mode;
-                node = vfs.create(pathbuf, attr);
-                if (res != 0) {
+                ssize_t res = vfs.create(pathbuf, &node, attr);
+                if (res < 0) {
                     delete[] pathbuf;
-                    SYSCALL_RET(-EIO); // Generic I/O error.
+                    proc->lock.release();
+                    SYSCALL_RET(res); // Creation failed.
                 }
             }
 
@@ -752,16 +770,13 @@ namespace NFS {
 
             if ((flags & O_DIRECTORY) && !S_ISDIR(st.st_mode)) { // If we're supposed to open a directory, we'd have to verify that the node is a directory.
                 node->unref();
+                proc->lock.release();
                 SYSCALL_RET(-ENOTDIR);
-            }
-
-            if ((flags & O_RDWR) && S_ISFIFO(st.st_mode)) { // Can't open FIFOs in read-write mode.
-                node->unref();
-                SYSCALL_RET(-EINVAL);
             }
 
             if (!vfs.checkaccess(node, flags, proc->euid, proc->egid)) { // Check if current process' effective UID and GID are valid for access the node in this way.
                 node->unref();
+                proc->lock.release();
                 SYSCALL_RET(-EACCES);
             }
 
@@ -771,6 +786,7 @@ namespace NFS {
                 case O_RDONLY:
                     if (flags & O_TRUNC) {
                         node->unref();
+                        proc->lock.release();
                         SYSCALL_RET(-EINVAL); // Can't truncate without write access.
                     }
                     break;
@@ -778,11 +794,13 @@ namespace NFS {
                 case O_RDWR:
                     if (S_ISDIR(st.st_mode)) {
                         node->unref();
+                        proc->lock.release();
                         SYSCALL_RET(-EISDIR); // Can't write to directory.
                     }
                     break;
                 default:
                     node->unref();
+                    proc->lock.release();
                     SYSCALL_RET(-EINVAL);
             }
 
@@ -791,7 +809,21 @@ namespace NFS {
             // }
 
             int fd = proc->fdtable->open(node, flags);
-            node->open(flags); // Trigger open hook.
+            proc->lock.release(); // Release process lock, because open() hooks may sleep.
+            if (fd < 0) {
+                node->unref();
+                SYSCALL_RET(fd); // Propagate error.
+            }
+
+            res = node->open(flags); // Trigger open hook.
+            if (res < 0) {
+                proc->lock.acquire(); // Reacquire process lock to safely modify FD table.
+                proc->fdtable->close(fd); // Clean up FD table entry.
+                proc->lock.release();
+                node->unref();
+                SYSCALL_RET(res); // Open failed.
+            }
+
             node->unref(); // Unreference. FD table will handle the reference.
 
             SYSCALL_RET(fd);
@@ -1459,7 +1491,7 @@ namespace NFS {
         }
 
         extern "C" uint64_t sys_access(int fd, const char *path, size_t len, int mode) {
-            SYSCALL_LOG("sys_access(%d, %p, %lu, %d).\n", fd, path, len, mode);
+            SYSCALL_LOG("sys_access(%d, %s, %lu, %d).\n", fd, path, len, mode);
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
             if (pathsize < 0) {
@@ -1562,9 +1594,10 @@ namespace NFS {
                 .st_mode = S_IFIFO | 0666
             };
 
-            PipeFS::PipeNode *pipe = (PipeFS::PipeNode *)PipeFS::pipefs->create("", attr);
-            if (!pipe) {
-                SYSCALL_RET(-ENOMEM);
+            PipeFS::PipeNode *pipe;
+            ssize_t res = PipeFS::pipefs->create("", (INode **)&pipe, attr);
+            if (res < 0) {
+                SYSCALL_RET(res);
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
@@ -1589,7 +1622,7 @@ namespace NFS {
 
             pipe->unref(); // FD table holds references now.
 
-            int res = NMem::UserCopy::copyto(pipefd, &readfd, sizeof(int));
+            res = NMem::UserCopy::copyto(pipefd, &readfd, sizeof(int));
             if (res < 0) {
                 proc->fdtable->close(readfd);
                 proc->fdtable->close(writefd);
@@ -1768,9 +1801,14 @@ namespace NFS {
                     }
 
                     uint64_t timeoutms = ktmo.tv_sec * 1000 + ktmo.tv_nsec / 1000000;
-                    NSched::sleep(timeoutms);
+                    int ret = NSched::sleep(timeoutms);
+                    if (ret < 0) {
+                        SYSCALL_RET(ret); // Return -EINTR if interrupted.
+                    }
                 } else {
                     // Infinite wait, so just yield (this acts like a sys_pause would).
+
+                    // XXX: Set thread signal mask?
 
                     NArch::CPU::get()->setint(false);
                     // Untracked sleep state, so we won't be woken up until a signal arrives.
@@ -1816,12 +1854,11 @@ namespace NFS {
                 }
             }
 
-            // Apply signal mask for the duration of the poll.
-            NSched::Process *proc = NArch::CPU::get()->currthread->process;
-            proc->lock.acquire();
-            NLib::sigset_t oldmask = proc->signalstate.blocked;
-            proc->signalstate.blocked = ksigmask;
-            proc->lock.release();
+            // Apply signal mask for the duration of the poll (per-thread).
+            NSched::Thread *thread = NArch::CPU::get()->currthread;
+            NSched::Process *proc = thread->process;
+            NLib::sigset_t oldmask = __atomic_load_n(&thread->blocked, memory_order_acquire);
+            __atomic_store_n(&thread->blocked, ksigmask, memory_order_release);
 
             size_t eventcount = 0; // How many fds ended up with non-zero revents.
 
@@ -1836,8 +1873,8 @@ namespace NFS {
 
                     FileDescriptor *desc = proc->fdtable->get(kfds[i].fd);
                     if (!desc) {
-                        // Restore old signal mask before returning.
-                        proc->signalstate.blocked = oldmask;
+                        // Restore old signal mask before returning (per-thread).
+                        __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
                         delete[] kfds;
                         SYSCALL_RET(-EBADF);
                     }
@@ -1848,8 +1885,8 @@ namespace NFS {
                     int res = node->poll(pfd->events, &pfd->revents, desc->getflags());
                     node->unref();
                     if (res < 0) {
-                        // Restore old signal mask before returning.
-                        proc->signalstate.blocked = oldmask;
+                        // Restore old signal mask before returning (per-thread).
+                        __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
                         delete[] kfds;
                         SYSCALL_RET(res);
                     }
@@ -1871,18 +1908,297 @@ namespace NFS {
                         break;
                     }
                     uint64_t timeoutms = ktmo.tv_sec * 1000 + ktmo.tv_nsec / 1000000;
-                    NSched::sleep(timeoutms);
+                    int ret = NSched::sleep(timeoutms);
+                    if (ret < 0) {
+                        // Sleep was interrupted by signal. Restore old mask and return.
+                        __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
+                        SYSCALL_RET(ret);
+                    }
                     break; // After sleeping, we return to userspace to re-poll.
                 }
 
                 NSched::yield(); // Yield to avoid thrashing the CPU.
             }
-            // Restore old signal mask before returning.
-            proc->lock.acquire();
-            proc->signalstate.blocked = oldmask;
-            proc->lock.release();
+            // Restore old signal mask before returning (per-thread).
+            __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
 
             SYSCALL_RET(eventcount);
+        }
+
+        extern "C" uint64_t sys_mknodat(int fd, const char *path, size_t len, int mode, int dev) {
+            SYSCALL_LOG("sys_mknodat(%d, %s, %lu, %o, %d).\n", fd, path, len, mode, dev);
+
+            ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
+            if (pathsize < 0) {
+                SYSCALL_RET(pathsize); // Contains errno.
+            }
+            char *pathbuf = new char[pathsize + 1];
+            if (!pathbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+            int ret = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+            if (ret < 0) {
+                delete[] pathbuf;
+                SYSCALL_RET(ret); // Contains errno.
+            }
+            pathbuf[pathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+            INode *dirnode;
+            if (fd == AT_FDCWD) {
+                dirnode = proc->cwd;
+                if (!dirnode) {
+                    dirnode = vfs.getroot();
+                } else {
+                    dirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(fd);
+                if (!desc) {
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                dirnode = desc->getnode();
+                if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            // Check permissions to create in this directory.
+            bool ok = vfs.checkaccess(dirnode, O_WRONLY | O_EXEC, proc->euid, proc->egid);
+            if (!ok) {
+                dirnode->unref();
+                delete[] pathbuf;
+                proc->lock.release();
+                SYSCALL_RET(-EACCES);
+            }
+
+            // Setup basic attributes, specific filesystems fill in the rest.
+            struct stat attr {
+                .st_mode = mode,
+                .st_uid = proc->euid,
+                .st_gid = proc->egid,
+                .st_rdev = dev
+            };
+
+            INode *nodeout = NULL;
+            ssize_t res = vfs.create(pathbuf, &nodeout, attr, dirnode);
+            dirnode->unref();
+            delete[] pathbuf;
+            proc->lock.release();
+            if (res < 0) {
+                SYSCALL_RET(res);
+            }
+
+            nodeout->unref();
+            SYSCALL_RET(0);
+        }
+
+        extern "C" uint64_t sys_chmod(int fd, const char *path, size_t len, int mode, int flags) {
+            SYSCALL_LOG("sys_chmod(%d, %s, %lu, %o, %d).\n", fd, path, len, mode, flags);
+
+            // FCHMODAT-like syscall, handles fchmodat, fchmod, and chmod.
+
+            ssize_t res = NMem::UserCopy::valid(path, len);
+            if (res < 0) {
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
+            if (pathsize < 0) {
+                SYSCALL_RET(pathsize); // Contains errno.
+            }
+            char *pathbuf = new char[pathsize + 1];
+            if (!pathbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            res = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+            if (res < 0) {
+                delete[] pathbuf;
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            pathbuf[pathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+            INode *dirnode;
+            if (fd == AT_FDCWD) {
+                dirnode = proc->cwd;
+                if (!dirnode) {
+                    dirnode = vfs.getroot();
+                } else {
+                    dirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(fd);
+                if (!desc) {
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                dirnode = desc->getnode();
+                if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            // If AT_EMPTY_PATH is set and path is empty, change mode of dirnode itself.
+            INode *targetnode = NULL;
+            if ((flags & AT_EMPTY_PATH) && pathsize == 0) {
+                targetnode = dirnode;
+                targetnode->ref();
+            } else {
+                res = vfs.resolve(pathbuf, &targetnode, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
+                if (res < 0) {
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(res);
+                }
+            }
+
+            dirnode->unref();
+            delete[] pathbuf;
+            // Check if we have permission to change the mode.
+            bool ok = false;
+            struct stat st = targetnode->getattr();
+            if (proc->euid == 0) {
+                ok = true; // Root can always change mode.
+            } else if (proc->euid == st.st_uid) {
+                ok = true; // Owner can change mode.
+            }
+
+            if (!ok) {
+                targetnode->unref();
+                proc->lock.release();
+                SYSCALL_RET(-EACCES);
+            }
+
+            struct stat newattr = st;
+            newattr.st_mode = (st.st_mode & S_IFMT) | (mode & ~S_IFMT);
+            targetnode->setattr(newattr);
+            targetnode->unref();
+            proc->lock.release();
+            SYSCALL_RET(0);
+        }
+
+        extern "C" uint64_t sys_chown(int fd, const char *path, size_t len, int uid, int gid, int flags) {
+            SYSCALL_LOG("sys_chown(%d, %s, %lu, %d, %d, %d).\n", fd, path, len, uid, gid, flags);
+
+            ssize_t res = NMem::UserCopy::valid(path, len);
+            if (res < 0) {
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
+            if (pathsize < 0) {
+                SYSCALL_RET(pathsize); // Contains errno.
+            }
+            char *pathbuf = new char[pathsize + 1];
+            if (!pathbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            res = NMem::UserCopy::strncpyfrom(pathbuf, path, pathsize);
+            if (res < 0) {
+                delete[] pathbuf;
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            pathbuf[pathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+            INode *dirnode;
+            if (fd == AT_FDCWD) {
+                dirnode = proc->cwd;
+                if (!dirnode) {
+                    dirnode = vfs.getroot();
+                } else {
+                    dirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(fd);
+                if (!desc) {
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                dirnode = desc->getnode();
+                if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            // If AT_EMPTY_PATH is set and path is empty, change owner of dirnode itself.
+            INode *targetnode = NULL;
+            if ((flags & AT_EMPTY_PATH) && pathsize == 0) {
+                targetnode = dirnode;
+                targetnode->ref();
+            } else {
+                res = vfs.resolve(pathbuf, &targetnode, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
+                if (res < 0) {
+                    dirnode->unref();
+                    delete[] pathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(res);
+                }
+            }
+            dirnode->unref();
+            delete[] pathbuf;
+            // Check if we have permission to change the owner.
+            bool ok = false;
+            struct stat st = targetnode->getattr();
+            if (proc->euid == 0) {
+                ok = true; // Root can always change owner.
+            } else if (proc->euid == st.st_uid) {
+                // Non-root can change group to one of their groups.
+                if (gid == -1 || gid == st.st_gid) {
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                targetnode->unref();
+                proc->lock.release();
+                SYSCALL_RET(-EACCES);
+            }
+
+            struct stat newattr = st;
+            if (uid != -1) {
+                newattr.st_uid = uid;
+            }
+            if (gid != -1) {
+                newattr.st_gid = gid;
+            }
+            targetnode->setattr(newattr);
+            targetnode->unref();
+            proc->lock.release();
+            SYSCALL_RET(0);
+        }
+
+        extern "C" uint64_t sys_umask(int newmask) {
+            SYSCALL_LOG("sys_umask(%o).\n", newmask);
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+            int oldmask = proc->umask;
+            proc->umask = newmask & 0777;
+            proc->lock.release();
+
+            SYSCALL_RET(oldmask);
         }
     }
 }

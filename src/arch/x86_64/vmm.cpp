@@ -593,12 +593,29 @@ namespace NArch {
                 for (size_t i = 0; i < size; i += PAGESIZE) {
                     void *page = PMM::alloc(PAGESIZE);
                     if (!page) {
+                        // Free already-allocated pages before unmapping
+                        for (size_t j = 0; j < i; j += PAGESIZE) {
+                            uint64_t *pte = _resolvepte(space, (uintptr_t)addr + j);
+                            if (pte && (*pte & PRESENT)) {
+                                void *phys = (void *)(*pte & ADDRMASK);
+                                PMM::free(phys, PAGESIZE);
+                            }
+                        }
                         _unmaprange(space, (uintptr_t)addr, i);
                         space->vmaspace->free(addr, size);
                         SYSCALL_RET(-ENOMEM);
                     }
                     NLib::memset(hhdmoff(page), 0, PAGESIZE);
                     if (!_mappage(space, (uintptr_t)addr + i, (uintptr_t)page, prottovmm(prot))) {
+                        // Free the page we just allocated plus all previously allocated pages
+                        PMM::free(page, PAGESIZE);
+                        for (size_t j = 0; j < i; j += PAGESIZE) {
+                            uint64_t *pte = _resolvepte(space, (uintptr_t)addr + j);
+                            if (pte && (*pte & PRESENT)) {
+                                void *phys = (void *)(*pte & ADDRMASK);
+                                PMM::free(phys, PAGESIZE);
+                            }
+                        }
                         _unmaprange(space, (uintptr_t)addr, i);
                         space->vmaspace->free(addr, size);
                         SYSCALL_RET(-ENOMEM);
@@ -627,7 +644,7 @@ namespace NArch {
                 // XXX: Dump the ifnode into the vmaspace so we can track during page faults?
 
                 // Get the implementing node to map the region (handled by filesystem or device).
-                int ret = node->mmap(addr, off, prottovmm(prot), flags);
+                int ret = node->mmap(addr, size, off, prottovmm(prot), flags);
 
                 filedesc->unref();
                 node->unref();
@@ -656,6 +673,15 @@ namespace NArch {
             struct addrspace *space = proc->addrspace;
 
             NLib::ScopeIRQSpinlock guard(&space->lock);
+
+            // Free physical pages before unmapping
+            for (size_t i = 0; i < size; i += PAGESIZE) {
+                uint64_t *pte = _resolvepte(space, (uintptr_t)ptr + i);
+                if (pte && (*pte & PRESENT)) {
+                    void *phys = (void *)(*pte & ADDRMASK);
+                    PMM::free(phys, PAGESIZE);
+                }
+            }
 
             _unmaprange(space, (uintptr_t)ptr, size);
             space->vmaspace->free(ptr, size);

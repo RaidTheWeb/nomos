@@ -84,9 +84,11 @@ void kpostarch(void) {
 
     NFS::PipeFS::pipefs = new NFS::PipeFS::PipeFileSystem(&NFS::VFS::vfs); // Create global PipeFS instance.
 
-    NFS::VFS::vfs.create("/dev", (struct NFS::VFS::stat) {
+    NFS::VFS::INode *devnode;
+    NFS::VFS::vfs.create("/dev", &devnode, (struct NFS::VFS::stat) {
         .st_mode = 0755 | NFS::VFS::S_IFDIR
     });
+    devnode->unref();
 
     NDev::setup(); // Initialise device registry.
 

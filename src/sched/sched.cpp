@@ -12,6 +12,7 @@
 #include <mm/ucopy.hpp>
 #include <sched/event.hpp>
 #include <sched/sched.hpp>
+#include <sys/clock.hpp>
 #include <sys/elf.hpp>
 #include <sys/syscall.hpp>
 #include <sys/timer.hpp>
@@ -629,9 +630,8 @@ namespace NSched {
         this->addrspace->ref++; // Reference address space.
         this->addrspace->lock.release();
 
-        // Initialize signal state to defaults (no pending, no blocked, all handlers SIG_DFL).
+        // Initialize signal state to defaults (no pending, all handlers SIG_DFL).
         this->signalstate.pending = 0;
-        this->signalstate.blocked = 0;
         for (size_t i = 0; i < NSIG; i++) {
             this->signalstate.actions[i].handler = SIG_DFL;
             this->signalstate.actions[i].mask = 0;
@@ -757,23 +757,122 @@ namespace NSched {
         // At this point, we've either been rescheduled (if we were running) or marked dead.
     }
 
+    struct sleepstate { // Simple helper struct that avoids UAF.
+        WaitQueue wq;
+        bool completed; // Set to true when thread wakes (either by timer or signal).
+        NArch::Spinlock lock;
+    };
+
     // Timer callback for sleep().
     static void sleepwork(void *arg) {
-        Thread *thread = (Thread *)arg;
-        schedulethread(thread);
+        struct sleepstate *state = (struct sleepstate *)arg;
+
+        state->lock.acquire();
+        if (!state->completed) { // Only bother waking if not already completed (interrupted by signal).
+            state->completed = true;
+            state->lock.release();
+            state->wq.wake();
+        } else {
+            // Thread was interrupted and marked completed. We can't assume it's still around, so just cleanup.
+            state->lock.release();
+            delete state;
+        }
     }
 
-    void sleep(uint64_t ms) {
-        Thread *current = CPU::get()->currthread;
+    int sleep(uint64_t ms) {
+        if (ms == 0) {
+            return 0;
+        }
+
+        // Allocate sleep state on heap so it survives even if we wake early.
+        struct sleepstate *state = new sleepstate();
+        state->completed = false;
+
         NSys::Timer::timerlock();
-        NArch::CPU::get()->setint(false); // Disable interrupts to prevent preemption during this critical section.
-
-        __atomic_store_n(&current->tstate, Thread::state::WAITING, memory_order_release);
-        NSys::Timer::create(sleepwork, current, ms); // XXX: Figure out how to ENSURE we don't get preempted before the yield().
-
+        NSys::Timer::create(sleepwork, state, ms);
         NSys::Timer::timerunlock();
-        NArch::CPU::get()->setint(true); // Re-enable interrupts.
-        yield();
+
+        // Wait interruptibly. If a signal arrives, this will return -EINTR.
+        int ret = state->wq.waitinterruptible();
+
+        // Mark that we've completed (either by signal or timer).
+        state->lock.acquire();
+        if (!state->completed) {
+            // Mark completed so timer callback knows to cleanup.
+            state->completed = true;
+            state->lock.release();
+        } else {
+            // Timer woke us up normally. We cleanup.
+            state->lock.release();
+            delete state;
+        }
+
+        return ret;
+    }
+
+    // XXX: Only guaranteed millisecond precision, as we convert from timespec to milliseconds.
+    extern "C" ssize_t sys_sleep(struct NSys::Clock::timespec *req, struct NSys::Clock::timespec *rem) {
+        SYSCALL_LOG("sys_sleep(%p, %p)\n", req, rem);
+
+        if (!req) {
+            SYSCALL_RET(-EFAULT);
+        }
+
+        // Copy timespec from userspace.
+        struct NSys::Clock::timespec kreq;
+        if (NMem::UserCopy::copyfrom(&kreq, req, sizeof(struct NSys::Clock::timespec)) < 0) {
+            SYSCALL_RET(-EFAULT);
+        }
+
+        // Validate timespec.
+        if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || kreq.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
+            SYSCALL_RET(-EINVAL);
+        }
+
+        // Convert to milliseconds, rounding up.
+        uint64_t ms = (uint64_t)kreq.tv_sec * NSys::Clock::MSEC_PER_SEC;
+        uint64_t ns_to_ms = (kreq.tv_nsec + 999999) / 1000000; // Round up nanoseconds to milliseconds.
+        ms += ns_to_ms;
+
+        // Record start time if we need to compute remaining time.
+        struct NSys::Clock::timespec start_time;
+        if (rem) {
+            NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+            if (clock && clock->gettime(&start_time) < 0) {
+                SYSCALL_RET(-EFAULT);
+            }
+        }
+
+        // Perform sleep.
+        int ret = sleep(ms);
+
+        // If interrupted and rem is provided, calculate remaining time.
+        if (ret == -EINTR && rem) {
+            struct NSys::Clock::timespec end_time;
+            NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+            if (clock && clock->gettime(&end_time) == 0) {
+                // Calculate elapsed time in nanoseconds.
+                uint64_t elapsed_ns = ((uint64_t)end_time.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)end_time.tv_nsec) -
+                                      ((uint64_t)start_time.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)start_time.tv_nsec);
+
+                // Calculate requested time in nanoseconds.
+                uint64_t requested_ns = (uint64_t)kreq.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)kreq.tv_nsec;
+
+                // Calculate remaining time.
+                uint64_t remaining_ns = (elapsed_ns < requested_ns) ? (requested_ns - elapsed_ns) : 0;
+
+                struct NSys::Clock::timespec krem;
+                krem.tv_sec = remaining_ns / NSys::Clock::NSEC_PER_SEC;
+                krem.tv_nsec = remaining_ns % NSys::Clock::NSEC_PER_SEC;
+
+                if (NMem::UserCopy::copyto(rem, &krem, sizeof(struct NSys::Clock::timespec)) < 0) {
+                    // If we can't copy the remaining time, we still return -EINTR.
+                    // POSIX allows this behavior.
+                }
+            }
+        }
+
+        SYSCALL_RET(ret);
     }
 
     void Mutex::acquire(void) {
@@ -822,7 +921,12 @@ namespace NSched {
 
             {
                 NLib::ScopeIRQSpinlock guard(&proc->lock);
-                proc->exitstatus = (status << 16) | (sig & 0xff);
+                if (sig != 0) {
+                    // If we're exiting due to a signal, encode that in exit status.
+                    proc->exitstatus = (sig & 0x7f);
+                } else { // Normal exit.
+                    proc->exitstatus = (status & 0xff) << 8;
+                }
 
             }
         }
@@ -852,6 +956,9 @@ namespace NSched {
 
         // Allocate thread ID.
         this->id = __atomic_fetch_add(&this->process->tidcounter, 1, memory_order_seq_cst);
+
+        // Initialize per-thread signal mask to 0 (no signals blocked).
+        this->blocked = 0;
 
         // Zero context.
         NLib::memset(&this->ctx, 0, sizeof(this->ctx));
@@ -1013,6 +1120,7 @@ namespace NSched {
         child->sgid = current->sgid;
         child->uid = current->uid;
         child->gid = current->gid;
+        child->umask = current->umask;
 
         // Establish child<->parent relationship between processes.
         child->parent = current;
@@ -1048,7 +1156,7 @@ namespace NSched {
             child->signalstate.actions[i] = current->signalstate.actions[i];
         }
         child->signalstate.pending = 0; // Pending signals are NOT inherited.
-        child->signalstate.blocked = current->signalstate.blocked; // Copy signal mask.
+        cthread->blocked = __atomic_load_n(&NArch::CPU::get()->currthread->blocked, memory_order_acquire); // Copy calling thread's signal mask to child thread.
 
         NSched::schedulethread(cthread);
 
@@ -1759,9 +1867,20 @@ namespace NSched {
             }
         } else {
             // Blocking wait.
-            waiteventlocked(&current->exitwq,
+            int ret;
+            waiteventinterruptiblelocked(&current->exitwq,
                 (zombie = findchild(current, pid, true)) != NULL,
-                &current->lock);
+                &current->lock,
+                ret);
+            if (ret < 0) {
+                // Even if interrupted, check if a zombie appeared.
+                zombie = findchild(current, pid, true);
+                if (!zombie) {
+                    current->lock.release();
+                    SYSCALL_RET(ret); // Interrupted and no zombie.
+                }
+                // Fall through to reap the zombie.
+            }
         }
 
         zombie->lock.acquire();
@@ -1942,5 +2061,50 @@ namespace NSched {
         }
 
         SYSCALL_RET(0);
+    }
+
+    struct timespec {
+        long tv_sec;
+        long tv_nsec;
+    };
+
+    #define FUTEX_WAIT      0
+    #define FUTEX_WAKE      1
+
+    extern "C" ssize_t sys_futex(int *ptr, int op, int expected, struct timespec *timeout) {
+        SYSCALL_LOG("sys_futex(%p, %d, %u, %p).\n", ptr, op, expected, timeout);
+
+        SYSCALL_RET(0); // TODO: Implement futexes.
+    }
+
+    extern "C" ssize_t sys_newthread(void *entry, void *stack) {
+        SYSCALL_LOG("sys_newthread(%p, %p).\n", entry, stack);
+
+        Process *proc = NArch::CPU::get()->currthread->process;
+
+        Thread *newthread = new Thread(proc, NSched::DEFAULTSTACKSIZE);
+        if (!newthread) {
+            SYSCALL_RET(-ENOMEM);
+        }
+
+        newthread->ctx.rip = (uint64_t)entry;
+        newthread->ctx.rsp = (uint64_t)stack;
+
+        NUtil::printf("Scheduling new thread %u in process %u with entry %p and stack %p.\n", newthread->id, proc->id, entry, stack);
+
+        NSched::schedulethread(newthread);
+        SYSCALL_RET(newthread->id);
+    }
+
+    extern "C" ssize_t sys_exitthread(void) {
+        SYSCALL_LOG("sys_exitthread().\n");
+
+        // Mark ourselves as dead and yield.
+        NArch::CPU::get()->setint(false);
+        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release);
+        NArch::CPU::get()->setint(true);
+        yield();
+
+        __builtin_unreachable();
     }
 }

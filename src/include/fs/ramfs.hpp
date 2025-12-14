@@ -14,7 +14,7 @@ namespace NFS {
                 NSched::Mutex datalock; // Lock for data access.
             public:
 
-                RAMNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr) : VFS::INode(fs, name, attr) { }
+                RAMNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr);
 
                 ~RAMNode(void) {
                     delete this->name;
@@ -63,7 +63,7 @@ namespace NFS {
                 int umount(void) override;
                 int sync(void) override { return 0; }
 
-                VFS::INode *create(const char *name, struct VFS::stat attr) override;
+                ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
                 int unlink(const char *path) override;
         };
     }

@@ -1,5 +1,5 @@
-#ifndef __SYS__TIMER_HPP
-#define __SYS__TIMER_HPP
+#ifndef _SYS__TIMER_HPP
+#define _SYS__TIMER_HPP
 
 #include <stdint.h>
 
@@ -10,12 +10,12 @@ namespace NSys {
             public:
                 void (*callback)(void *);
                 void *arg;
-                uint64_t expire_time;
+                uint64_t expiry;
 
-                OneshotEvent(void (*callback)(void *), void *arg, uint64_t expire_time) {
+                OneshotEvent(void (*callback)(void *), void *arg, uint64_t expiry) {
                     this->callback = callback;
                     this->arg = arg;
-                    this->expire_time = expire_time;
+                    this->expiry = expiry;
                 }
 
                 void trigger(void) {
@@ -29,9 +29,9 @@ namespace NSys {
         void timerlock(void);
         void timerunlock(void);
 
+        // Create a new one-shot timer event, duration is not guaranteed to be exact, as the timer sometimes does its best to avoid doing any work.
         void create(void (*callback)(void *), void *arg, uint64_t duration);
         void update(uint64_t current);
-        void init(void);
     }
 }
 

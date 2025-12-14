@@ -500,7 +500,10 @@ namespace NDev {
         };
         char namebuf[64];
         NUtil::snprintf(namebuf, sizeof(namebuf), "/dev/nvme%un%u", ctrl->num, ns->nsnum + 1);
-        assert(VFS::vfs.create(namebuf, st), "Failed to create NVMe block device node.");
+        VFS::INode *devnode;
+        ssize_t res = VFS::vfs.create(namebuf, &devnode, st);
+        assert(res == 0, "Failed to create NVMe block device node.");
+        devnode->unref();
 
         struct parttableinfo *ptinfo = getpartinfo(nsblkdev);
         if (ptinfo) {
@@ -518,7 +521,9 @@ namespace NDev {
                 );
                 registry->add(partblkdev);
 
-                assert(VFS::vfs.create(namebuf, st), "Failed to create NVMe partition block device node.");
+                res = VFS::vfs.create(namebuf, &devnode, st);
+                assert(res == 0, "Failed to create NVMe partition block device node.");
+                devnode->unref();
             }
         }
     }

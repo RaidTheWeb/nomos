@@ -69,7 +69,8 @@ namespace NFS {
                 ssize_t readlink(char *buf, size_t bufsiz) override;
                 int open(int flags) override;
                 int close(int fdflags) override;
-                int mmap(void *addr, size_t offset, uint64_t flags, int fdflags) override;
+                int poll(short events, short *revents, int fdflags) override;
+                int mmap(void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) override;
                 int munmap(void *addr, int fdflags) override;
                 int ioctl(unsigned long request, uint64_t arg) override;
                 int stat(struct VFS::stat *st) override;
@@ -98,7 +99,7 @@ namespace NFS {
                 int mount(const char *path, VFS::INode *mntnode) override;
                 int sync(void) override;
                 int umount(void) override;
-                VFS::INode *create(const char *name, struct VFS::stat attr) override;
+                ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
                 int unlink(const char *path) override;
         };
     }

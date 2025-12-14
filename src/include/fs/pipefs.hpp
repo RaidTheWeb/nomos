@@ -1,5 +1,5 @@
-#ifndef __FS__PIPEFS_HPP
-#define __FS__PIPEFS_HPP
+#ifndef _FS__PIPEFS_HPP
+#define _FS__PIPEFS_HPP
 
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
@@ -8,17 +8,27 @@
 
 namespace NFS {
     namespace PipeFS {
-        #define PIPEBUFSIZE (16 * NArch::PAGESIZE)
+        #define PIPEBUFSIZE (16 * NArch::PAGESIZE) // Total pipe buffer capacity.
+        #define PIPE_BUF 4096 // Writes <= PIPE_BUF are atomic.
 
         class PipeNode : public VFS::INode {
             private:
                 NArch::Spinlock datalock;
-                NSched::WaitQueue wq;
+                NSched::WaitQueue readwq; // Queue for readers waiting for data/writers.
+                NSched::WaitQueue writewq; // Queue for writers waiting for space/readers.
+
+                // Effectively just "event" wait queues for open() calls, because we never check conditions.
+                NSched::WaitQueue writeopenwq;
+                // Effectively just "event" wait queues for open() calls, because we never check conditions.
+                NSched::WaitQueue readopenwq;
+
                 NLib::CircularBuffer<uint8_t> databuffer;
                 size_t writers = 0;
                 size_t readers = 0;
+
+                bool file = false; // Is this a FIFO special file? We don't block when opening pipes that aren't FIFOs.
             public:
-                PipeNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr);
+                PipeNode(VFS::IFileSystem *fs, const char *name, struct VFS::stat attr, bool file = false);
 
                 ~PipeNode(void) {
                     delete this->name;
@@ -50,6 +60,7 @@ namespace NFS {
                 VFS::INode *resolvesymlink(void) override {
                     return NULL;
                 }
+                int poll(short events, short *revents, int fdflags) override;
 
                 bool empty(void) override {
                     return true;
@@ -63,7 +74,7 @@ namespace NFS {
                     struct VFS::stat attr = (struct VFS::stat) {
                         .st_mode = 0666 | VFS::S_IFIFO,
                     };
-                    this->root = new PipeNode(this, "", attr);
+                    this->root = new PipeNode(this, "", attr, false);
                 }
 
                 int mount(const char *path, VFS::INode *mntnode) override {
@@ -79,12 +90,13 @@ namespace NFS {
                 // TODO: FIFO files creating their corresponding PipeNode instances.
                 // Maybe when initialising a filesystem, we create PipeNode hardlinks for each FIFO file...
                 // This would mean we'd need a specialised "abstracted" hard link purely in the VFS, just for stuff like this.
-                VFS::INode *create(const char *name, struct VFS::stat attr) override {
+                ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override {
                     if (!VFS::S_ISFIFO(attr.st_mode)) {
-                        return NULL; // Only FIFOs supported.
+                        return -EINVAL; // Only FIFOs supported.
                     }
 
-                    return new PipeNode(this, name, attr);
+                    *nodeout = new PipeNode(this, name, attr, false);
+                    return 0;
                 }
 
                 int unlink(const char *path) override {

@@ -23,7 +23,6 @@ namespace NSched {
 
     // Default actions for each signal number.
     static const enum dflactions dflactions[] = {
-        DFL_IGNORE,                 // RSVD
         DFL_TERMINATE,              // SIGHUP
         DFL_TERMINATE,              // SIGINT
         DFL_TERMINATE,              // SIGQUIT
@@ -66,12 +65,15 @@ namespace NSched {
             return; // Invalid signal number.
         }
 
+        // Used when indexing into actions array.
+        uint8_t signo = sig - 1;
+
         Process *proc = thread->process;
-        struct sigaction *action = &proc->signalstate.actions[sig];
+        struct sigaction *action = &proc->signalstate.actions[signo];
 
         // Handle default actions.
         if (action->handler == SIG_DFL) {
-            enum dflactions dflact = dflactions[sig];
+            enum dflactions dflact = dflactions[signo];
             switch (dflact) {
                 case DFL_IGNORE:
                     return; // Do nothing.
@@ -87,15 +89,16 @@ namespace NSched {
         } else if (action->handler == SIG_IGN) {
             return; // Explicitly ignored.
         } else {
+            NUtil::printf("Run handler %p.\n", action->handler);
 #ifdef __x86_64__
-            // Save old signal mask to restore later.
-            uint64_t oldmask = proc->signalstate.blocked;
+            // Save old signal mask to restore later (per-thread).
+            uint64_t oldmask = __atomic_load_n(&thread->blocked, memory_order_acquire);
 
-            // Block additional signals during handler execution.
-            proc->signalstate.blocked |= action->mask;
+            // Block additional signals during handler execution (per-thread).
+            __atomic_fetch_or(&thread->blocked, action->mask, memory_order_acq_rel);
             // Always block the signal being handled (unless SA_NODEFER is set).
             if (!(action->flags & SA_NODEFER)) {
-                setblocked(&proc->signalstate, sig);
+                setblocked(&thread->blocked, sig);
             }
 
             // Check if we have a restorer (required for proper signal return).
@@ -163,15 +166,21 @@ namespace NSched {
 
         Thread *currthread = NArch::CPU::get()->currthread;
         if (!currthread || !currthread->process || currthread->process->kernel) {
+            if (caller == NSched::POSTSYSCALL) {
+                NArch::CPU::get()->intstatus = true; // Restore interrupt status for syscall context.
+            }
             return; // Don't deliver signals to kernel threads or if no thread context.
         }
 
         Process *proc = currthread->process;
         NLib::ScopeIRQSpinlock guard(&proc->lock);
 
-        // Find highest priority pending unblocked signal.
-        uint64_t deliverable = proc->signalstate.pending & ~proc->signalstate.blocked;
+        // Find highest priority pending unblocked signal (check thread mask).
+        uint64_t deliverable = proc->signalstate.pending & ~__atomic_load_n(&currthread->blocked, memory_order_acquire);
         if (deliverable == 0) {
+            if (caller == NSched::POSTSYSCALL) {
+                NArch::CPU::get()->intstatus = true; // Restore interrupt status for syscall context.
+            }
             return; // No signals to deliver.
         }
 
@@ -201,7 +210,7 @@ namespace NSched {
 
         // Return old action if requested.
         if (oact) {
-            int ret = NMem::UserCopy::copyto(oact, &proc->signalstate.actions[sig], sizeof(struct sigaction));
+            int ret = NMem::UserCopy::copyto(oact, &proc->signalstate.actions[sig - 1], sizeof(struct sigaction));
             if (ret < 0) {
                 SYSCALL_RET(ret);
             }
@@ -214,7 +223,7 @@ namespace NSched {
             if (ret < 0) {
                 SYSCALL_RET(ret);
             }
-            proc->signalstate.actions[sig] = newact;
+            proc->signalstate.actions[sig - 1] = newact;
         }
 
         SYSCALL_RET(0);
@@ -295,10 +304,10 @@ namespace NSched {
             SYSCALL_RET(ret);
         }
 
-        // Restore signal mask.
+        // Restore signal mask (per-thread).
         NLib::ScopeIRQSpinlock guard(&proc->lock);
-        proc->signalstate.blocked = frame.oldmask;
-        proc->signalstate.blocked &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        __atomic_store_n(&thread->blocked, frame.oldmask, memory_order_release);
+        __atomic_fetch_and(&thread->blocked, ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1))), memory_order_acq_rel); // Ensure SIGKILL and SIGSTOP are unblocked.
 
         struct NArch::CPU::context *ctx = &frame.ctx;
 
@@ -339,18 +348,19 @@ namespace NSched {
     extern "C" int sys_sigprocmask(int how, NLib::sigset_t *set, NLib::sigset_t *oldset) {
         SYSCALL_LOG("sys_sigprocmask(%d, %p, %p).\n", how, set, oldset);
 
-        Process *proc = NArch::CPU::get()->currthread->process;
+        Thread *thread = NArch::CPU::get()->currthread;
+        Process *proc = thread->process;
         NLib::ScopeIRQSpinlock guard(&proc->lock);
 
-        // Return old signal mask if requested.
+        // Return old signal mask if requested (per-thread).
         if (oldset) {
-            int ret = NMem::UserCopy::copyto(oldset, &proc->signalstate.blocked, sizeof(uint64_t));
+            int ret = NMem::UserCopy::copyto(oldset, &thread->blocked, sizeof(uint64_t));
             if (ret < 0) {
                 SYSCALL_RET(ret);
             }
         }
 
-        // Modify signal mask if requested.
+        // Modify signal mask if requested (per-thread).
         if (set) {
             uint64_t newset;
             int ret = NMem::UserCopy::copyfrom(&newset, set, sizeof(uint64_t));
@@ -363,13 +373,13 @@ namespace NSched {
 
             switch (how) {
                 case SIG_BLOCK:
-                    proc->signalstate.blocked |= newset;
+                    __atomic_fetch_or(&thread->blocked, newset, memory_order_acq_rel);
                     break;
                 case SIG_UNBLOCK:
-                    proc->signalstate.blocked &= ~newset;
+                    __atomic_fetch_and(&thread->blocked, ~newset, memory_order_acq_rel);
                     break;
                 case SIG_SETMASK:
-                    proc->signalstate.blocked = newset;
+                    __atomic_store_n(&thread->blocked, newset, memory_order_release);
                     break;
                 default:
                     SYSCALL_RET(-EINVAL);
@@ -388,20 +398,43 @@ namespace NSched {
         // Set pending bit for signal.
         setpending(&proc->signalstate, sig);
 
-        if (isblocked(&proc->signalstate, sig)) {
-            return 0; // Signal is blocked, don't wake up any threads.
-        }
+        // Find a thread to deliver the signal to.
+        Thread *paused_candidate = NULL;
 
-        // Wake up one of the process' threads to handle the signal.
         NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
         for (; it.valid(); it.next()) {
             Thread *thread = *it.get();
-            // Wake the first waiting thread we find.
-            // XXX: Is there a better way of doing this?
-            if (thread && __atomic_load_n(&thread->tstate, memory_order_acquire) == Thread::PAUSED) {
-                NSched::schedulethread(thread);
-                break;
+            if (!thread) continue;
+
+            // Check if this thread has the signal blocked (safe under process lock).
+            if (isblocked(&thread->blocked, sig)) {
+                continue; // This thread has the signal blocked, try next thread.
             }
+
+            enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+            // Prefer threads that are already running or ready.
+            if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
+                // Signal will be delivered when this thread next checks for pending signals.
+                return 0;
+            }
+
+            // Remember first paused thread as candidate.
+            if (state == Thread::PAUSED && !paused_candidate) {
+                paused_candidate = thread;
+            }
+
+            if (state == Thread::WAITINGINT && thread->waitingon) { // Only interruptible waits can be woken.
+                WaitQueue *wq = thread->waitingon;
+                wq->dequeue(thread);
+                NSched::schedulethread(thread);
+                return 0;
+            }
+        }
+
+        // If we found a paused thread, wake it up.
+        if (paused_candidate) {
+            NSched::schedulethread(paused_candidate);
         }
 
         return 0;
@@ -412,6 +445,7 @@ namespace NSched {
             return -EINVAL;
         }
 
+        NUtil::printf("[sched/signal] Sending signal %u to process group %u.\n", sig, pgrp->id);
         NLib::ScopeIRQSpinlock guard(&pgrp->lock);
 
         // Signal all processes in the group.
@@ -419,6 +453,7 @@ namespace NSched {
         for (; it.valid(); it.next()) {
             Process *proc = *it.get();
             if (proc) {
+                NUtil::printf("[sched/signal] Signaling process %u in group %u with signal %u.\n", proc->id, pgrp->id, sig);
                 signalproc(proc, sig);
             }
         }
@@ -431,9 +466,42 @@ namespace NSched {
             return -EINVAL;
         }
 
-        // XXX: Figure out how the hell to do per-thread signals properly.
+        Process *proc = thread->process;
+        NLib::ScopeIRQSpinlock guard(&proc->lock);
 
-        return signalproc(thread->process, sig);
+        // Set pending bit for signal at process level.
+        setpending(&proc->signalstate, sig);
+
+        // Check if the target thread has this signal blocked.
+        if (isblocked(&thread->blocked, sig)) {
+            // Signal is blocked in this thread, it will remain pending.
+            return 0;
+        }
+
+        // Check thread state and wake if necessary.
+        enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+        if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
+            // Thread is already active, signal will be delivered when it checks.
+            return 0;
+        }
+
+        if (state == Thread::PAUSED) {
+            // Wake the paused thread so it can handle the signal.
+            // Paused threads are not in waitqueues, so this is safe.
+            NSched::schedulethread(thread);
+            return 0;
+        }
+
+        if (state == Thread::WAITING && thread->waitingon) {
+            // Dequeue from waitqueue and wake the thread.
+            WaitQueue *wq = thread->waitingon;
+            wq->dequeue(thread);
+            NSched::schedulethread(thread);
+            return 0;
+        }
+
+        return 0;
     }
 
 }

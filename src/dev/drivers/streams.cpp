@@ -36,19 +36,25 @@ namespace NDev {
                     .st_blksize = 4096
                 };
 
-                VFS::vfs.create("/dev/null", st);
+                VFS::INode *devnode;
+                VFS::vfs.create("/dev/null", &devnode, st);
+                devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, ZEROMINOR);
-                VFS::vfs.create("/dev/zero", st);
+                VFS::vfs.create("/dev/zero", &devnode, st);
+                devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, FULLMINOR);
-                VFS::vfs.create("/dev/full", st);
+                VFS::vfs.create("/dev/full", &devnode, st);
+                devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, RANDOMMINOR);
-                VFS::vfs.create("/dev/random", st);
+                VFS::vfs.create("/dev/random", &devnode, st);
+                devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, URANDOMMINOR);
-                VFS::vfs.create("/dev/urandom", st);
+                VFS::vfs.create("/dev/urandom", &devnode, st);
+                devnode->unref();
             }
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {
@@ -63,6 +69,13 @@ namespace NDev {
                     case ZEROMINOR:
                     case FULLMINOR: { // Both of these provide zeroes on read.
                         NLib::memset(buf, 0, count); // Reading device simply wants us to fill the buffer with zeroes.
+                        return count;
+                    }
+                    // XXX: Implement proper random data generation.
+                    case RANDOMMINOR:
+                    case URANDOMMINOR: {
+                        // For now, just fill with zeroes.
+                        NLib::memset(buf, 0, count);
                         return count;
                     }
 

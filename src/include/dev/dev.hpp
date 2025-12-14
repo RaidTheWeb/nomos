@@ -138,8 +138,14 @@ namespace NDev {
                 (void)fdflags;
                 return 0;
             }
-//            XXX: virtual int poll(uint32_t minor, ...)
-            virtual int mmap(uint64_t dev, void *addr, size_t offset, uint64_t flags, int fdflags) {
+            virtual int poll(uint64_t dev, short events, short *revents, int fdflags) {
+                (void)dev;
+                (void)events;
+                (void)revents;
+                (void)fdflags;
+                return -EINVAL;
+            }
+            virtual int mmap(uint64_t dev, void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
                 (void)dev;
                 (void)addr;
                 (void)offset;

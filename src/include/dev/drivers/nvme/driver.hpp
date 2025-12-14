@@ -26,7 +26,7 @@ namespace NDev {
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override;
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override;
 
-            int mmap(uint64_t dev, void *addr, size_t offset, uint64_t flags, int fdflags) override;
+            int mmap(uint64_t dev, void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) override;
             int munmap(uint64_t dev, void *addr, int fdflags) override;
     };
 

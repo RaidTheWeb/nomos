@@ -84,14 +84,17 @@ namespace NDev {
                 uint8_t veof; // Ctrl+D.
                 uint8_t vtime; // Non-canon read timeout.
                 uint8_t vmin; // Minimum for non-canon read.
+                uint8_t vswtch; // Switch character.
                 uint8_t vstart; // CTRL+Q.
                 uint8_t vstop; // CTRL+S.
                 uint8_t vsusp; // CTRL+Z.
                 uint8_t veol; // EOL alt.
                 uint8_t vreprint; // CTRL+R.
+                uint8_t vdiscard; // CTRL+O.
                 uint8_t vwerase; // CTRL+W.
                 uint8_t vlnext; // CTRL+V.
                 uint8_t veol2;
+                uint8_t padding[17];
             };
 
             struct termios {
@@ -135,6 +138,7 @@ namespace NDev {
             ssize_t read(char *buf, size_t count, int fdflags);
             // Write character, with driver write.
             ssize_t write(const char *buf, size_t count, int fdflags, void (*writefn)(const char *str, size_t count));
+            int poll(short events, short *revents, int fdflags);
 
             // NOTE: The TTY provides no way to manage writing to it. This is driver/implementation specific and should be handled separately.
     };

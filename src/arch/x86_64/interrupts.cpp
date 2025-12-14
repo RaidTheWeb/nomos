@@ -122,6 +122,7 @@ namespace NArch {
                     space->lock.release();
                     // Send SIGSEGV for non-present page in userspace.
                     if (is_userspace) {
+                        NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: non-present page.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, addr);
                         NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
                         return;
                     }
@@ -162,7 +163,7 @@ namespace NArch {
                     return;
                 }
 pffault:
-                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", ctx->err & (1 << 2) ? NArch::CPU::get()->currthread->process->id : 0);
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", NArch::CPU::get()->currthread->process->id);
                 sig = SIGSEGV;
             } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);

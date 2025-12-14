@@ -1,5 +1,5 @@
-#ifndef __MM__VMALLOC_HPP
-#define __MM__VMALLOC_HPP
+#ifndef _MM__VMALLOC_HPP
+#define _MM__VMALLOC_HPP
 
 #ifdef __x86_64__
 #include <arch/x86_64/sync.hpp>

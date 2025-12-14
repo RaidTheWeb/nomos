@@ -170,8 +170,21 @@ namespace NSched {
             // Atomic wait on condition with external Mutex held.
             void waitlocked(NSched::Mutex *lock);
 
+            // Interruptible wait that returns -EINTR if a signal is pending. Takes an optional parameter specifying whether the wait queue lock is already held.
+            int waitinterruptible(bool locked = false);
+            // Atomic interruptible wait on condition with external IRQSpinlock held. Returns -EINTR if interrupted.
+            int waitinterruptiblelocked(NArch::IRQSpinlock *lock);
+            // Atomic interruptible wait on condition with external Spinlock held. Returns -EINTR if interrupted.
+            int waitinterruptiblelocked(NArch::Spinlock *lock);
+            // Atomic interruptible wait on condition with external Mutex held. Returns -EINTR if interrupted.
+            int waitinterruptiblelocked(NSched::Mutex *lock);
+
             // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
             void wake(void);
+
+            // Dequeue a specific thread from the waitqueue (used by signal delivery).
+            // Returns true if the thread was found and removed.
+            bool dequeue(Thread *thread);
     };
 
     class Process {
@@ -209,6 +222,9 @@ namespace NSched {
             // Real UID and GID. Who launched the program?
             int uid = 0;
             int gid = 0;
+
+            // Default file creation mask.
+            int umask = 022;
 
             NArch::IRQSpinlock lock;
 
@@ -262,6 +278,7 @@ namespace NSched {
                 READY, // Ready for scheduling.
                 SUSPENDED, // Sitting in the running queue, but not currently running (yielding for another thread).
                 WAITING, // Waiting on something like a mutex/wait queue.
+                WAITINGINT, // Interruptible waiting on something like a mutex/wait queue.
                 PAUSED, // Paused via SIGSTOP or awaiting via sys_pause.
                 RUNNING, // Currently running.
                 DEAD // Thread exited.
@@ -290,6 +307,9 @@ namespace NSched {
 
             bool migratedisabled = false; // Outright prevent migration of this thread. NOTE: Useful for critical sections that use per-CPU data (i.e. driver interrupt handler registration).
             size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
+
+            NLib::sigset_t blocked = 0; // Signals blocked in this thread.
+            WaitQueue *waitingon = NULL; // Waitqueue this thread is sleeping on (if any).
 
             // Called every timeslice, updates weighted vruntime for later scheduling prioritisation.
             void setvruntime(uint64_t delta) {
@@ -372,10 +392,10 @@ namespace NSched {
     void schedulethread(Thread *thread);
 
     // Voluntarily relinquish access to the CPU. The yielding thread will be rewarded with more opportunities to make up the runtime it lost while yielding.
-    void yield(void);
+    void yield();
 
-    // Sleep for a given number of milliseconds.
-    void sleep(uint64_t ms);
+    // Sleep for a given number of milliseconds. Returns -EINTR if interrupted by a signal, 0 on successful completion.
+    int sleep(uint64_t ms);
 
     // Exit a kernel thread. REQUIRED for ending kernel threads that return eventually.
     void exit(int status, int sig = 0);

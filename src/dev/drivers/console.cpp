@@ -34,7 +34,10 @@ namespace NDev {
                     .st_blksize = 1024
                 };
 
-                assert(VFS::vfs.create("/dev/console", st), "Failed to create device node.\n");
+                VFS::INode *devnode;
+                ssize_t res = VFS::vfs.create("/dev/console", &devnode, st);
+                assert(res == 0, "Failed to create device node.\n");
+                devnode->unref();
 
                 const char *target = NArch::cmdline.get("syscon");
                 if (!target) {
@@ -79,6 +82,17 @@ namespace NDev {
                 this->devlock.acquire();
                 this->targetnode->ref();
                 int ret = this->targetnode->ioctl(request, arg);
+                this->targetnode->unref();
+                this->devlock.release();
+                return ret;
+            }
+
+            int poll(uint64_t dev, short events, short *revents, int fdflags) override {
+                assert(dev == DEVICEID, "Invalid device given to console driver.\n");
+
+                this->devlock.acquire();
+                this->targetnode->ref();
+                int ret = this->targetnode->poll(events, revents, fdflags);
                 this->targetnode->unref();
                 this->devlock.release();
                 return ret;
