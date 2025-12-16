@@ -238,10 +238,9 @@ namespace NSys {
             struct timespec ts = { 0, 0 };
             int rtcres = NArch::RTC::gettime(&ts);
             if (rtcres == 0 && (ts.tv_sec != 0 || ts.tv_nsec != 0)) {
-                NUtil::printf("[sys/clock]: RTC returned time: %ld s, %ld ns\n", ts.tv_sec, ts.tv_nsec);
                 realtimeclock.settime(&ts);
             } else {
-                NUtil::printf("[sys/clock]: RTC not available (error %d), starting from epoch\n", rtcres);
+                NUtil::printf("[sys/clock]: RTC not available (error %d), starting from epoch.\n", rtcres);
             }
             coarserealtimeclock.initclock(tscfreq, tscnow);
 
@@ -276,7 +275,6 @@ namespace NSys {
                     break;
                 case CLOCK_GET:
                     res = clk->gettime(&kts);
-                    NUtil::printf("Clock gettime returned %d { secs = %ld, nsecs = %ld }.\n", res, kts.tv_sec, kts.tv_nsec);
                     break;
                 case CLOCK_SET:
                     res = clk->settime(&kts);

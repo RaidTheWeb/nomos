@@ -143,29 +143,155 @@ namespace NMem {
             } else if (start > root->start) { // Higher addresses are found in right hand side (Ditto.)
                 root->right = this->remove(root->right, start); // Ditto.
             } else { // Matches our range allocation.
-                if (!root->left || !root->right) { // Possesses one or no children, no more nodes to search, remove it.
-                    struct vmanode *tmp = root->left ? root->left : root->right; // Figure out whatever is left.
+                // Case 1: Node with zero or one child
+                if (!root->left) {
+                    struct vmanode *tmp = root->right;
                     delete root;
-                    return tmp; // Return NULL or remaining child.
+                    return tmp;
+                }
+                if (!root->right) {
+                    struct vmanode *tmp = root->left;
+                    delete root;
+                    return tmp;
                 }
 
-                // Otherwise: Two children exist, we'll have to manage this.
-                struct vmanode *tmp = root->right;
-                while (tmp->left) {
-                    tmp = tmp->left; // Traverse the entirety of the left hand side to the right child of root.
-                }
+                // Case 2: Node with two children
+                // Find the in-order successor (minimum in right subtree)
+                struct vmanode *successor = this->findmin(root->right);
 
-                // Copy data to root, then delete the right hand side.
-                root->start = tmp->start;
-                root->end = tmp->end;
-                root->used = tmp->used;
-                root->flags = tmp->flags;
+                // Copy successor's data to root (in-place replacement)
+                root->start = successor->start;
+                root->end = successor->end;
+                root->used = successor->used;
+                root->flags = successor->flags;
+                // Don't copy maxend or height - they'll be recalculated
 
-                root->right = this->remove(root->right, tmp->start);
+                // Recursively remove the successor from right subtree
+                root->right = this->remove(root->right, successor->start);
             }
 
             this->updatenode(root); // Force update on root (recalculate based on children, we removed something, so the heights and max end may have changed).
             return this->balancenode(root); // Rebalance root, based on updates.
+        }
+
+        struct vmanode *VMASpace::findmin(struct vmanode *node) {
+            if (!node) {
+                return NULL;
+            }
+            while (node->left) {
+                node = node->left;
+            }
+            return node;
+        }
+
+        struct vmanode *VMASpace::findmax(struct vmanode *node) {
+            if (!node) {
+                return NULL;
+            }
+            while (node->right) {
+                node = node->right;
+            }
+            return node;
+        }
+
+        struct vmanode *VMASpace::findsuccessor(struct vmanode *root, uintptr_t start) {
+            struct vmanode *current = root;
+            struct vmanode *target = NULL;
+            struct vmanode *successor = NULL;
+
+            // First find the target node
+            while (current) {
+                if (current->start == start) {
+                    target = current;
+                    break;
+                }
+                if (start < current->start) {
+                    current = current->left;
+                } else {
+                    current = current->right;
+                }
+            }
+
+            if (!target) {
+                return NULL;
+            }
+
+            // If right subtree exists, successor is leftmost node in right subtree
+            if (target->right) {
+                return this->findmin(target->right);
+            }
+
+            // Otherwise, successor is the lowest ancestor whose left child is also ancestor of target
+            current = root;
+            while (current) {
+                if (start < current->start) {
+                    successor = current;
+                    current = current->left;
+                } else if (start > current->start) {
+                    current = current->right;
+                } else {
+                    break;
+                }
+            }
+
+            return successor;
+        }
+
+        struct vmanode *VMASpace::findpredecessor(struct vmanode *root, uintptr_t start) {
+            struct vmanode *current = root;
+            struct vmanode *target = NULL;
+            struct vmanode *predecessor = NULL;
+
+            // First find the target node
+            while (current) {
+                if (current->start == start) {
+                    target = current;
+                    break;
+                }
+                if (start < current->start) {
+                    current = current->left;
+                } else {
+                    current = current->right;
+                }
+            }
+
+            if (!target) {
+                return NULL;
+            }
+
+            // If left subtree exists, predecessor is rightmost node in left subtree
+            if (target->left) {
+                return this->findmax(target->left);
+            }
+
+            // Otherwise, predecessor is the lowest ancestor whose right child is also ancestor of target
+            current = root;
+            while (current) {
+                if (start < current->start) {
+                    current = current->left;
+                } else if (start > current->start) {
+                    predecessor = current;
+                    current = current->right;
+                } else {
+                    break;
+                }
+            }
+
+            return predecessor;
+        }
+
+        struct vmanode *VMASpace::findexact(struct vmanode *root, uintptr_t start) {
+            while (root) {
+                if (start == root->start) {
+                    return root;
+                }
+                if (start < root->start) {
+                    root = root->left;
+                } else {
+                    root = root->right;
+                }
+            }
+            return NULL;
         }
 
         struct vmanode *VMASpace::newnode(uintptr_t start, uintptr_t end, bool used) {
@@ -193,26 +319,55 @@ namespace NMem {
             delete node;// Finally, destroy the node allocation.
         }
 
-        void VMASpace::findadj(struct vmanode *root, struct vmanode *target, struct vmanode **prev, struct vmanode **next) {
-            *prev = NULL;
-            *next = NULL;
+        void VMASpace::mergeadjacent(uintptr_t start, uintptr_t end) {
+            // Keep track of the current region being processed.
+            uintptr_t currentstart = start;
+            uintptr_t currentend = end;
 
-            struct vmanode *current = root;
-
-            while (current) {
-                if (current != target) {
-                    if (current->end == target->start && !current->used) {
-                        *prev = current; // End of this node is the beginning of our target, this means it's the node before it.
-                    } else if (target->end == current->start && !current->used) {
-                        *next = current; // Start of this node is the end of our target, this means it's the node after it.
-                    }
+            // Try to merge with predecessor (node immediately before).
+            struct vmanode *pred = this->findpredecessor(this->root, currentstart);
+            if (pred && !pred->used && pred->end == currentstart) {
+                struct vmanode *current = this->findexact(this->root, currentstart);
+                if (!current) {
+                    return; // Safety check.
                 }
 
-                if (target->start < current->start) {
-                    current = current->left;
-                } else {
-                    current = current->right;
+                uintptr_t predstart = pred->start;
+                uintptr_t currentend_val = current->end;
+                uint8_t flags = current->flags;
+
+                this->root = this->remove(this->root, predstart);
+                this->root = this->remove(this->root, currentstart);
+
+                // Insert merged node.
+                struct vmanode *merged = this->newnode(predstart, currentend_val, false);
+                merged->flags = flags;
+                this->root = this->insert(this->root, merged);
+
+                currentstart = predstart;
+                currentend = currentend_val;
+            }
+
+            // Try to merge with successor (node immediately after).
+            // Must re-find after potential previous merge.
+            struct vmanode *succ = this->findsuccessor(this->root, currentstart);
+            if (succ && !succ->used && currentend == succ->start) {
+                struct vmanode *current = this->findexact(this->root, currentstart);
+                if (!current) {
+                    return; // Safety check.
                 }
+
+                uintptr_t succstart = succ->start;
+                uintptr_t succend = succ->end;
+                uint8_t flags = current->flags;
+
+                this->root = this->remove(this->root, currentstart);
+                this->root = this->remove(this->root, succstart);
+
+                // Insert merged node.
+                struct vmanode *merged = this->newnode(currentstart, succend, false);
+                merged->flags = flags;
+                this->root = this->insert(this->root, merged);
             }
         }
 
@@ -314,16 +469,72 @@ namespace NMem {
 
             *last = root->end;
 
-            if (balancefactor(root) > 1) {
+            int bf = balancefactor(root);
+            if (bf > 1 || bf < -1) {
                 assert(false, "Unbalanced node.\n");
             }
 
             this->validate(root->right, last);
         }
 
+        bool VMASpace::verifyavl(struct vmanode *node) {
+            if (!node) {
+                return true;
+            }
+
+            // Verify height is correct.
+            int leftheight = height(node->left);
+            int rightheight = height(node->right);
+            int expectedheight = 1 + MAX(leftheight, rightheight);
+
+            if (node->height != expectedheight) {
+                NUtil::printf("Height mismatch at node [%p->%p]: expected %d, got %d\n", node->start, node->end, expectedheight, node->height);
+                return false;
+            }
+
+            // Verify balance factor is within bounds.
+            int bf = balancefactor(node);
+            if (bf < -1 || bf > 1) {
+                NUtil::printf("Invalid balance factor at node [%p->%p]: %d\n", node->start, node->end, bf);
+                return false;
+            }
+
+            // Verify maxend is correct
+            uintptr_t expectedmaxend = node->end;
+            if (node->left && node->left->maxend > expectedmaxend) {
+                expectedmaxend = node->left->maxend;
+            }
+            if (node->right && node->right->maxend > expectedmaxend) {
+                expectedmaxend = node->right->maxend;
+            }
+
+            if (node->maxend != expectedmaxend) {
+                NUtil::printf("Maxend mismatch at node [%p->%p]: expected %p, got %p\n", node->start, node->end, expectedmaxend, node->maxend);
+                return false;
+            }
+
+            // Verify left children have lower addresses.
+            if (node->left && node->left->start >= node->start) {
+                NUtil::printf("BST violation: left child [%p->%p] >= parent [%p->%p]\n", node->left->start, node->left->end, node->start, node->end);
+                return false;
+            }
+
+            // Verify right children have higher addresses.
+            if (node->right && node->right->start <= node->start) {
+                NUtil::printf("BST violation: right child [%p->%p] <= parent [%p->%p]\n", node->right->start, node->right->end, node->start, node->end);
+                return false;
+            }
+
+            // Recursively verify subtrees.
+            return this->verifyavl(node->left) && this->verifyavl(node->right);
+        }
+
         void VMASpace::validate(void) {
             uintptr_t last = 0;
             this->validate(this->root, &last);
+            if (!this->verifyavl(this->root)) {
+                assert(false, "AVL tree verification failed.\n");
+            }
             NUtil::printf("Valid AVL tree.\n");
         }
 
@@ -475,7 +686,8 @@ namespace NMem {
                     count++;
                 }
 
-                nodes[count] = this->newnode(start, end, true);
+                // Mark freed region as free.
+                nodes[count] = this->newnode(start, end, false);
                 nodes[count]->flags = tofree->flags;
                 count++;
 
@@ -491,42 +703,29 @@ namespace NMem {
                     this->root = this->insert(this->root, nodes[i]);
                 }
 
-                this->free(ptr, size);
-                return;
-            }
+                // Now find the middle node we just inserted and merge it with adjacent free nodes.
+                tofree = NULL;
+                current = this->root;
+                while (current) {
+                    if (current->start == start && current->end == end) {
+                        tofree = current;
+                        break;
+                    }
+                    if (start < current->start) {
+                        current = current->left;
+                    } else {
+                        current = current->right;
+                    }
+                }
 
-            tofree->used = false; // Set to free.
-            this->updatenode(tofree); // Recompute balancing prerequisites.
-
-            struct vmanode *prev = NULL;
-            struct vmanode *next = NULL;
-            this->findadj(this->root, tofree, &prev, &next); // Call the helper function to find adjacent nodes within the tree.
-
-            // These will be replaced if there are adjacent nodes, and we'll use that to know if we should modify the origin region.
-            struct vmanode *merged = tofree;
-            bool changed = false;
-            uintptr_t mergedstart = tofree->start;
-            uintptr_t mergedend = tofree->end;
-
-            if (prev) {
-                mergedstart = prev->start;
-                this->root = this->remove(this->root, prev->start); // Remove this node, we're treating it as the start of the new region.
-            }
-
-            if (next) {
-                mergedend = next->end;
-                this->root = this->remove(this->root, next->start); // Remove this node, we're treating it as the end of the new region.
-            }
-
-            if (mergedstart != tofree->start || mergedend != tofree->end) { // Did we find any adjacent node?
-                this->root = this->remove(this->root, tofree->start); // If so, OBLITERATE ourselves.
-                merged = this->newnode(mergedstart, mergedend, false); // Initialise the new node that occupies our new region.
-                changed = true; // Have we made a new node?
-            }
-
-            if (changed) {
-                // Insert this new node.
-                this->root = this->insert(this->root, merged);
+                if (!tofree) {
+                    NUtil::printf("[vma/free]: WARNING: couldn't re-find freed node\n");
+                    return;
+                }
+                this->mergeadjacent(start, end);
+            } else {
+                tofree->used = false; // Set to free.
+                this->mergeadjacent(tofree->start, tofree->end);
             }
         }
     }

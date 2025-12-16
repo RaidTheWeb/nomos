@@ -100,7 +100,7 @@ namespace NFS {
                 int sync(void) override;
                 int umount(void) override;
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
-                int unlink(const char *path) override;
+                int unlink(VFS::INode *node, VFS::INode *parent) override;
         };
     }
 }

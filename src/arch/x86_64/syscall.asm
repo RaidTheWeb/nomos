@@ -55,6 +55,14 @@ extern sys_chmod
 extern sys_chown
 extern sys_umask
 extern sys_sleep
+extern sys_sethostname
+extern sys_sigaltstack
+extern sys_ftruncate
+extern sys_sync
+extern sys_fsync
+extern sys_sigpending
+extern sys_getitimer
+extern sys_setitimer
 
 MAXSYSCALLS equ 256
 
@@ -113,6 +121,14 @@ syscall_table:
     dq sys_chown
     dq sys_umask
     dq sys_sleep
+    dq sys_sethostname
+    dq sys_sigaltstack
+    dq sys_ftruncate
+    dq sys_sync
+    dq sys_fsync
+    dq sys_sigpending
+    dq sys_getitimer
+    dq sys_setitimer
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

@@ -17,30 +17,31 @@ namespace NDev {
     using namespace NFS;
 
     TTY::TTY(void) : inbuffer(4096), outbuffer(4096), linebuffer(1024) {
-        // Initialise termios with defaults.
-        this->termios.iflag = ICRNL | IXON;
-        this->termios.oflag = ONLCR | OPOST;
-        this->termios.cflag = 0;
-        this->termios.lflag = ECHO | ICANON | ISIG | ECHOE | ECHOK;
+        // Initialise termios with defaults (similar to Linux defaults).
+        this->termios.iflag = ICRNL | IXON | IMAXBEL;
+        this->termios.oflag = OPOST | ONLCR;
+        this->termios.cflag = CREAD | CS8 | CLOCAL; // Enable receiver, 8-bit chars, ignore modem
+        this->termios.lflag = ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
         this->termios.ibaud = 38400;
         this->termios.obaud = 38400;
         this->termios.line = 0;
         this->termios.cc.vmin = 1;
-        this->termios.cc.vintr = 0x03;
-        this->termios.cc.vquit = 0x1c;
-        this->termios.cc.verase = '\b';
-        this->termios.cc.vkill = 0x15;
-        this->termios.cc.veof = 0x04;
+        this->termios.cc.vintr = 0x03;    // ^C
+        this->termios.cc.vquit = 0x1c;    // ^\
+        this->termios.cc.verase = 0x7f;   // DEL (more common than ^H)
+        this->termios.cc.vkill = 0x15;    // ^U
+        this->termios.cc.veof = 0x04;     // ^D
         this->termios.cc.vswtch = 0;
-        this->termios.cc.vstart = 0x11;
-        this->termios.cc.vstop = 0x13;
-        this->termios.cc.vsusp = 0x1a;
+        this->termios.cc.vstart = 0x11;   // ^Q
+        this->termios.cc.vstop = 0x13;    // ^S
+        this->termios.cc.vsusp = 0x1a;    // ^Z
         this->termios.cc.veol = 0;
         this->termios.cc.vtime = 0;
-        this->termios.cc.vreprint = 0x12;
-        this->termios.cc.vdiscard = 0x0f;
-        this->termios.cc.vwerase = 0x17;
-        this->termios.cc.vlnext = 0x16;
+        this->termios.cc.vreprint = 0x12; // ^R
+        this->termios.cc.vdiscard = 0x0f; // ^O
+        this->termios.cc.vwerase = 0x17;  // ^W
+        this->termios.cc.vlnext = 0x16;   // ^V
+        this->termios.cc.veol2 = 0;
 
         size_t rows;
         size_t cols;
@@ -282,6 +283,16 @@ namespace NDev {
             }
 
             if (signal >= 0) {
+                // POSIX: Unless NOFLSH is set, flush input and output queues.
+                if (!(this->termios.lflag & NOFLSH)) {
+                    NLib::ScopeIRQSpinlock guard1(&this->linelock);
+                    NLib::ScopeIRQSpinlock guard2(&this->outlock);
+                    NLib::ScopeIRQSpinlock guard3(&this->inlock);
+                    this->linebuffer.clear();
+                    this->inbuffer.clear();
+                    // Note: Some implementations also clear outbuffer here.
+                }
+
                 if (this->fpgrp) {
                     // Signal the foreground process group.
                     NSched::signalpgrp(this->fpgrp, signal);
@@ -316,22 +327,38 @@ namespace NDev {
                 }
                 return;
             } else if (c == this->termios.cc.vkill) {
-                if (this->termios.lflag & ECHO) {
-                    if (this->termios.lflag & ECHOK) {
-                        NLib::ScopeIRQSpinlock guard(&this->outlock);
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
+                size_t linesize = this->linebuffer.size();
 
+                if (this->termios.lflag & ECHO) {
+                    NLib::ScopeIRQSpinlock guard2(&this->outlock);
+                    if (this->termios.lflag & ECHOKE) {
+                        // ECHOKE: Visually erase the line by backspacing over each character.
+                        for (size_t i = 0; i < linesize; i++) {
+                            this->outbuffer.push('\b');
+                            this->outbuffer.push(' ');
+                            this->outbuffer.push('\b');
+                            if (canwrite) {
+                                writefn("\b \b", 3);
+                            }
+                        }
+                    } else if (this->termios.lflag & ECHOK) {
+                        // ECHOK: Echo ^U and newline.
                         this->outbuffer.push('^');
                         this->outbuffer.push(this->termios.cc.vkill + 0x40);
                         this->outbuffer.push('\n');
                         if (canwrite) {
                             char cc[3];
-                            cc[0]  = '^';
+                            cc[0] = '^';
                             cc[1] = this->termios.cc.vkill + 0x40;
                             cc[2] = '\n';
                             writefn(cc, 3);
                         }
                     }
                 }
+
+                // Actually clear the line buffer.
+                this->linebuffer.clear();
                 return;
             } else if (c == this->termios.cc.veof) {
                 // Forced to flush output to buffer, there's nothing left.
@@ -374,11 +401,23 @@ namespace NDev {
                 this->linebuffer.push(c);
                 bool shouldecho = (this->termios.lflag & ECHO) || (!(this->termios.lflag & ECHO) && (this->termios.lflag & ECHONL) && (c == '\n'));
                 if (shouldecho) {
-                    if (canwrite) {
-                        writefn(&c, 1);
+                    // ECHOCTL: Echo control characters as ^X (except TAB, NL, and START/STOP chars).
+                    if ((this->termios.lflag & ECHOCTL) && c < 32 && c != '\t' && c != '\n' &&
+                        c != this->termios.cc.vstart && c != this->termios.cc.vstop) {
+                        char ctrl[2] = { '^', (char)(c + 0x40) };
+                        if (canwrite) {
+                            writefn(ctrl, 2);
+                        }
+                        NLib::ScopeIRQSpinlock guard(&this->outlock);
+                        this->outbuffer.push(ctrl[0]);
+                        this->outbuffer.push(ctrl[1]);
+                    } else {
+                        if (canwrite) {
+                            writefn(&c, 1);
+                        }
+                        NLib::ScopeIRQSpinlock guard(&this->outlock);
+                        this->outbuffer.push(c);
                     }
-                    NLib::ScopeIRQSpinlock guard(&this->outlock);
-                    this->outbuffer.push(c);
                 }
             // }
         } else {
@@ -613,14 +652,51 @@ namespace NDev {
 
 dowrite:
 
-        if (writefn) {
-            writefn(buf, count);
+        // Apply output processing if OPOST is set.
+        if (this->termios.oflag & OPOST) {
+            // Process each character according to output flags.
+            for (size_t i = 0; i < count; i++) {
+                char c = buf[i];
+
+                // OLCUC: Map lowercase to uppercase.
+                if ((this->termios.oflag & OLCUC) && c >= 'a' && c <= 'z') {
+                    c = c - 'a' + 'A';
+                }
+
+                // ONLCR: Map NL to CR-NL.
+                if ((this->termios.oflag & ONLCR) && c == '\n') {
+                    if (writefn) {
+                        writefn("\r\n", 2);
+                    }
+                    NLib::ScopeIRQSpinlock guard(&this->outlock);
+                    this->outbuffer.push('\r');
+                    this->outbuffer.push('\n');
+                    continue;
+                }
+
+                // OCRNL: Map CR to NL.
+                if ((this->termios.oflag & OCRNL) && c == '\r') {
+                    c = '\n';
+                }
+
+                if (writefn) {
+                    writefn(&c, 1);
+                }
+                NLib::ScopeIRQSpinlock guard(&this->outlock);
+                this->outbuffer.push(c);
+            }
+        } else {
+            // No output processing, write raw.
+            if (writefn) {
+                writefn(buf, count);
+            }
+
+            NLib::ScopeIRQSpinlock guard(&this->outlock);
+            for (size_t i = 0; i < count; i++) {
+                this->outbuffer.push(buf[i]);
+            }
         }
 
-        NLib::ScopeIRQSpinlock guard(&this->outlock);
-        for (size_t i = 0; i < count; i++) {
-            outbuffer.push(buf[i]);
-        }
         return count;
     }
 
@@ -1144,14 +1220,140 @@ notspecial:
                             ret = NMem::UserCopy::copyto((void *)arg, &tty->tty->winsize, sizeof(struct TTY::winsize));
                             tty->devlock.release();
                             return ret;
-                        case TTY::ioctls::TIOCSWINSZ:
+                        case TTY::ioctls::TIOCSWINSZ: {
                             if (!arg) {
                                 tty->devlock.release();
                                 return -EINVAL;
                             }
+                            struct TTY::winsize oldsize = tty->tty->winsize;
                             ret = NMem::UserCopy::copyfrom(&tty->tty->winsize, (void *)arg, sizeof(struct TTY::winsize));
+                            if (ret >= 0) {
+                                // POSIX: Send SIGWINCH to foreground process group if size changed.
+                                if ((oldsize.row != tty->tty->winsize.row || oldsize.col != tty->tty->winsize.col) &&
+                                    tty->tty->fpgrp) {
+                                    NSched::signalpgrp(tty->tty->fpgrp, SIGWINCH);
+                                }
+                            }
                             tty->devlock.release();
                             return ret;
+                        }
+
+                        case TTY::ioctls::TIOCNOTTY: {
+                            // Give up the controlling terminal.
+                            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+                            // Process must be session leader to give up ctty this way.
+                            proc->lock.acquire();
+                            bool is_session_leader = proc->session && proc->session->id == proc->id;
+                            NSched::Session *proc_session = proc->session;
+                            proc->lock.release();
+
+                            if (!is_session_leader) {
+                                tty->devlock.release();
+                                return -EPERM;
+                            }
+
+                            // Check that this is actually the controlling terminal.
+                            if (tty->tty->session != proc_session) {
+                                tty->devlock.release();
+                                return -ENOTTY;
+                            }
+
+                            // Dissociate.
+                            tty->tty->session = NULL;
+                            tty->tty->fpgrp = NULL;
+                            if (proc_session) {
+                                proc_session->ctty = 0;
+                            }
+                            __atomic_store_n(&proc->tty, 0, memory_order_relaxed);
+
+                            tty->devlock.release();
+                            return 0;
+                        }
+
+                        case TTY::ioctls::TIOCGSID: {
+                            // Get session ID of the TTY.
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+
+                            // Caller must be in the same session as the TTY.
+                            if (!tty->tty->session || !proc->session || proc->session != tty->tty->session) {
+                                tty->devlock.release();
+                                return -ENOTTY;
+                            }
+
+                            int sid = (int)tty->tty->session->id;
+                            ret = NMem::UserCopy::copyto((void *)arg, &sid, sizeof(sid));
+                            tty->devlock.release();
+                            return ret;
+                        }
+
+                        case TTY::ioctls::FIONREAD: {
+                            // Get number of bytes available for reading (TIOCINQ is alias).
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            int count = 0;
+                            if (tty->tty->termios.lflag & TTY::ICANON) {
+                                NLib::ScopeIRQSpinlock guard(&tty->tty->linelock);
+                                count = (int)tty->tty->linebuffer.size();
+                            } else {
+                                NLib::ScopeIRQSpinlock guard(&tty->tty->inlock);
+                                count = (int)tty->tty->inbuffer.size();
+                            }
+
+                            ret = NMem::UserCopy::copyto((void *)arg, &count, sizeof(count));
+                            tty->devlock.release();
+                            return ret;
+                        }
+
+                        case TTY::ioctls::TIOCOUTQ: {
+                            // Get number of bytes in output buffer.
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            NLib::ScopeIRQSpinlock guard(&tty->tty->outlock);
+                            int count = (int)tty->tty->outbuffer.size();
+
+                            ret = NMem::UserCopy::copyto((void *)arg, &count, sizeof(count));
+                            tty->devlock.release();
+                            return ret;
+                        }
+
+                        case TTY::ioctls::TCXONC: {
+                            // Flow control operations.
+                            tty->devlock.release();
+                            return 0;
+                        }
+
+                        case TTY::ioctls::TCSBRK: {
+                            // Send break. For virtual terminals, this is essentially a no-op.
+                            tty->devlock.release();
+                            return 0;
+                        }
+
+                        case TTY::ioctls::TTYNAME:
+                            if (!arg) {
+                                tty->devlock.release();
+                                return -EINVAL;
+                            }
+
+                            {
+                                char namebuf[32];
+                                NUtil::snprintf(namebuf, sizeof(namebuf), "/dev/tty%u", DEVFS::minor(tty->id));
+
+                                ret = NMem::UserCopy::copyto((void *)arg, namebuf, NLib::strlen(namebuf) + 1);
+                                tty->devlock.release();
+                                return ret;
+                            }
                     }
                 }
                 return -EINVAL;

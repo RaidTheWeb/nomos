@@ -78,6 +78,18 @@ namespace NMem {
                 // Remove a node from a root tree, by allocation start address.
                 struct vmanode *remove(struct vmanode *root, uintptr_t start);
 
+                // Find minimum node in subtree (leftmost).
+                struct vmanode *findmin(struct vmanode *node);
+
+                // Find maximum node in subtree (rightmost).
+                struct vmanode *findmax(struct vmanode *node);
+
+                // Find in-order successor of a node by start address.
+                struct vmanode *findsuccessor(struct vmanode *root, uintptr_t start);
+
+                // Find in-order predecessor of a node by start address.
+                struct vmanode *findpredecessor(struct vmanode *root, uintptr_t start);
+
                 // Initialise new node.
                 struct vmanode *newnode(uintptr_t start, uintptr_t end, bool used);
 
@@ -87,11 +99,17 @@ namespace NMem {
                 // Find the node that contains a specific desired region.
                 struct vmanode *containing(struct vmanode *root, uintptr_t start, uintptr_t end);
 
+                // Find exact node by start address.
+                struct vmanode *findexact(struct vmanode *root, uintptr_t start);
+
                 // Validate nodes.
                 void validate(struct vmanode *root, uintptr_t *last);
 
-                // Find adjacent nodes.
-                void findadj(struct vmanode *root, struct vmanode *target, struct vmanode **prev, struct vmanode **next);
+                // Verify AVL tree properties (heights, balance factors).
+                bool verifyavl(struct vmanode *node);
+
+                // Merge adjacent free nodes after freeing.
+                void mergeadjacent(uintptr_t start, uintptr_t end);
 
             public:
                 struct vmanode *getroot(void) {

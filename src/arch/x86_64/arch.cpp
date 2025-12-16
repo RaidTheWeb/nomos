@@ -164,7 +164,7 @@ namespace NArch {
 
         VMM::setup();
 
-        // Test VMA.
+        // Test VMA basic allocation/deallocation.
         uintptr_t test = (uintptr_t)VMM::kspace.vmaspace->alloc(4096, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
         void *p = PMM::alloc(4096);
         *((uint8_t *)((uintptr_t)p + NLimine::hhdmreq.response->offset)) = 0xab;

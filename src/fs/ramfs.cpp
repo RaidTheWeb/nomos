@@ -69,6 +69,24 @@ namespace NFS {
             return count;
         }
 
+        int RAMNode::truncate(off_t length) {
+            this->datalock.acquire();
+
+            if (length < 0) {
+                this->datalock.release();
+                return -EINVAL;
+            }
+
+            this->data = (uint8_t *)NMem::allocator.realloc(this->data, length);
+            assert(this->data || length == 0, "Failed to truncate file data.\n");
+
+            this->attr.st_size = length;
+            this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
+
+            this->datalock.release();
+            return 0;
+        }
+
         ssize_t RAMNode::readlink(char *buf, size_t bufsiz) {
             this->datalock.acquire();
 
@@ -96,11 +114,55 @@ namespace NFS {
 
             size_t bytesread = 0;
             size_t curroffset = 0;
-            NLib::HashMap<RAMNode *>::Iterator it = this->children.begin();
+            size_t reclen = sizeof(struct VFS::dirent);
 
+            // Add "." entry.
+            if (curroffset >= (size_t)offset) {
+                if (bytesread + reclen > count) {
+                    return bytesread;
+                }
+                struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
+                dentry->d_ino = this->attr.st_ino;
+                dentry->d_off = bytesread + reclen;
+                dentry->d_reclen = (uint16_t)reclen;
+                dentry->d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
+                dentry->d_name[0] = '.';
+                bytesread += reclen;
+            }
+            curroffset += reclen;
+
+            // Add ".." entry.
+            if (curroffset >= (size_t)offset) {
+                if (bytesread + reclen > count) {
+                    return bytesread;
+                }
+                struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
+
+                INode *root = this->fs->getroot();
+                if (root == this) {
+                    dentry->d_ino = this->attr.st_ino; // Parent of root is root.
+                } else if (this->parent) {
+                    dentry->d_ino = this->parent->getattr().st_ino;
+                } else {
+                    dentry->d_ino = 0; // No parent.
+                }
+                root->unref();
+
+                dentry->d_off = bytesread + reclen;
+                dentry->d_reclen = (uint16_t)reclen;
+                dentry->d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
+                dentry->d_name[0] = '.';
+                dentry->d_name[1] = '.';
+                bytesread += reclen;
+            }
+            curroffset += reclen;
+
+            // Add regular entries:
+            NLib::HashMap<RAMNode *>::Iterator it = this->children.begin();
             while (it.valid()) {
                 RAMNode *child = *it.value();
-                size_t reclen = sizeof(struct VFS::dirent);
                 if (curroffset >= (size_t)offset) {
                     if (bytesread + reclen > count) {
                         break; // No more space.
@@ -172,7 +234,13 @@ namespace NFS {
             RAMNode *rnode = (RAMNode *)node;
 
             node->setparent(this); // Ensure the node knows we're its parent.
-            this->children.insert(rnode->name, rnode);
+            this->children.insert(rnode->getname(), rnode);
+
+            // If adding a directory, increment parent's st_nlink for the '..' entry.
+            if (VFS::S_ISDIR(node->getattr().st_mode)) {
+                this->attr.st_nlink++;
+            }
+
             return true;
         }
 
@@ -181,6 +249,15 @@ namespace NFS {
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false; // Non-directories possess no children.
+            }
+
+            // Need to check if we're removing a directory to decrement st_nlink.
+            RAMNode **child = this->children.find(name);
+            if (child && VFS::S_ISDIR((*child)->attr.st_mode)) {
+                // Removing a directory, decrement parent's st_nlink for the '..' entry.
+                if (this->attr.st_nlink > 0) {
+                    this->attr.st_nlink--;
+                }
             }
 
             return this->children.remove(name);
@@ -220,25 +297,17 @@ namespace NFS {
             NLib::ScopeSpinlock guard(&this->spin);
             attr.st_blksize = 512;
             attr.st_ino = this->nextinode++;
+            if (VFS::S_ISDIR(attr.st_mode)) {
+                attr.st_nlink = 2; // Directories start with 2 links (self and parent).
+            } else {
+                attr.st_nlink = 1; // Files start with 1 link.
+            }
             *nodeout = new RAMNode(this, name, attr);
             return 0;
         }
 
-        int RAMFileSystem::unlink(const char *path) {
-            VFS::INode *node = NULL;
-            ssize_t res = this->vfs->resolve(path, &node, NULL, true);
-            if (res < 0) {
-                return res; // Failed to resolve.
-            }
-
+        int RAMFileSystem::unlink(VFS::INode *node, VFS::INode *parent) {
             uint64_t ino = node->getattr().st_ino;
-
-            VFS::INode *parent = node->getparent();
-            if (!parent) {
-                node->unref();
-                return -EINVAL; // Cannot unlink root node.
-            }
-            parent->ref();
 
             // Remove from parent.
             bool worked = parent->remove(node->getname());
@@ -249,8 +318,9 @@ namespace NFS {
                 return -EINVAL; // Removal failed.
             }
 
-            res = node->unlink(); // Returns 0 if we're good to delete the node.
+            ssize_t res = node->unlink(); // Returns 0 if we're good to delete the node.
             if (res == 0) {
+                NUtil::printf("RAMFS: Deleting node %s ino %llu\n", node->getname(), ino);
                 delete node; // Delete the node.
             }
             return 0;

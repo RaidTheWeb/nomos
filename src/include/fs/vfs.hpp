@@ -343,6 +343,12 @@ namespace NFS {
             public:
                 IFileSystem *fs;
 
+                enum syncmode {
+                    SYNC_NONE,
+                    SYNC_DATA,
+                    SYNC_FULL
+                };
+
                 INode(IFileSystem *fs, const char *name, struct stat attr) {
                     this->fs = fs;
                     this->attr = attr;
@@ -390,6 +396,14 @@ namespace NFS {
                     *st = this->attr;
                     return 0;
                 }
+                virtual int truncate(off_t length) {
+                    (void)length;
+                    return -EFAULT;
+                }
+                virtual int sync(enum syncmode mode) {
+                    (void)mode;
+                    return 0;
+                }
 
                 // Locate child by name.
                 virtual INode *lookup(const char *name) = 0;
@@ -404,7 +418,14 @@ namespace NFS {
                     if (this->attr.st_nlink == 0) {
                         return -ENOENT;
                     }
-                    this->attr.st_nlink--;
+                    if (S_ISDIR(this->attr.st_mode)) {
+                        if (this->attr.st_nlink < 2) {
+                            return -ENOENT; // Inconsistent state.
+                        }
+                        this->attr.st_nlink -= 2; // Decrement for all references.
+                    } else {
+                        this->attr.st_nlink--;
+                    }
                     if (nlink) {
                         *nlink = this->attr.st_nlink; // Return new link count, for filesystems that need it.
                     }
@@ -412,6 +433,7 @@ namespace NFS {
                     if (this->attr.st_nlink == 0 && __atomic_load_n(&this->refcount, memory_order_seq_cst) == 0) {
                         return 0;
                     }
+                    NUtil::printf("INode: unlink called, nlink now %llu, refcount %lu\n", this->attr.st_nlink, this->refcount);
                     return 1;
                 }
 
@@ -463,6 +485,7 @@ namespace NFS {
                 // When done with this node, call unref() to decrease reference count.
                 // This lets the filesystem know when it can safely delete this node (no process is using it anymore).
                 void unref(void) {
+                    assert(this->refcount > 0, "INode: Attempting to unref node with zero refcount.\n");
                     __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
         };
@@ -498,7 +521,8 @@ namespace NFS {
 
                 // Create a node.
                 virtual ssize_t create(const char *name, INode **nodeout, struct stat attr) = 0;
-                virtual int unlink(const char *path) = 0; // Unlink a node.
+                // Unlink a node from its parent, on the filesystem. NOTE: Expects caller to hold references to both node and parent, and will unref them as needed.
+                virtual int unlink(INode *node, INode *parent) = 0; // Unlink a node.
         };
 
         class VFS {
@@ -537,6 +561,9 @@ namespace NFS {
 
                 ssize_t create(const char *path, INode **nodeout, struct stat attr, INode *relativeto = NULL);
                 int unlink(const char *path, INode *relativeto = NULL, int flags = 0, int uid = 0, int gid = 0);
+
+                // Sync all mounted filesystems.
+                void syncall(void);
         };
 
         class FileDescriptor {

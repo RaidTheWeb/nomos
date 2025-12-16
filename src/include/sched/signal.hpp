@@ -4,6 +4,7 @@
 #include <lib/signal.hpp>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/clock.hpp>
 
 namespace NArch {
     namespace CPU {
@@ -26,12 +27,40 @@ namespace NSched {
     // sigaction flags
     #define SA_NODEFER 0x40000000  // Don't automatically block signal during handler.
     #define SA_RESETHAND 0x80000000 // Reset handler to SIG_DFL after invocation.
+    #define SA_ONSTACK 0x08000000  // Use alternate signal stack for handler.
 
     struct sigaction {
         void (*handler)(int) = SIG_DFL;
         uint64_t flags = 0;
         void (*restorer)(void) = NULL;
         NLib::sigset_t mask = 0; // Signals to block during execution of action.
+    };
+
+    #define SS_ONSTACK 1     // Currently executing on alternate stack.
+    #define SS_DISABLE 2     // Alternate stack is disabled.
+
+    #define MINSIGSTKSZ 2048  // Minimum stack size.
+    #define SIGSTKSZ 8192     // Default stack size.
+
+    struct stack_t {
+        void *ss_sp;         // Base of stack.
+        int ss_flags;        // Flags.
+        size_t ss_size;      // Size of stack.
+    };
+
+    // Interval timer types.
+    #define ITIMER_REAL    0  // Decrements in real time, delivers SIGALRM.
+    #define ITIMER_VIRTUAL 1  // Decrements in process virtual time (user CPU time), delivers SIGVTALRM.
+    #define ITIMER_PROF    2  // Decrements in process virtual time (user + system CPU time), delivers SIGPROF.
+
+    struct timeval {
+        long tv_sec;   // Seconds.
+        long tv_usec;  // Microseconds.
+    };
+
+    struct itimerval {
+        struct timeval it_interval;  // Timer interval (period for repeating timers).
+        struct timeval it_value;     // Current timer value (time until next expiration).
     };
 
     static const size_t NSIG = 64; // Total number of signals.

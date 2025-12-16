@@ -41,17 +41,36 @@ namespace NDev {
             };
 
             enum cflags {
+                // Character size (CS5-CS8)
+                CSIZE           = 0x30,
+                CS5             = 0x00,
+                CS6             = 0x10,
+                CS7             = 0x20,
+                CS8             = 0x30, // We only really support this.
+                CSTOPB          = (1 << 6),  // 2 stop bits
+                CREAD           = (1 << 7),  // Enable receiver
+                PARENB          = (1 << 8),  // Enable parity
+                PARODD          = (1 << 9),  // Odd parity
+                HUPCL           = (1 << 10), // Hang up on close
+                CLOCAL          = (1 << 11)  // Ignore modem control lines
             };
 
             enum lflags {
                 ISIG            = (1 << 0),
                 ICANON          = (1 << 1),
+                XCASE           = (1 << 2),  // Canonical upper/lower presentation
                 ECHO            = (1 << 3),
                 ECHOE           = (1 << 4),
                 ECHOK           = (1 << 5),
                 ECHONL          = (1 << 6),
                 NOFLSH          = (1 << 7),
-                TOSTOP          = (1 << 8)
+                TOSTOP          = (1 << 8),
+                ECHOCTL         = (1 << 9),  // Echo control chars as ^X
+                ECHOPRT         = (1 << 10), // Echo erased chars
+                ECHOKE          = (1 << 11), // Visual erase for VKILL
+                FLUSHO          = (1 << 12), // Output being flushed (state flag)
+                PENDIN          = (1 << 14), // Retype pending input
+                IEXTEN          = (1 << 15)  // Enable impl-defined input processing
             };
 
             enum ioctls {
@@ -62,11 +81,34 @@ namespace NDev {
                 TCSBRK          = 0x5405,
                 TCXONC          = 0x5406,
                 TCFLSH          = 0x5407,
+                TIOCEXCL        = 0x540c, // Set exclusive mode
+                TIOCNXCL        = 0x540d, // Clear exclusive mode
                 TIOCSCTTY       = 0x540e,
                 TIOCGPGRP       = 0x540f,
                 TIOCSPGRP       = 0x5410,
+                TIOCOUTQ        = 0x5411, // Output queue size
+                TIOCSTI         = 0x5412, // Simulate terminal input
                 TIOCGWINSZ      = 0x5413,
-                TIOCSWINSZ      = 0x5414
+                TIOCSWINSZ      = 0x5414,
+                TIOCMGET        = 0x5415, // Get modem bits
+                TIOCMBIS        = 0x5416, // Set modem bits
+                TIOCMBIC        = 0x5417, // Clear modem bits
+                TIOCMSET        = 0x5418, // Set modem bits
+                TIOCGSOFTCAR    = 0x5419, // Get software carrier flag
+                TIOCSSOFTCAR    = 0x541a, // Set software carrier flag
+                FIONREAD        = 0x541b, // Get input queue size (aka TIOCINQ)
+                TIOCINQ         = 0x541b, // Alias for FIONREAD
+                TIOCNOTTY       = 0x5422, // Give up controlling terminal
+                TIOCGETD        = 0x5424, // Get line discipline
+                TIOCSETD        = 0x5425, // Set line discipline
+                TIOCSBRK        = 0x5427, // Set break
+                TIOCCBRK        = 0x5428, // Clear break
+                TIOCGSID        = 0x5429, // Get session ID
+                TIOCGRS485      = 0x542e, // Get RS485 config
+                TIOCSRS485      = 0x542f, // Set RS485 config
+
+                // Non-POSIX special ioctl to get the TTY name.
+                TTYNAME         = 0x16789123
             };
 
             struct winsize {

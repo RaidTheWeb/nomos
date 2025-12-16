@@ -8,7 +8,9 @@
 namespace NSched {
     // Helper function to check if thread has pending unblocked signals.
     static inline bool haspendingsignal(Thread *thread) {
-        if (!thread->process) return false;
+        if (!thread || !thread->process) {
+            return false;
+        }
 
         // Get pending signals that aren't blocked.
         NLib::sigset_t pending = __atomic_load_n(&thread->process->signalstate.pending, memory_order_acquire);
@@ -19,33 +21,44 @@ namespace NSched {
     }
 
     void WaitQueue::wait(bool locked) {
+        Thread *thread = NArch::CPU::get()->currthread;
+
         if (!locked) {
             this->waitinglock.acquire(); // We MUST acquire the lock before setting the thread to waiting, otherwise we'll never be rescheduled when the timeslice expires.
         }
 
-        Thread *thread = NArch::CPU::get()->currthread;
+        // Set state to WAITING before adding to queue.
         __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
         this->waitinglock.release();
+
+        // Memory barrier to ensure state is visible before yield.
+        NArch::CPU::writemb();
+
         yield();
 
+        // After waking, clear the waitingon pointer.
         thread->waitingon = NULL;
     }
 
     void WaitQueue::waitlocked(NArch::IRQSpinlock *lock) {
-        // Acquire waitqueue lock first
+        Thread *thread = NArch::CPU::get()->currthread;
+
+        // Acquire waitqueue lock while still holding external lock.
         this->waitinglock.acquire();
 
-        lock->release(); // Release before sleeping.
-
-        Thread *thread = NArch::CPU::get()->currthread;
+        // Set up wait state while holding both locks.
         __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
+        // Release locks in correct order: waitqueue first, then external.
         this->waitinglock.release();
+        lock->release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
@@ -55,51 +68,49 @@ namespace NSched {
     }
 
     void WaitQueue::waitlocked(NArch::Spinlock *lock) {
-        // Acquire waitqueue lock first
+        Thread *thread = NArch::CPU::get()->currthread;
+
         this->waitinglock.acquire();
 
-        lock->release(); // Release before sleeping.
-
-        Thread *thread = NArch::CPU::get()->currthread;
         __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
         this->waitinglock.release();
+        lock->release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
-
-        // When we wake up, re-acquire the external lock before returning
         lock->acquire();
     }
 
     void WaitQueue::waitlocked(NSched::Mutex *lock) {
-        // Acquire waitqueue lock first
+        Thread *thread = NArch::CPU::get()->currthread;
+
         this->waitinglock.acquire();
 
-        lock->release(); // Release before sleeping.
-
-        Thread *thread = NArch::CPU::get()->currthread;
         __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
         this->waitinglock.release();
+        lock->release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
-
-        // When we wake up, re-acquire the external lock before returning
         lock->acquire();
     }
 
     int WaitQueue::waitinterruptible(bool locked) {
+        Thread *thread = NArch::CPU::get()->currthread;
+
         if (!locked) {
             this->waitinglock.acquire();
         }
-
-        Thread *thread = NArch::CPU::get()->currthread;
 
         // Check for pending signals before sleeping.
         if (haspendingsignal(thread)) {
@@ -112,6 +123,8 @@ namespace NSched {
         this->waiting.pushback(thread);
 
         this->waitinglock.release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
@@ -125,10 +138,9 @@ namespace NSched {
     }
 
     int WaitQueue::waitinterruptiblelocked(NArch::IRQSpinlock *lock) {
-        // Acquire waitqueue lock first
-        this->waitinglock.acquire();
-
         Thread *thread = NArch::CPU::get()->currthread;
+
+        this->waitinglock.acquire();
 
         // Check for pending signals before sleeping.
         if (haspendingsignal(thread)) {
@@ -136,21 +148,24 @@ namespace NSched {
             return -EINTR;
         }
 
-        lock->release(); // Release before sleeping.
-
+        // Set up wait state.
         __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
+        // Release locks: waitqueue first, then external.
         this->waitinglock.release();
+        lock->release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
 
-        // When we wake up, re-acquire the external lock before returning
+        // Re-acquire external lock before returning.
         lock->acquire();
 
-        // After waking, check if we were interrupted by a signal.
+        // Check if we were interrupted by a signal.
         if (haspendingsignal(thread)) {
             return -EINTR;
         }
@@ -159,10 +174,9 @@ namespace NSched {
     }
 
     int WaitQueue::waitinterruptiblelocked(NArch::Spinlock *lock) {
-        // Acquire waitqueue lock first
-        this->waitinglock.acquire();
-
         Thread *thread = NArch::CPU::get()->currthread;
+
+        this->waitinglock.acquire();
 
         // Check for pending signals before sleeping.
         if (haspendingsignal(thread)) {
@@ -170,21 +184,20 @@ namespace NSched {
             return -EINTR;
         }
 
-        lock->release(); // Release before sleeping.
-
         __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
         this->waitinglock.release();
+        lock->release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
 
-        // When we wake up, re-acquire the external lock before returning
         lock->acquire();
 
-        // After waking, check if we were interrupted by a signal.
         if (haspendingsignal(thread)) {
             return -EINTR;
         }
@@ -193,10 +206,9 @@ namespace NSched {
     }
 
     int WaitQueue::waitinterruptiblelocked(NSched::Mutex *lock) {
-        // Acquire waitqueue lock first
-        this->waitinglock.acquire();
-
         Thread *thread = NArch::CPU::get()->currthread;
+
+        this->waitinglock.acquire();
 
         // Check for pending signals before sleeping.
         if (haspendingsignal(thread)) {
@@ -204,21 +216,20 @@ namespace NSched {
             return -EINTR;
         }
 
-        lock->release(); // Release before sleeping.
-
         __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
         thread->waitingon = this;
         this->waiting.pushback(thread);
 
         this->waitinglock.release();
+        lock->release();
+
+        NArch::CPU::writemb();
         yield();
 
         thread->waitingon = NULL;
 
-        // When we wake up, re-acquire the external lock before returning
         lock->acquire();
 
-        // After waking, check if we were interrupted by a signal.
         if (haspendingsignal(thread)) {
             return -EINTR;
         }
@@ -226,35 +237,40 @@ namespace NSched {
         return 0;
     }
 
+    // Wake up all threads waiting on this waitqueue.
     void WaitQueue::wake(void) {
         NLib::SingleList<Thread *> towake;
+
         this->waitinglock.acquire();
-        size_t i = 0;
+
+        // Collect all waiting threads into a temporary list.
         while (!this->waiting.empty()) {
             Thread *thread = this->waiting.pop();
-            enum Thread::state tstate = __atomic_load_n(&thread->tstate, memory_order_acquire);
-            if (tstate != Thread::state::WAITING && tstate != Thread::state::WAITINGINT) {
-                continue; // Thread is no longer waiting, skip it.
+
+            // Verify thread is still in a waiting state.
+            enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+            if (tstate == Thread::state::WAITING || tstate == Thread::state::WAITINGINT) {
+                towake.push(thread);
             }
-            i++;
-            towake.push(thread);
+            // If thread is not waiting (e.g., already marked DEAD), skip it.
         }
+
         this->waitinglock.release();
 
-        // Schedule all threads that were waiting.
+        // Schedule all collected threads outside of the lock.
         for (NLib::SingleList<Thread *>::Iterator it = towake.begin(); it.valid(); it.next()) {
             Thread *thread = *(it.get());
             schedulethread(thread);
         }
     }
 
-    // Dequeue a specific thread from the waitqueue.
+    // Remove a specific thread from the waitqueue.
     bool WaitQueue::dequeue(Thread *target) {
         this->waitinglock.acquire();
 
         bool found = this->waiting.remove([](Thread *thread, void *udata) -> bool {
-            Thread *target = (Thread *)udata;
-            return thread == target;
+            Thread *t = (Thread *)udata;
+            return thread == t;
         }, (void *)target);
 
         this->waitinglock.release();

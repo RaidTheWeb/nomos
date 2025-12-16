@@ -54,7 +54,7 @@ namespace NDev {
                 scanbus((reg6 >> 8) & 0xff); // Scan this entire bus as well.
             }
 
-            NUtil::printf("[dev/pci]: Discovered PCI device %04x:%04x\n", dev.info.pci.vendor, dev.info.pci.device);
+            NUtil::printf("[dev/pci]: Discovered PCI device %04x:%04x.\n", dev.info.pci.vendor, dev.info.pci.device);
 
             uint16_t status = read(&dev, 0x6, 2);
 

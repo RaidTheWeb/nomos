@@ -204,6 +204,7 @@ namespace NSched {
             WaitQueue exitwq; // Wait queue to await completion of this process.
 
             bool kernel = false;
+            bool hasexeced = false; // Set to true when process calls execve.
             size_t id; // Process ID.
             size_t tidcounter = 1; // Thread ID counter.
             NFS::VFS::FileDescriptorTable *fdtable = NULL;
@@ -231,8 +232,8 @@ namespace NSched {
             Process *parent = NULL;
             NLib::DoubleList<Process *> children;
 
-            ProcessGroup *pgrp = NULL;
-            Session *session = NULL;
+            ProcessGroup *pgrp = NULL; // Process group ID = PID of leader.
+            Session *session = NULL; // Session ID = PID of leader.
 
             size_t threadcount = 0;
             NLib::DoubleList<Thread *> threads;
@@ -240,6 +241,10 @@ namespace NSched {
             uint64_t tty; // Device ID of process' controlling TTY.
 
             struct signal signalstate; // Signal state (pending, blocked, handlers).
+
+            uint64_t itimerreal = 0; // Time until next SIGALRM for ITIMER_REAL.
+            uint64_t itimerintv = 0; // Interval for ITIMER_REAL.
+            uint64_t itimerdeadline = 0; // TSC deadline for ITIMER_REAL.
 
             Process(struct NArch::VMM::addrspace *space) {
                 this->init(space, NULL);
@@ -275,13 +280,13 @@ namespace NSched {
             };
 
             enum state {
-                READY, // Ready for scheduling.
-                SUSPENDED, // Sitting in the running queue, but not currently running (yielding for another thread).
-                WAITING, // Waiting on something like a mutex/wait queue.
-                WAITINGINT, // Interruptible waiting on something like a mutex/wait queue.
+                READY, // Ready for scheduling (initial state, not in any queue).
+                SUSPENDED, // In the runqueue, waiting to be scheduled.
+                WAITING, // Blocked on a waitqueue (non-interruptible).
+                WAITINGINT, // Blocked on a waitqueue (interruptible by signals).
                 PAUSED, // Paused via SIGSTOP or awaiting via sys_pause.
-                RUNNING, // Currently running.
-                DEAD // Thread exited.
+                RUNNING, // Currently executing on a CPU.
+                DEAD // Thread has exited and is awaiting cleanup.
             };
 
             struct NArch::CPU::context ctx; // CPU working context (save state).
@@ -296,26 +301,32 @@ namespace NSched {
             int nice = 0; // -20 to +19, used for virtual runtime weighting. Lower values mean higher priority.
 
         public:
-            bool rescheduling = false;
+            volatile bool rescheduling = false; // Set when thread needs to be rescheduled.
 
-            enum state tstate = state::READY; // Current state of thread.
+            volatile enum state tstate = state::READY; // Current state of thread. Access atomically.
             struct RBTree::node node; // Red-Black tree node for this thread.
             struct Thread *nextzombie = NULL; // Next zombie in the zombie list.
             size_t id = 0; // Thread ID.
-            size_t cid = 0; // Current CPU ID. What CPU owns this right now?
+            volatile size_t cid = 0; // Current CPU ID. What CPU owns this right now? Access atomically.
             size_t lastcid = 0; // Last CPU ID. What CPU owned it before?
 
-            bool migratedisabled = false; // Outright prevent migration of this thread. NOTE: Useful for critical sections that use per-CPU data (i.e. driver interrupt handler registration).
-            size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
+            volatile bool migratedisabled = false; // Outright prevent migration of this thread.
+            volatile size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
 
             NLib::sigset_t blocked = 0; // Signals blocked in this thread.
             WaitQueue *waitingon = NULL; // Waitqueue this thread is sleeping on (if any).
 
+            // Alternate signal stack.
+            void *altstackbase = NULL;
+            size_t altstacksize = 0;
+            int altstackflags = 0;
+
             // Called every timeslice, updates weighted vruntime for later scheduling prioritisation.
             void setvruntime(uint64_t delta) {
                 uint64_t weight = NICEWEIGHTS[this->nice + 20];
-                this->vruntime += (delta * 1024) / weight; // Lower nice levels will accumulate vruntime slower, leading to them being scheduled more often.
-                NArch::CPU::writemb();
+                uint64_t oldvruntime = __atomic_load_n(&this->vruntime, memory_order_acquire);
+                uint64_t newvruntime = oldvruntime + (delta * 1024) / weight;
+                __atomic_store_n(&this->vruntime, newvruntime, memory_order_release);
             }
 
             // Set how nice the thread will be to other threads during scheduling. Higher niceness levels will schedule less often.
@@ -326,11 +337,11 @@ namespace NSched {
 
             void enablemigrate(void) {
                 NArch::CPU::writemb();
-                this->migratedisabled = false;
+                __atomic_store_n(&this->migratedisabled, false, memory_order_release);
             }
 
             void disablemigrate(void) {
-                this->migratedisabled = true;
+                __atomic_store_n(&this->migratedisabled, true, memory_order_release);
                 NArch::CPU::writemb();
             }
 
@@ -339,7 +350,7 @@ namespace NSched {
             }
 
             uint64_t getvruntime(void) {
-                return this->vruntime;
+                return __atomic_load_n(&this->vruntime, memory_order_acquire);
             }
 
             void setaffinity(uint16_t target) {

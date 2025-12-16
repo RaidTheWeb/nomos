@@ -34,6 +34,7 @@ namespace NFS {
                 ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t readdir(void *buf, size_t count, off_t offset) override;
                 ssize_t readlink(char *buf, size_t bufsiz) override;
+                int truncate(off_t length) override;
                 VFS::INode *lookup(const char *name) override;
                 bool add(VFS::INode *node) override;
                 bool remove(const char *name) override;
@@ -64,7 +65,7 @@ namespace NFS {
                 int sync(void) override { return 0; }
 
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
-                int unlink(const char *path) override;
+                int unlink(VFS::INode *node, VFS::INode *parent) override;
         };
     }
 }

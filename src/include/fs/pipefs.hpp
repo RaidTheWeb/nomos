@@ -95,11 +95,13 @@ namespace NFS {
                         return -EINVAL; // Only FIFOs supported.
                     }
 
-                    *nodeout = new PipeNode(this, name, attr, false);
+                    PipeNode *node = new PipeNode(this, name, attr, false);
+                    node->ref(); // Return referenced node to match VFS contract.
+                    *nodeout = node;
                     return 0;
                 }
 
-                int unlink(const char *path) override {
+                int unlink(VFS::INode *node, VFS::INode *parent) override {
                     return -ENOSYS; // Not supported.
                 }
         };

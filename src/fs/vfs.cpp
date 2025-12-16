@@ -5,6 +5,7 @@
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
 #include <mm/ucopy.hpp>
+#include <sys/clock.hpp>
 #include <sys/syscall.hpp>
 
 namespace NFS {
@@ -126,15 +127,25 @@ namespace NFS {
 
             Path rp = Path(path);
 
-            if (!rp.depth()) { // Empty path, we're referring to our current directory.
-                INode *result = relativeto ? relativeto : this->root;
-                if (result) {
-                    result->ref(); // Caller expects a referenced node.
-                } else {
-                    return -ENOENT;
-                }
+            if (!rp.depth()) { // Empty path or root path.
+                if (rp.isabsolute()) { // Absolute path refers to root.
+                    if (!this->root) {
+                        return -ENOENT;
+                    }
+                    this->root->ref();
+                    *nodeout = this->root;
+                    return 0;
+                } else { // Empty relative path refers to current directory.
+                    INode *result = relativeto ? relativeto : this->root;
+                    if (result) {
+                        result->ref(); // Caller expects a referenced node.
+                    } else {
+                        return -ENOENT;
+                    }
 
-                *nodeout = result;
+                    *nodeout = result;
+                    return 0;
+                }
                 return 0;
             }
 
@@ -254,9 +265,17 @@ namespace NFS {
                 return -EINVAL; // Cannot create root.
             }
 
+            // Check if path already exists.
+            INode *existing = NULL;
+            ssize_t res = this->resolve(path, &existing, relativeto, false);
+            if (res == 0) {
+                existing->unref();
+                return -EEXIST; // Path already exists.
+            }
+
             const char *parentpath = pobj.dirname();
             INode *parent;
-            ssize_t res = this->resolve(parentpath, &parent);
+            res = this->resolve(parentpath, &parent, relativeto);
             delete parentpath; // Caller is expected to free `dirname()`.
             if (res < 0) {
                 return res; // Parent doesn't already exist.
@@ -277,6 +296,7 @@ namespace NFS {
             parent->add(node);
             parent->unref();
 
+            node->ref(); // Increment refcount before returning, matching resolve() contract.
             *nodeout = node;
             return 0;
         }
@@ -288,9 +308,8 @@ namespace NFS {
                 return -EINVAL; // Cannot unlink root.
             }
 
-            // Resolve the node to unlink.
             INode *node = NULL;
-            ssize_t res = this->resolve(path, &node, relativeto, true);
+            ssize_t res = this->resolve(path, &node, relativeto, false);
             if (res < 0) {
                 return res; // Failed to resolve path.
             }
@@ -333,23 +352,19 @@ namespace NFS {
                 return -EACCES; // No write/search permission on parent directory.
             }
 
-            // Find the mountpoint for this path to call filesystem-specific unlink.
-            struct mntpoint *mount = this->findmount(&pobj);
-            if (!mount) {
-                parent->unref();
-                node->unref();
-                return -EINVAL; // Invalid mounting point.
-            }
-
-            // Call filesystem-specific unlink.
-            const char *pathstr = pobj.construct();
-            int ret = mount->fs->unlink(pathstr);
-            delete[] pathstr;
-
-            parent->unref();
-            node->unref();
+            // Call filesystem-specific unlink, it handles unreferencing our references to node and parent.
+            int ret = node->fs->unlink(node, parent);
 
             return ret;
+        }
+
+        void VFS::syncall(void) {
+            NLib::ScopeSpinlock guard(&this->mountlock);
+
+            NLib::DoubleList<struct mntpoint>::Iterator it = this->mounts.begin();
+            for (; it.valid(); it.next()) {
+                it.get()->fs->sync();
+            }
         }
 
         int FileDescriptorTable::open(INode *node, int flags) {
@@ -608,6 +623,8 @@ namespace NFS {
                         delete this->fds[i];
                     }
                     this->fds[i] = NULL;
+                    this->openfds.clear(i);
+                    this->closeonexec.clear(i);
                 }
             }
         }
@@ -621,6 +638,8 @@ namespace NFS {
                         delete this->fds[i]; // Delete descriptor itself if we ran out of references.
                     }
                     this->fds[i] = NULL;
+                    this->openfds.clear(i);
+                    this->closeonexec.clear(i);
                 }
             }
         }
@@ -755,8 +774,10 @@ namespace NFS {
                 }
                 // Create the node.
                 struct stat attr = { 0 };
-                attr.st_mode = mode;
-                ssize_t res = vfs.create(pathbuf, &node, attr);
+                attr.st_mode = mode | S_IFREG;
+                attr.st_uid = proc->euid;
+                attr.st_gid = proc->egid;
+                ssize_t res = vfs.create(pathbuf, &node, attr, dirnode);
                 if (res < 0) {
                     delete[] pathbuf;
                     proc->lock.release();
@@ -1705,7 +1726,7 @@ namespace NFS {
         }
 
         extern "C" ssize_t sys_unlink(int fd, const char *path, size_t len, int flags) {
-            SYSCALL_LOG("sys_unlink(%d, %p, %lu, %d).\n", fd, path, len, flags);
+            SYSCALL_LOG("sys_unlink(%d, %s, %lu, %d).\n", fd, path, len, flags);
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
             if (pathsize < 0) {
@@ -1810,11 +1831,36 @@ namespace NFS {
 
                     // XXX: Set thread signal mask?
 
+                    NLib::sigset_t ksigmask;
+                    if (sigmask) {
+                        if (!NMem::UserCopy::valid(sigmask, sizeof(ksigmask))) {
+                            delete[] kfds;
+                            SYSCALL_RET(-EFAULT);
+                        }
+                        int res = NMem::UserCopy::copyfrom(&ksigmask, sigmask, sizeof(ksigmask));
+                        if (res < 0) {
+                            delete[] kfds;
+                            SYSCALL_RET(res);
+                        }
+                    } else {
+                        // Empty signal mask.
+                        NLib::memset(&ksigmask, 0, sizeof(ksigmask));
+                    }
+
+                    // Apply signal mask for the duration of the poll (per-thread).
+                    NSched::Thread *thread = NArch::CPU::get()->currthread;
+                    NSched::Process *proc = thread->process;
+                    NLib::sigset_t oldmask = __atomic_load_n(&thread->blocked, memory_order_acquire);
+                    __atomic_store_n(&thread->blocked, ksigmask, memory_order_release);
+
                     NArch::CPU::get()->setint(false);
                     // Untracked sleep state, so we won't be woken up until a signal arrives.
                     __atomic_store_n(&NArch::CPU::get()->currthread->tstate, NSched::Thread::PAUSED, memory_order_release);
                     NArch::CPU::get()->setint(true);
                     NSched::yield();
+
+                    // Restore old signal mask before returning (per-thread).
+                    __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
 
                     SYSCALL_RET(-EINTR); // Indicate we were interrupted by a signal.
                 }
@@ -1842,14 +1888,17 @@ namespace NFS {
             struct timespec ktmo;
             if (timeout) { // Simply just wait for the timeout period.
                 if (!NMem::UserCopy::valid(timeout, sizeof(struct timespec))) {
+                    delete[] kfds;
                     SYSCALL_RET(-EFAULT);
                 }
                 int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct timespec));
                 if (res < 0) {
+                    delete[] kfds;
                     SYSCALL_RET(res);
                 }
 
                 if (ktmo.tv_sec < 0 || ktmo.tv_nsec < 0 || ktmo.tv_nsec >= 1000000000) {
+                    delete[] kfds;
                     SYSCALL_RET(-EINVAL);
                 }
             }
@@ -1861,6 +1910,18 @@ namespace NFS {
             __atomic_store_n(&thread->blocked, ksigmask, memory_order_release);
 
             size_t eventcount = 0; // How many fds ended up with non-zero revents.
+
+            // Track timeout using monotonic clock for accurate timing.
+            uint64_t deadlinens = 0;
+            bool hastimeout = (timeout != NULL);
+            if (hastimeout) {
+                NSys::Clock::timespec now;
+                NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+                if (clock && clock->gettime(&now) == 0) {
+                    deadlinens = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+                    deadlinens += (uint64_t)ktmo.tv_sec * 1000000000ULL + (uint64_t)ktmo.tv_nsec;
+                }
+            }
 
             while (true) {
                 for (size_t i = 0; i < nfds; i++) {
@@ -1902,25 +1963,54 @@ namespace NFS {
                 }
 
                 // No events ready yet, check if we have a timeout.
-                if (timeout) {
-                    if (ktmo.tv_sec == 0 && ktmo.tv_nsec == 0) {
-                        // Immediate timeout.
+                if (hastimeout) {
+                    // Check remaining time.
+                    NSys::Clock::timespec now;
+                    NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+                    uint64_t nowns = 0;
+                    if (clock && clock->gettime(&now) == 0) {
+                        nowns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+                    }
+
+                    if (nowns >= deadlinens) {
+                        // Timeout expired.
                         break;
                     }
-                    uint64_t timeoutms = ktmo.tv_sec * 1000 + ktmo.tv_nsec / 1000000;
-                    int ret = NSched::sleep(timeoutms);
+
+                    // Calculate remaining time in ms.
+                    uint64_t remainingns = deadlinens - nowns;
+                    uint64_t remainingms = (remainingns + 999999) / 1000000; // Round up to ms.
+
+                    if (remainingms == 0) {
+                        break; // Timeout effectively expired.
+                    }
+
+                    // Sleep for a small interval (min of remaining time or 10ms) to allow checking for events.
+                    uint64_t sleepms = remainingms < 10 ? remainingms : 10;
+                    int ret = NSched::sleep(sleepms);
                     if (ret < 0) {
                         // Sleep was interrupted by signal. Restore old mask and return.
                         __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
+                        delete[] kfds;
                         SYSCALL_RET(ret);
                     }
-                    break; // After sleeping, we return to userspace to re-poll.
+                    // Continue loop to re-poll fds after short sleep.
+                    continue;
                 }
 
                 NSched::yield(); // Yield to avoid thrashing the CPU.
             }
             // Restore old signal mask before returning (per-thread).
             __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
+
+            // Copy results back to userspace.
+            if (nfds > 0 && kfds) {
+                int res = NMem::UserCopy::copyto(fds, kfds, sizeof(struct pollfd) * nfds);
+                delete[] kfds;
+                if (res < 0) {
+                    SYSCALL_RET(res);
+                }
+            }
 
             SYSCALL_RET(eventcount);
         }
@@ -2200,5 +2290,48 @@ namespace NFS {
 
             SYSCALL_RET(oldmask);
         }
+
+        extern "C" ssize_t sys_ftruncate(int fd, off_t len) {
+            SYSCALL_LOG("sys_ftruncate(%d, %ld).\n", fd, len);
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                SYSCALL_RET(-EBADF);
+            }
+
+            INode *node = desc->getnode();
+            int res = node->truncate(len);
+            node->unref();
+            SYSCALL_RET(res);
+        }
+
+        extern "C" ssize_t sys_sync(void) {
+            SYSCALL_LOG("sys_sync().\n");
+
+            vfs.syncall();
+
+            SYSCALL_RET(0);
+        }
+
+        extern "C" ssize_t sys_fsync(int fd, int opt) {
+            SYSCALL_LOG("sys_fsync(%d, %d).\n", fd, opt);
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            FileDescriptor *desc = proc->fdtable->get(fd);
+            if (!desc) {
+                SYSCALL_RET(-EBADF);
+            }
+
+            INode *node = desc->getnode();
+            int res = node->sync((opt == 0) ? INode::SYNC_FULL : INode::SYNC_DATA);
+            node->unref();
+            SYSCALL_RET(res);
+        }
+
     }
 }

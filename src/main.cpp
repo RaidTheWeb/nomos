@@ -114,7 +114,7 @@ void kpostarch(void) {
     NDev::PCI::init(); // Initialise PCI.
 
     NFS::VFS::INode *node;
-    ssize_t ret = NFS::VFS::vfs.resolve("/test", &node);
+    ssize_t ret = NFS::VFS::vfs.resolve("/bin/init", &node);
     assert(ret == 0, "Failed to locate file.\n");
 
     struct NSys::ELF::header elfhdr;
@@ -164,7 +164,7 @@ void kpostarch(void) {
 
     uintptr_t ustackbottom = ustacktop - (1 << 20); // Bottom of stack.
 
-    char *argv[] = { (char *)"/test", NULL };
+    char *argv[] = { (char *)"/bin/init", NULL };
 
     // We pass in the hhdm-offset physical stack top. The user will be given the mapped version.
     //void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
