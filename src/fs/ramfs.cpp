@@ -1,3 +1,7 @@
+#ifdef __x86_64__
+#include <arch/x86_64/cpu.hpp>
+#endif
+
 #include <fs/ramfs.hpp>
 #include <lib/errno.hpp>
 #include <fs/pipefs.hpp>
@@ -77,8 +81,20 @@ namespace NFS {
                 return -EINVAL;
             }
 
+            if (length == 0) {
+                if (this->data != NULL) {
+                    delete this->data;
+                    this->data = NULL;
+                }
+                this->attr.st_size = 0;
+                this->attr.st_blocks = 0;
+
+                this->datalock.release();
+                return 0;
+            }
+
             this->data = (uint8_t *)NMem::allocator.realloc(this->data, length);
-            assert(this->data || length == 0, "Failed to truncate file data.\n");
+            assert(this->data, "Failed to truncate file data.\n");
 
             this->attr.st_size = length;
             this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;

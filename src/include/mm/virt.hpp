@@ -7,6 +7,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+namespace NFS {
+    namespace VFS {
+        class INode;
+    }
+}
+
 namespace NMem {
     namespace Virt {
 
@@ -16,7 +22,8 @@ namespace NMem {
             VIRT_NX         = (1 << 2), // Region is non-executable.
             VIRT_SWAPPED    = (1 << 3), // Region is swapped out to disk.
             VIRT_DIRTY      = (1 << 4), // Region has been modified (and is thus, dirty). Automatic.
-            VIRT_SHARED     = (1 << 5)  // Region is shared between processses (no CoW!).
+            VIRT_SHARED     = (1 << 5), // Region is shared between processses (no CoW!).
+            VIRT_CHRSPECIAL = (1 << 6)  // Region is backed by a character special file. No demand paging.
         };
 
         // Address ordered AVL tree for managing the allocations of an address space.
@@ -34,6 +41,10 @@ namespace NMem {
             // Tree structure, branches between left and right.
             struct vmanode *left;
             struct vmanode *right;
+
+            // File-backing information for demand paging.
+            NFS::VFS::INode *backingfile; // Backing file, NULL for anonymous memory.
+            off_t fileoffset; // Offset into the backing file.
         };
 
         // Helper function for the height of a node, NULL nodes have a default 0 height.
@@ -123,6 +134,9 @@ namespace NMem {
 
                 // Allocate an aligned region within address space.
                 void *alloc(size_t size, uint8_t flags);
+
+                // Find the VMA node containing a specific address (public wrapper).
+                struct vmanode *findcontaining(uintptr_t addr);
 
                 // Forcibly occupy this area of memory. Useful for areas of memory that we should avoid (kernel sections, regions of actual RAM). We only want to be allocating where we could not be having anything useful.
                 void *reserve(uintptr_t start, uintptr_t end, uint8_t flags);

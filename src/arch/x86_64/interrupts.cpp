@@ -3,8 +3,13 @@
 #include <arch/x86_64/interrupts.hpp>
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/panic.hpp>
+#include <arch/x86_64/pmm.hpp>
+#include <arch/x86_64/vmm.hpp>
+#include <fs/vfs.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
+#include <lib/string.hpp>
+#include <mm/virt.hpp>
 #include <util/kprint.hpp>
 #include <sched/signal.hpp>
 
@@ -105,7 +110,7 @@ namespace NArch {
 
             // Map exception number to signal for userspace faults.
             int sig = 0;
-            bool is_userspace = (ctx->cs & 0x3) == 0x3;
+            bool isuserspace = (ctx->cs & 0x3) == 0x3;
 
             if ((isr->id & 0xffffffff) == 14) { // #PF
                 uintptr_t addr = 0;
@@ -119,9 +124,56 @@ namespace NArch {
                 uint64_t *pte = VMM::_resolvepte(space, addr);
 
                 if (!pte || !(*pte & VMM::PRESENT)) {
+                    // Check if this is a file-backed VMA that needs demand paging.
+                    NMem::Virt::vmanode *vma = space->vmaspace->findcontaining(addr);
+                    if (vma && vma->used && vma->backingfile && !(vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
+                        void *newpage = PMM::alloc(PAGESIZE);
+                        if (!newpage) {
+                            space->lock.release();
+                            if (isuserspace) {
+                                NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
+                                return;
+                            }
+                            panic("Out of memory during demand paging.\n");
+                        }
+
+                        NLib::memset(hhdmoff(newpage), 0, PAGESIZE);
+
+                        // Calculate file offset for this page.
+                        uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
+                        off_t fileoff = vma->fileoffset + (pagestart - vma->start);
+
+                        // Read from backing file into the new page.
+                        ssize_t nread = vma->backingfile->read(hhdmoff(newpage), PAGESIZE, fileoff, 0);
+                        if (nread < 0) {
+                            PMM::free(newpage, PAGESIZE);
+                            space->lock.release();
+                            if (isuserspace) {
+                                NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
+                                return;
+                            }
+                            panic("File read failed during demand paging.\n");
+                        }
+
+                        // Map the page with appropriate flags from VMA.
+                        uint64_t mapflags = VMM::PRESENT | VMM::USER;
+                        if (vma->flags & NMem::Virt::VIRT_RW) {
+                            mapflags |= VMM::WRITEABLE;
+                        }
+                        if (vma->flags & NMem::Virt::VIRT_NX) {
+                            mapflags |= VMM::NOEXEC;
+                        }
+
+                        VMM::_mappage(space, pagestart, (uintptr_t)newpage, mapflags);
+                        space->lock.release();
+
+                        NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, pagestart, pagestart + PAGESIZE);
+                        return;
+                    }
+
                     space->lock.release();
                     // Send SIGSEGV for non-present page in userspace.
-                    if (is_userspace) {
+                    if (isuserspace) {
                         NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: non-present page.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, addr);
                         NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
                         return;
@@ -135,7 +187,7 @@ namespace NArch {
                     if (!newpage) {
                         space->lock.release();
                         // Out of memory, send SIGKILL to process.
-                        if (is_userspace) {
+                        if (isuserspace) {
                             NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
                             return;
                         }
@@ -155,7 +207,7 @@ namespace NArch {
                     space->lock.release();
 
                     PMM::PageMeta *meta = PMM::phystometa((uintptr_t)oldpage);
-                    assertarg(meta, "Failed to get page metadata for physical address %p during COW page fault handling.\n", (void *)oldpage);
+                    assertarg(meta, "Failed to get page metadata for physical address %p during COW handling.\n", oldpage);
                     meta->unref(); // Unref old page, free if needed.
 
                     // XXX: Free pages with no more references from any thread.
@@ -194,7 +246,7 @@ pffault:
             }
 
             // If this is a userspace exception and we have a signal, send it instead of panicking.
-            if (is_userspace && sig > 0) {
+            if (isuserspace && sig > 0) {
                 NSched::signalproc(NArch::CPU::get()->currthread->process, sig);
                 return;
             }

@@ -3,6 +3,7 @@
 #include <arch/x86_64/vmm.hpp>
 #endif
 
+#include <fs/vfs.hpp>
 #include <mm/slab.hpp>
 #include <mm/virt.hpp>
 #include <lib/align.hpp>
@@ -164,6 +165,8 @@ namespace NMem {
                 root->end = successor->end;
                 root->used = successor->used;
                 root->flags = successor->flags;
+                root->backingfile = successor->backingfile;
+                root->fileoffset = successor->fileoffset;
                 // Don't copy maxend or height - they'll be recalculated
 
                 // Recursively remove the successor from right subtree
@@ -305,6 +308,8 @@ namespace NMem {
             node->left = NULL;
             node->right = NULL;
             node->flags = 0;
+            node->backingfile = NULL;
+            node->fileoffset = 0;
             return node;
         }
 
@@ -425,6 +430,22 @@ namespace NMem {
             assert(this->root, "Root is NULL.\n");
 
             return (void *)allocaddr; // Return pointer to brand new virtual address space!
+        }
+
+        struct vmanode *VMASpace::findcontaining(uintptr_t addr) {
+            struct vmanode *current = this->root;
+            while (current) {
+                if (addr >= current->start && addr < current->end) {
+                    return current; // This node contains the address.
+                }
+
+                if (addr < current->start) {
+                    current = current->left;
+                } else {
+                    current = current->right;
+                }
+            }
+            return NULL;
         }
 
 

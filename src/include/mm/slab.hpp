@@ -1,6 +1,9 @@
 #ifndef _MM__SLAB_HPP
 #define _MM__SLAB_HPP
 
+#ifdef __x86_64__
+#include <arch/x86_64/sync.hpp>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -44,12 +47,14 @@ namespace NMem {
                         uint32_t endcanary;
                     };
 
+                    NArch::IRQSpinlock lock;  // Per-slab lock for thread safety.
                     struct header *freelist;
                     size_t blksize; // Size of this suballocator's block.
                     size_t blkpp; // Number of blocks fit within a page.
             };
 
             SubAllocator slabs[numslabs];
+            NArch::IRQSpinlock largelock;  // Lock for large (page-based) allocations.
         public:
             SlabAllocator(void) { };
             void setup(void);

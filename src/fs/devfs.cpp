@@ -168,12 +168,12 @@ namespace NFS {
             return this->device->driver->mmap(this->attr.st_rdev, addr, count, offset, flags, fdflags);
         }
 
-        int DevNode::munmap(void *addr, int fdflags) {
+        int DevNode::munmap(void *addr, size_t count, size_t offset, int fdflags) {
             if (!this->device) {
                 return -ENODEV;
             }
 
-            return this->device->driver->munmap(this->attr.st_rdev, addr, fdflags);
+            return this->device->driver->munmap(this->attr.st_rdev, addr, count, offset, fdflags);
         }
 
         int DevNode::ioctl(unsigned long request, uint64_t arg) {

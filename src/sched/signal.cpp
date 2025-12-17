@@ -819,7 +819,6 @@ namespace NSched {
             return -EINVAL;
         }
 
-        NUtil::printf("[sched/signal] Sending signal %u to process group %u.\n", sig, pgrp->id);
         NLib::ScopeIRQSpinlock guard(&pgrp->lock);
 
         // Signal all processes in the group.
@@ -827,7 +826,6 @@ namespace NSched {
         for (; it.valid(); it.next()) {
             Process *proc = *it.get();
             if (proc) {
-                NUtil::printf("[sched/signal] Signaling process %u in group %u with signal %u.\n", proc->id, pgrp->id, sig);
                 signalproc(proc, sig);
             }
         }

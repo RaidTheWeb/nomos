@@ -2124,11 +2124,10 @@ namespace NSched {
         // Kill other threads and await their death.
         termothers(current);
 
-        {
-            NLib::ScopeIRQSpinlock guard(&current->lock);
+        current->lock.acquire();
 
-            // Mark that this process has called execve.
-            current->hasexeced = true;
+        // Mark that this process has called execve.
+        current->hasexeced = true;
 
             if (NFS::VFS::S_ISSUID(attr.st_mode)) {
                 current->euid = attr.st_uid; // Run as owner of file.
@@ -2201,8 +2200,8 @@ namespace NSched {
             current->lock.release();
 
             NArch::CPU::ctx_swap(&NArch::CPU::get()->currthread->ctx); // Context switch to new entry point.
-        }
 
+        panic("sys_execve ctx_swap returned unexpectedly!");
         __builtin_unreachable();
     }
 

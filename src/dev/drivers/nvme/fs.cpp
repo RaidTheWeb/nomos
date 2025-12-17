@@ -59,9 +59,11 @@ namespace NDev {
         return -EFAULT;
     }
 
-    int NVMEDriver::munmap(uint64_t dev, void *addr, int fdflags) {
+    int NVMEDriver::munmap(uint64_t dev, void *addr, size_t count, size_t offset, int fdflags) {
         (void)dev;
         (void)addr;
+        (void)count;
+        (void)offset;
         (void)fdflags;
         return -EFAULT;
     }

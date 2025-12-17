@@ -1,9 +1,9 @@
 #ifdef __x86_64__
+#include <arch/limine/console.hpp>
 #include <arch/x86_64/arch.hpp>
 #endif
 
 #include <dev/dev.hpp>
-#include <arch/limine/console.hpp>
 #include <dev/drivers/tty.hpp>
 #include <fs/devfs.hpp>
 #include <mm/ucopy.hpp>

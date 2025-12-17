@@ -52,9 +52,13 @@ namespace NMem {
             // We found an allocator, allocate with it:
 
             SubAllocator *sub = &this->slabs[idx];
+
+            sub->lock.acquire();  // Lock this slab.
+
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
                 void *ptr = NArch::PMM::alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
+                    sub->lock.release();
                     return NULL;
                 }
                 ptr = NArch::hhdmoff(ptr);
@@ -79,6 +83,8 @@ namespace NMem {
             struct SubAllocator::header *block = sub->freelist; // If we had previously allocated more blocks, this would grab the head of that.
             sub->freelist = block->next; // Push freelist forwards.
 
+            sub->lock.release();  // Unlock slab before metadata operations.
+
             // Reinterpret block as metadata.
             struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)block;
             meta->size = aligned; // Set metadata.
@@ -97,12 +103,17 @@ namespace NMem {
         } else {
             // Unable to find slab (too big). Try to allocate this as a page.
 
+            this->largelock.acquire();  // Lock for large allocations.
+
             size_t needed = ((aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE) * NArch::PAGESIZE;
             void *ptr = NArch::PMM::alloc(needed);
             if (ptr == NULL) {
+                this->largelock.release();
                 return NULL;
             }
             ptr = NArch::hhdmoff(ptr);
+
+            this->largelock.release();  // Unlock after PMM allocation.
 
             // Store metadata header at the start of page allocation.
             struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)ptr;
@@ -132,6 +143,9 @@ namespace NMem {
         assert(meta->magic == ALLOCMAGIC, "Invalid free on potentially non-allocated block.\n");
         assert(meta->startcanary == CANARY && meta->endcanary == CANARY, "Slab memory corruption detected.\n");
 
+        // Clear the magic to detect double-frees.
+        meta->magic = 0;
+
         size_t size = meta->size;
 
         size_t idx = getslabidx(size);
@@ -145,10 +159,14 @@ namespace NMem {
                 NLib::memset(meta, 0xaa, size);
             }
 
+            sub->lock.acquire();  // Lock slab before modifying freelist.
+
             struct SubAllocator::header *block = (struct SubAllocator::header *)meta; // Reinterpret pointer as free block.
             block->next = sub->freelist; // This metadata'd allocation (indicating that it's allocated) is now free, so we need to point it somewhere.
 
             sub->freelist = block; // Add to freelist.
+
+            sub->lock.release();
         } else { // Outside of slab, this means that it was allocated from pages directly.
 
             if (sanitisefreed) {

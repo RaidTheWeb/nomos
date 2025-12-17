@@ -71,7 +71,7 @@ namespace NFS {
                 int close(int fdflags) override;
                 int poll(short events, short *revents, int fdflags) override;
                 int mmap(void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) override;
-                int munmap(void *addr, int fdflags) override;
+                int munmap(void *addr, size_t count, size_t offset, int fdflags) override;
                 int ioctl(unsigned long request, uint64_t arg) override;
                 int stat(struct VFS::stat *st) override;
                 VFS::INode *lookup(const char *name) override;

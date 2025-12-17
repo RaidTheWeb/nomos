@@ -1313,6 +1313,10 @@ namespace NFS {
                     }
                     SYSCALL_RET(newfd);
                 }
+                case F_SETLK64:
+                case F_SETLKW64:
+                case F_GETLK64:
+                    SYSCALL_RET(0); // No locking implemented.
                 default:
                     SYSCALL_RET(-EINVAL);
             }

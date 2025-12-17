@@ -95,6 +95,9 @@ namespace NFS {
             F_SETFD = 2,
             F_GETFL = 3,
             F_SETFL = 4,
+            F_GETLK64 = 5,
+            F_SETLK64 = 6,
+            F_SETLKW64 = 7,
 
             F_DUPFD_CLOEXEC = 1030
         };
@@ -375,8 +378,10 @@ namespace NFS {
                     (void)fdflags;
                     return -EFAULT;
                 }
-                virtual int munmap(void *addr, int fdflags) {
+                virtual int munmap(void *addr, size_t count, size_t offset, int fdflags) {
                     (void)addr;
+                    (void)count;
+                    (void)offset;
                     (void)fdflags;
                     return -EFAULT;
                 }

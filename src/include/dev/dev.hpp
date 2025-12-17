@@ -153,9 +153,11 @@ namespace NDev {
                 (void)fdflags;
                 return -EFAULT;
             }
-            virtual int munmap(uint64_t dev, void *addr, int fdflags) {
+            virtual int munmap(uint64_t dev, void *addr, size_t count, size_t offset, int fdflags) {
                 (void)dev;
                 (void)addr;
+                (void)count;
+                (void)offset;
                 (void)fdflags;
                 return -EFAULT;
             }

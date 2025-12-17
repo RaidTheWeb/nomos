@@ -229,7 +229,9 @@ namespace NArch {
                         }
 
                         PMM::PageMeta *meta = PMM::phystometa(phys);
-                        assertarg(meta, "Failed to get page metadata for physical address %p during address space destruction.\n", (void *)phys);
+                        if (!meta) {
+                            continue; // Skip.
+                        }
                         meta->unref();
                     }
                 }
@@ -641,18 +643,91 @@ namespace NArch {
                     SYSCALL_RET(-EBADF);
                 }
 
-                // XXX: Dump the ifnode into the vmaspace so we can track during page faults?
+                // File not opened with read access?
+                if (!((filedesc->getflags() & NFS::VFS::O_ACCMODE) == NFS::VFS::O_RDWR || (filedesc->getflags() & NFS::VFS::O_ACCMODE) == NFS::VFS::O_RDONLY)) {
+                    node->unref();
+                    filedesc->unref();
+                    space->vmaspace->free(addr, size);
+                    SYSCALL_RET(-EACCES);
+                }
 
-                // Get the implementing node to map the region (handled by filesystem or device).
-                int ret = node->mmap(addr, size, off, prottovmm(prot), flags);
+                if ((filedesc->getflags() & NFS::VFS::O_APPEND) && (prot & PROT_WRITE)) {
+                    // Can't map with write access if opened in append mode.
+                    node->unref();
+                    filedesc->unref();
+                    space->vmaspace->free(addr, size);
+                    SYSCALL_RET(-EACCES);
+                }
+
+                if (NFS::VFS::S_ISDIR(node->getattr().st_mode)) {
+                    // Can't map a directory.
+                    node->unref();
+                    filedesc->unref();
+                    space->vmaspace->free(addr, size);
+                    SYSCALL_RET(-EISDIR);
+                }
+
+                if (off < 0 || (size_t)off + size > node->getattr().st_size) {
+                    // Mapping beyond end of file.
+                    node->unref();
+                    filedesc->unref();
+                    space->vmaspace->free(addr, size);
+                    SYSCALL_RET(-EINVAL);
+                }
+
+                // Demand paging:
+                bool demandback = NFS::VFS::S_ISBLK(node->getattr().st_mode) || NFS::VFS::S_ISREG(node->getattr().st_mode);
+                // Character devices are demand paged unless MAP_SHARED is specified (in which case, they're DMA).
+                demandback = demandback || (NFS::VFS::S_ISCHR(node->getattr().st_mode) && !(flags & MAP_SHARED));
+
+                if (demandback) { // We can map regular files and block devices.
+                    // Allocate file-backed VMA with demand paging.
+                    if (flags & MAP_FIXED) {
+                        // Find and update the VMA node with file backing info.
+                        NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)addr);
+                        if (vma) {
+                            vma->backingfile = node;
+                            vma->fileoffset = off;
+                            node->ref(); // Keep a reference to the file.
+                        }
+                    } else {
+                        NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)addr);
+                        vma->backingfile = node;
+                        vma->fileoffset = off;
+                        node->ref(); // Keep a reference to the file.
+                    }
+                } else if (NFS::VFS::S_ISCHR(node->getattr().st_mode)) {
+                    // Character devices fall through to implementation-specific mapping.
+
+                    NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)addr);
+                    if (vma) {
+                        vma->backingfile = node;
+                        vma->fileoffset = off;
+                        vma->flags |= NMem::Virt::VIRT_CHRSPECIAL;
+                    } else {
+                        node->unref();
+                        filedesc->unref();
+                        space->vmaspace->free(addr, size);
+                        SYSCALL_RET(-EINVAL);
+                    }
+
+                    int ret = node->mmap(addr, size, off, vmaflags, filedesc->getflags());
+                    if (ret < 0) {
+                        node->unref();
+                        filedesc->unref();
+                        space->vmaspace->free(addr, size);
+                        SYSCALL_RET(ret);
+                    }
+                } else {
+                    // Unsupported file type for mapping.
+                    node->unref();
+                    filedesc->unref();
+                    space->vmaspace->free(addr, size);
+                    SYSCALL_RET(-EINVAL);
+                }
 
                 filedesc->unref();
                 node->unref();
-
-                if (ret < 0) {
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(ret);
-                }
             }
 
             SYSCALL_RET((uint64_t)addr);
@@ -674,6 +749,43 @@ namespace NArch {
 
             NLib::ScopeIRQSpinlock guard(&space->lock);
 
+            // Check if this is a file-backed mapping.
+            NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)ptr);
+            NFS::VFS::INode *backingfile = NULL;
+            off_t fileoffset = 0;
+            uintptr_t vmastart = 0;
+            bool ischrspecial = false;
+
+            if (vma && vma->used && vma->backingfile) {
+                backingfile = vma->backingfile;
+                fileoffset = vma->fileoffset;
+                vmastart = vma->start;
+                ischrspecial = (vma->flags & NMem::Virt::VIRT_CHRSPECIAL) != 0;
+            }
+
+            if (ischrspecial && (vma->flags & NMem::Virt::VIRT_SHARED)) {
+                // Inform underlying character special file of unmap.
+                // XXX: Pass fdflags.
+                ssize_t ret = vma->backingfile->munmap(ptr, size, fileoffset, 0);
+                if (ret < 0) {
+                    SYSCALL_RET(ret);
+                }
+                goto nophys;
+            }
+
+            // Shared mapping doesn't have its own copy, so we need to write back dirty pages.
+            if (backingfile && (vma->flags & NMem::Virt::VIRT_SHARED)) {
+                for (size_t i = 0; i < size; i += PAGESIZE) {
+                    uintptr_t pageaddr = (uintptr_t)ptr + i;
+                    uint64_t *pte = _resolvepte(space, pageaddr);
+                    if (pte && (*pte & PRESENT) && (*pte & DIRTY)) {
+                        off_t fileoff = fileoffset + (pageaddr - vmastart);
+                        void *phys = (void *)(*pte & ADDRMASK);
+                        backingfile->write(hhdmoff(phys), PAGESIZE, fileoff, 0);
+                    }
+                }
+            }
+
             // Free physical pages before unmapping
             for (size_t i = 0; i < size; i += PAGESIZE) {
                 uint64_t *pte = _resolvepte(space, (uintptr_t)ptr + i);
@@ -682,8 +794,15 @@ namespace NArch {
                     PMM::free(phys, PAGESIZE);
                 }
             }
+nophys: // Jump label to skip unmapping physical pages for character special files.
 
             _unmaprange(space, (uintptr_t)ptr, size);
+
+            // Unref the backing file if present before freeing VMA.
+            if (backingfile) {
+                backingfile->unref();
+            }
+
             space->vmaspace->free(ptr, size);
 
             SYSCALL_RET(0);
@@ -717,6 +836,69 @@ namespace NArch {
                     uint64_t newflags = prottovmm(prot);
                     *pte = phys | newflags;
                     doshootdown(CPU::TLBSHOOTDOWN_SINGLE, (uintptr_t)ptr + i, (uintptr_t)ptr + i + PAGESIZE);
+                }
+            }
+
+            SYSCALL_RET(0);
+        }
+
+        extern "C" uint64_t sys_msync(void *ptr, size_t size, int flags) {
+            SYSCALL_LOG("sys_msync(%p, %lu, %d).\n", ptr, size, flags);
+
+            if ((uintptr_t)ptr % PAGESIZE != 0) {
+                SYSCALL_RET(-EINVAL);
+            }
+
+            if (size == 0) {
+                SYSCALL_RET(0); // Nothing to sync.
+            }
+
+            size = NLib::alignup(size, PAGESIZE);
+
+            struct CPU::cpulocal *cpu = CPU::get();
+            NSched::Thread *thread = cpu->currthread;
+            NSched::Process *proc = thread->process;
+            struct addrspace *space = proc->addrspace;
+
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+
+            // Find the VMA containing this range.
+            NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)ptr);
+            if (!vma || !vma->used) {
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            // Only file-backed shared mappings need writeback.
+            if (!vma->backingfile || !(vma->flags & NMem::Virt::VIRT_SHARED) || (vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
+                SYSCALL_RET(0); // Anonymous or private mapping, nothing to do.
+            }
+
+            // Write back dirty pages to the file.
+            for (size_t i = 0; i < size; i += PAGESIZE) {
+                uintptr_t pageaddr = (uintptr_t)ptr + i;
+                if (pageaddr >= vma->end) {
+                    break; // Past end of VMA.
+                }
+
+                uint64_t *pte = _resolvepte(space, pageaddr);
+                if (!pte || !(*pte & PRESENT)) {
+                    continue; // Page not present, nothing to sync.
+                }
+
+                if (*pte & DIRTY) { // Writeback dirty pages.
+                    off_t fileoff = vma->fileoffset + (pageaddr - vma->start);
+
+                    void *phys = (void *)(*pte & ADDRMASK);
+
+                    // Write page data back to file.
+                    ssize_t nwritten = vma->backingfile->write(hhdmoff(phys), PAGESIZE, fileoff, 0);
+                    if (nwritten < 0) {
+                        SYSCALL_RET(nwritten); // Return error.
+                    }
+
+                    // Clear dirty bit.
+                    *pte &= ~DIRTY;
+                    doshootdown(CPU::TLBSHOOTDOWN_SINGLE, pageaddr, pageaddr + PAGESIZE);
                 }
             }
 
