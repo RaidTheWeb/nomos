@@ -136,6 +136,11 @@ namespace NArch {
 
             bool preemptdisabled = true; // Is preemption disabled on this CPU?
 
+            // Per-CPU IRQSpinlock state storage for proper nested lock handling.
+            static const size_t IRQSPINLOCK_MAXDEPTH = 16;
+            bool irqstatestack[IRQSPINLOCK_MAXDEPTH] = { false };
+            size_t irqstatedepth = 0;
+
             bool setint(bool status) {
                 asm volatile("cli");
                 bool old = this->intstatus;

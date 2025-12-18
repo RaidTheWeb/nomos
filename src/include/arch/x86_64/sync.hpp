@@ -31,12 +31,12 @@ namespace NArch {
     // Special wrapper class for spinlocks that blocks and disables interrupts while holding the lock. NOTE: Do NOT use in thread-thread synchronisation cases, only for thread-interrupt synchronisation cases.
     class IRQSpinlock {
         private:
-            bool state;
             NArch::Spinlock lock;
+
+            // We support up to 16 levels of nesting per CPU.
+            static const size_t MAXDEPTH = 16;
         public:
-            IRQSpinlock(void) {
-                this->state = false;
-            }
+            IRQSpinlock(void) { }
 
             void acquire(void);
             void release(void);

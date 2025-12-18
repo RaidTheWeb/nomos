@@ -56,6 +56,8 @@ namespace NMem {
             sub->lock.acquire();  // Lock this slab.
 
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
+                // XXX: When slabs grow, they're never shrunk, so memory usage can grow without bound (memory reclamation?).
+
                 void *ptr = NArch::PMM::alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
                     sub->lock.release();

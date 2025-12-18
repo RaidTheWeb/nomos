@@ -50,13 +50,32 @@ namespace NArch {
     }
 
     void IRQSpinlock::acquire(void) {
-        this->state = CPU::get()->setint(false); // Disable interrupts. Stops preemption.
+        struct CPU::cpulocal *cpu = CPU::get();
+        bool oldstate = false;
+
+        if (cpu != NULL) {
+            oldstate = cpu->setint(false);
+
+            // Push state onto per-CPU stack.
+            assert(cpu->irqstatedepth < CPU::cpulocal::IRQSPINLOCK_MAXDEPTH, "IRQSpinlock nesting depth exceeded.\n");
+            cpu->irqstatestack[cpu->irqstatedepth++] = oldstate;
+        } else {
+            asm volatile("cli");
+        }
+
         this->lock.acquire(); // Raw acquire internal lock.
     }
 
     void IRQSpinlock::release(void) {
         this->lock.release(); // Raw release internal lock.
-        CPU::get()->setint(this->state); // Restore initial interrupt state.
+
+        // Restore interrupt state from per-CPU stack.
+        struct CPU::cpulocal *cpu = CPU::get();
+        if (cpu != NULL) {
+            assert(cpu->irqstatedepth > 0, "IRQSpinlock release without matching acquire.\n");
+            bool oldstate = cpu->irqstatestack[--cpu->irqstatedepth];
+            cpu->setint(oldstate);
+        }
     }
 
     void MCSSpinlock::initstate(struct state *state) {

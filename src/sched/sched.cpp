@@ -706,14 +706,16 @@ namespace NSched {
 
         cpu->runqueue.lock.acquire();
 
-        // Re-enqueue previous thread if it was running (not idle, not dead, not waiting).
+        // Re-enqueue previous thread if it was running or suspended (not idle, not dead, not waiting).
         if (prev != cpu->idlethread) {
             enum Thread::state prevstate = (enum Thread::state)__atomic_load_n(&prev->tstate, memory_order_acquire);
 
             if (prevstate == Thread::state::RUNNING) {
-                // Thread was running, put it back in the queue.
+                // Thread was running normally, put it back in the queue.
                 __atomic_store_n(&prev->tstate, Thread::state::SUSPENDED, memory_order_release);
                 NArch::CPU::writemb();
+                cpu->runqueue._insert(&prev->node, vruntimecmp);
+            } else if (prevstate == Thread::state::SUSPENDED) {
                 cpu->runqueue._insert(&prev->node, vruntimecmp);
             } else if (prevstate == Thread::state::DEAD) {
                 // Thread died, queue for cleanup.
@@ -1096,23 +1098,19 @@ namespace NSched {
             }
 #endif
 
-            // Lock is contended, add ourselves to the wait queue.
-            this->waitqueuelock.acquire();
+            // Lock is contended, wait on the waitqueue.
+            this->waitqueue.waitinglock.acquire();
 
             // Double-check the lock is still held after acquiring waitqueue lock.
 #ifdef __x86_64__
             if (!__sync_lock_test_and_set(&this->locked, 1)) {
-                this->waitqueuelock.release();
+                this->waitqueue.waitinglock.release();
                 break; // Got the lock.
             }
 #endif
 
-            // Set state to WAITING before adding to queue.
-            __atomic_store_n(&current->tstate, Thread::state::WAITING, memory_order_release);
-            this->waitqueue.pushback(current);
-            this->waitqueuelock.release();
-
-            yield();
+            // Use the WaitQueue's wait mechanism with lock already held.
+            this->waitqueue.wait(true);
             // When we return, we were woken up - try to acquire again.
         }
 
@@ -1127,15 +1125,8 @@ namespace NSched {
         __sync_lock_release(&this->locked);
 #endif
 
-        // Wake up a waiter if any.
-        this->waitqueuelock.acquire();
-        if (!this->waitqueue.empty()) {
-            Thread *waiter = this->waitqueue.pop();
-            this->waitqueuelock.release();
-            schedulethread(waiter);
-        } else {
-            this->waitqueuelock.release();
-        }
+        // Wake up all waiters so they can try to acquire the lock.
+        this->waitqueue.wake();
     }
 
     void exit(int status, int sig) {
@@ -1260,6 +1251,22 @@ namespace NSched {
         // Don't schedule dead threads.
         if (oldstate == Thread::state::DEAD) {
             return;
+        }
+
+        // Don't re-schedule threads that are already suspended (already in a runqueue).
+        if (oldstate == Thread::state::SUSPENDED) {
+            return;
+        }
+
+        // Check if this thread is currently the active thread on some CPU.
+        size_t threadcid = __atomic_load_n(&thread->cid, memory_order_acquire);
+        if (threadcid < SMP::awakecpus) {
+            struct CPU::cpulocal *threadcpu = SMP::cpulist[threadcid];
+            if (threadcpu && threadcpu->currthread == thread) {
+                __atomic_store_n(&thread->tstate, Thread::state::SUSPENDED, memory_order_release);
+                APIC::sendipi(threadcpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+                return;
+            }
         }
 
         // Set state to SUSPENDED before adding to runqueue.

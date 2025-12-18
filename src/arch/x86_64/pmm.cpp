@@ -263,7 +263,8 @@ namespace NArch {
             }
 
             if (found == ALLOCLEVEL) { // If we have actually reached the maximum allocation level, then we couldn't find anything.
-                NUtil::printf("[arch/x86_64/pmm]: Buddy allocator OOM when trying to find for size %lu.\n", size);
+                panic("PMM Buddy allocator OOM.\n");
+
                 return NULL; // OOM.
             }
 
@@ -357,6 +358,7 @@ namespace NArch {
                     page++;
                 }
             }
+            panic("PMM Bitmap allocator OOM.\n");
 done:
             return res;
         }

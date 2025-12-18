@@ -155,6 +155,8 @@ namespace NSched {
         STDERR_FILENO = 2
     };
 
+    class Mutex;
+
     class WaitQueue {
         private:
             NLib::DoubleList<Thread *> waiting;
@@ -183,7 +185,6 @@ namespace NSched {
             void wake(void);
 
             // Dequeue a specific thread from the waitqueue (used by signal delivery).
-            // Returns true if the thread was found and removed.
             bool dequeue(Thread *thread);
     };
 
@@ -423,8 +424,7 @@ namespace NSched {
     class Mutex {
         private:
             volatile uint32_t locked;
-            NLib::DoubleList<Thread *> waitqueue;
-            NArch::Spinlock waitqueuelock;
+            WaitQueue waitqueue; // Using WaitQueue for proper thread tracking.
         public:
             Mutex(void) {
                 this->locked = 0;

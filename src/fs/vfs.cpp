@@ -368,7 +368,7 @@ namespace NFS {
         }
 
         int FileDescriptorTable::open(INode *node, int flags) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             int fd = this->openfds.findfirst();
             if (fd == -1) {
@@ -404,7 +404,7 @@ namespace NFS {
         }
 
         void FileDescriptorTable::reserve(int fd, INode *node, int flags) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             this->fds[fd] = new FileDescriptor(node, flags);
             if (!this->fds[fd]) {
@@ -415,7 +415,7 @@ namespace NFS {
         }
 
         int FileDescriptorTable::close(int fd) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             if (fd < 0 || fd >= (int)this->fds.getsize() || !this->fds[fd] || !this->openfds.test(fd)) {
                 return -EBADF;
@@ -431,7 +431,7 @@ namespace NFS {
         }
 
         int FileDescriptorTable::dup(int oldfd) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             if (oldfd < 0 || oldfd >= (int)this->fds.getsize() || !this->fds[oldfd] || !this->openfds.test(oldfd)) {
                 return -EBADF;
@@ -464,7 +464,7 @@ namespace NFS {
         }
 
         int FileDescriptorTable::dup2(int oldfd, int newfd, bool fcntl) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             if (oldfd < 0 || oldfd >= (int)this->fds.getsize() || !this->fds[oldfd] || !this->openfds.test(oldfd)) { // Discard if we can tell that the FD is bad.
                 return -EBADF;
@@ -546,7 +546,7 @@ namespace NFS {
         }
 
         FileDescriptor *FileDescriptorTable::get(int fd) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeReadLock guard(&this->lock);
 
             if (fd < 0 || fd >= (int)this->fds.getsize() || !this->openfds.test(fd)) {
                 // If the fd is negative, over our current maximum, or not currently allocated:
@@ -556,7 +556,7 @@ namespace NFS {
         }
 
         FileDescriptorTable *FileDescriptorTable::fork(void) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             FileDescriptorTable *newtable = new FileDescriptorTable();
 
@@ -591,7 +591,7 @@ namespace NFS {
         }
 
         bool FileDescriptorTable::iscloseonexec(int fd) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeReadLock guard(&this->lock);
 
             if (fd < 0 || fd >= (int)this->fds.getsize() || !this->openfds.test(fd)) {
                 return false;
@@ -601,7 +601,7 @@ namespace NFS {
         }
 
         void FileDescriptorTable::setcloseonexec(int fd, bool closeit) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             if (fd < 0 || fd >= (int)this->fds.getsize() || !this->openfds.test(fd)) {
                 return;
@@ -615,7 +615,7 @@ namespace NFS {
         }
 
         void FileDescriptorTable::doexec(void) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             for (size_t i = 0; i < this->closeonexec.getsize(); i++) { // Effectively the same logic as closeall(), but we only close FDs marked as close-on-exec.
                 if (this->closeonexec.test(i)) {
@@ -630,7 +630,7 @@ namespace NFS {
         }
 
         void FileDescriptorTable::closeall(void) {
-            NLib::ScopeSpinlock guard(&this->lock);
+            NLib::ScopeWriteLock guard(&this->lock);
 
             for (size_t i = 0; i < this->openfds.getsize(); i++) {
                 if (this->openfds.test(i)) { // Allocated. Free associated if without reference.

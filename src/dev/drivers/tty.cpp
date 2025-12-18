@@ -1354,6 +1354,10 @@ notspecial:
                                 tty->devlock.release();
                                 return ret;
                             }
+
+                        default:
+                            tty->devlock.release();
+                            return -EINVAL;
                     }
                 }
                 return -EINVAL;

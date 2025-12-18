@@ -601,37 +601,37 @@ namespace NFS {
                 }
 
                 int getflags(void) {
-                    return __atomic_load_n(&this->flags, memory_order_seq_cst);
+                    return __atomic_load_n(&this->flags, memory_order_acquire);
                 }
 
                 void setflags(int flags) {
-                    __atomic_store_n(&this->flags, flags, memory_order_seq_cst);
+                    __atomic_store_n(&this->flags, flags, memory_order_release);
                 }
 
                 size_t getoff(void) {
-                    return __atomic_load_n(&this->offset, memory_order_seq_cst);
+                    return __atomic_load_n(&this->offset, memory_order_acquire);
                 }
 
                 void setoff(off_t off) {
-                    __atomic_store_n(&this->offset, off, memory_order_seq_cst);
+                    __atomic_store_n(&this->offset, off, memory_order_release);
                 }
 
                 void addoff(off_t by) {
-                    __atomic_add_fetch(&this->offset, by, memory_order_seq_cst);
+                    __atomic_add_fetch(&this->offset, by, memory_order_acq_rel);
                 }
 
                 size_t ref(void) {
-                    __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
-                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                    __atomic_add_fetch(&this->refcount, 1, memory_order_acq_rel);
+                    return __atomic_load_n(&this->refcount, memory_order_acquire);
                 }
 
                 size_t getref(void) {
-                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                    return __atomic_load_n(&this->refcount, memory_order_acquire);
                 }
 
                 size_t unref(void) {
-                    __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
-                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                    __atomic_sub_fetch(&this->refcount, 1, memory_order_acq_rel);
+                    return __atomic_load_n(&this->refcount, memory_order_acquire);
                 }
         };
 
@@ -639,7 +639,7 @@ namespace NFS {
             private:
                 static const int MAXFDS = 1024; // Hard limit on the number of FDs a single descriptor table is capable of handling. Upper limit prevents expansion that would cripple the kernel.
 
-                NArch::Spinlock lock;
+                NLib::RWLock lock;
                 size_t maxfds = 0; // Current maximum number of file descriptors.
                 NLib::Bitmap openfds; // File descriptors currently open.
                 NLib::Bitmap closeonexec; // File descriptors that we should close before using exec().
