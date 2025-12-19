@@ -110,6 +110,7 @@ namespace NFS {
                     dentry->d_off = bytesread + reclen;
                     dentry->d_reclen = (uint16_t)reclen;
                     dentry->d_type = (child->attr.st_mode & VFS::S_IFMT) >> 12; // File type is stored in the high bits of st_mode.
+
                     NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
                     NLib::strncpy(dentry->d_name, (char *)child->getname(), sizeof(dentry->d_name) - 1);
 
@@ -123,30 +124,16 @@ namespace NFS {
         }
 
         int DevNode::open(int flags) {
-            DevNode *root = (DevNode *)this->fs->getroot();
-            if (this == root) {
-                root->unref();
-                return 0;
-            }
-            root->unref();
-
             if (!this->device) {
-                return -ENODEV;
+                return 0;
             }
 
             return this->device->driver->open(this->attr.st_rdev, flags);
         }
 
         int DevNode::close(int fdflags) {
-            DevNode *root = (DevNode *)this->fs->getroot();
-            if (this == root) {
-                root->unref();
-                return 0;
-            }
-            root->unref();
-
             if (!this->device) {
-                return -ENODEV;
+                return 0;
             }
 
             return this->device->driver->close(this->attr.st_rdev, fdflags);
@@ -185,17 +172,11 @@ namespace NFS {
         }
 
         int DevNode::stat(struct VFS::stat *st) {
-            DevNode *root = (DevNode *)this->fs->getroot();
-            if (this == root) {
-                root->unref();
+
+            if (!this->device) {
                 NLib::ScopeSpinlock guard(&this->metalock);
                 *st = this->attr;
                 return 0;
-            }
-            root->unref();
-
-            if (!this->device) {
-                return -ENODEV;
             }
 
             int ret = this->device->driver->stat(this->attr.st_dev, st);
@@ -281,8 +262,11 @@ namespace NFS {
         }
 
 
-        int DevFileSystem::mount(const char *path, VFS::INode *mntnode) {
+        int DevFileSystem::mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) {
+            (void)src;
             (void)path;
+            (void)flags;
+            (void)data;
 
             NLib::ScopeSpinlock guard(&this->spin);
 
@@ -299,7 +283,8 @@ namespace NFS {
             return 0;
         }
 
-        int DevFileSystem::umount(void) {
+        int DevFileSystem::umount(int flags) {
+            (void)flags;
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->mounted) {
@@ -327,6 +312,7 @@ namespace NFS {
                 dev->ifnode = dnode; // Give device a reference to the node it is connected to.
             } else {
                 if (VFS::S_ISDIR(attr.st_mode)) {
+                    NUtil::printf("devfs: Creating directory node `%s` without associated device.\n", name);
                     // Directories can exist without devices.
                     *nodeout = dnode;
                     return 0;
@@ -356,5 +342,11 @@ namespace NFS {
             }
             return 0;
         }
+
+        static struct VFS::fsreginfo devfsinfo = {
+            .name = "devfs"
+        };
+
+        REGFS(devfs, DevFileSystem::instance, &devfsinfo);
     }
 }

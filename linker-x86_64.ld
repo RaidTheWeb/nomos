@@ -47,6 +47,12 @@ SECTIONS
         __drivers_end = .;
     } :data
 
+    .filesystems : {
+        __filesystems_start = .;
+        KEEP(*(.filesystems*))
+        __filesystems_end = .;
+    } :data
+
     .bss : {
         *(.bss .bss.*)
         *(COMMON)

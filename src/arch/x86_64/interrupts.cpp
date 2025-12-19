@@ -127,9 +127,17 @@ namespace NArch {
                     // Check if this is a file-backed VMA that needs demand paging.
                     NMem::Virt::vmanode *vma = space->vmaspace->findcontaining(addr);
                     if (vma && vma->used && vma->backingfile && !(vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
+                        uintptr_t vmastart = vma->start;
+                        uintptr_t vmaend = vma->end;
+                        off_t vmafileoffset = vma->fileoffset;
+                        uint8_t vmaflags = vma->flags;
+                        NFS::VFS::INode *backingfile = vma->backingfile;
+                        backingfile->ref();
+                        space->lock.release();
+
                         void *newpage = PMM::alloc(PAGESIZE);
                         if (!newpage) {
-                            space->lock.release();
+                            backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
                                 return;
@@ -141,13 +149,13 @@ namespace NArch {
 
                         // Calculate file offset for this page.
                         uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
-                        off_t fileoff = vma->fileoffset + (pagestart - vma->start);
+                        off_t fileoff = vmafileoffset + (pagestart - vmastart);
 
-                        // Read from backing file into the new page.
-                        ssize_t nread = vma->backingfile->read(hhdmoff(newpage), PAGESIZE, fileoff, 0);
+                        // Read from backing file into the new page (may sleep).
+                        ssize_t nread = backingfile->read(hhdmoff(newpage), PAGESIZE, fileoff, 0);
                         if (nread < 0) {
                             PMM::free(newpage, PAGESIZE);
-                            space->lock.release();
+                            backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
                                 return;
@@ -155,12 +163,29 @@ namespace NArch {
                             panic("File read failed during demand paging.\n");
                         }
 
+                        // Re-acquire lock and verify VMA is still valid.
+                        space->lock.acquire();
+                        vma = space->vmaspace->findcontaining(addr);
+                        if (!vma || !vma->used || vma->backingfile != backingfile ||
+                            vma->start != vmastart || vma->end != vmaend) {
+                            // VMA was changed while we were sleeping, discard page.
+                            space->lock.release();
+                            PMM::free(newpage, PAGESIZE);
+                            backingfile->unref();
+                            if (isuserspace) {
+                                NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
+                                return;
+                            }
+                            panic("VMA changed during demand paging.\n");
+                        }
+                        backingfile->unref();
+
                         // Map the page with appropriate flags from VMA.
                         uint64_t mapflags = VMM::PRESENT | VMM::USER;
-                        if (vma->flags & NMem::Virt::VIRT_RW) {
+                        if (vmaflags & NMem::Virt::VIRT_RW) {
                             mapflags |= VMM::WRITEABLE;
                         }
-                        if (vma->flags & NMem::Virt::VIRT_NX) {
+                        if (vmaflags & NMem::Virt::VIRT_NX) {
                             mapflags |= VMM::NOEXEC;
                         }
 

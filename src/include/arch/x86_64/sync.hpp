@@ -32,9 +32,6 @@ namespace NArch {
     class IRQSpinlock {
         private:
             NArch::Spinlock lock;
-
-            // We support up to 16 levels of nesting per CPU.
-            static const size_t MAXDEPTH = 16;
         public:
             IRQSpinlock(void) { }
 

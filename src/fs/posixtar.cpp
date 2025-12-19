@@ -9,8 +9,11 @@
 namespace NFS {
     namespace POSIXTAR {
 
-        int POSIXTARFileSystem::mount(const char *path, VFS::INode *mntnode) {
-            int super = this->RAMFS::RAMFileSystem::mount(path, mntnode); // Super.
+        int POSIXTARFileSystem::mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) {
+            (void)src;
+            (void)flags;
+            (void)data;
+            int super = this->RAMFS::RAMFileSystem::mount(NULL, path, mntnode, 0, NULL); // Super.
             if (super != 0) {
                 return super;
             }
@@ -70,7 +73,7 @@ namespace NFS {
                         attr.st_blksize = 512;
                         attr.st_atime = mtime;
                         attr.st_ctime = mtime;
-                        ssize_t res = VFS::vfs.create(name, &node, attr);
+                        ssize_t res = VFS::vfs->create(name, &node, attr);
                         assert(res == 0, "Failed to allocate VFS node.\n");
 
                         size_t count = node->write((void *)((uintptr_t)current + 512), fsize, 0, 0);
@@ -87,7 +90,7 @@ namespace NFS {
                         attr.st_atime = mtime;
                         attr.st_ctime = mtime;
                         attr.st_nlink = 2; // Directories start with 2 links (self and parent).
-                        ssize_t res = VFS::vfs.create(name, &node, attr);
+                        ssize_t res = VFS::vfs->create(name, &node, attr);
                         assert(res == 0, "Failed to allocate VFS node.\n");
                         node->unref();
                         break;
@@ -98,7 +101,7 @@ namespace NFS {
                         attr.st_uid = uid;
                         attr.st_gid = gid;
                         attr.st_mtime = mtime;
-                        ssize_t res = VFS::vfs.create(name, &node, attr);
+                        ssize_t res = VFS::vfs->create(name, &node, attr);
                         assert(res == 0, "Failed to allocate VFS node.\n");
 
                         size_t len = 0;

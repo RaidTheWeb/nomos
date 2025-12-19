@@ -487,6 +487,10 @@ namespace NFS {
                     __atomic_add_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
 
+                size_t getrefcount(void) {
+                    return __atomic_load_n(&this->refcount, memory_order_seq_cst);
+                }
+
                 // When done with this node, call unref() to decrease reference count.
                 // This lets the filesystem know when it can safely delete this node (no process is using it anymore).
                 void unref(void) {
@@ -520,8 +524,8 @@ namespace NFS {
                     return this->vfs;
                 }
 
-                virtual int mount(const char *path, INode *mntnode) = 0; // Called upon mount -> Good for initialising nodes.
-                virtual int umount(void) = 0; // Called upon unmount -> Good for clean up.
+                virtual int mount(const char *src, const char *path, INode *mntnode, uint64_t flags, const void *data) = 0; // Called upon mount -> Good for initialising nodes.
+                virtual int umount(int flags) = 0; // Called upon unmount -> Good for clean up.
                 virtual int sync(void) = 0; // Called whenever a sync is required.
 
                 // Create a node.
@@ -529,6 +533,32 @@ namespace NFS {
                 // Unlink a node from its parent, on the filesystem. NOTE: Expects caller to hold references to both node and parent, and will unref them as needed.
                 virtual int unlink(INode *node, INode *parent) = 0; // Unlink a node.
         };
+
+        typedef IFileSystem *(fsfactory_t)(VFS *vfs);
+
+        __attribute__((used))
+        static const uint32_t FS_MAGIC = 0x5346534c; // "LSFS" in little-endian
+
+        struct fsreginfo {
+            const char *name;
+        };
+
+        struct fsregentry {
+            uint32_t magic;
+            fsfactory_t *factory;
+            struct fsreginfo *info;
+        } __attribute__((aligned(16)));
+
+        extern "C" struct fsregentry __filesystems_start[];
+        extern "C" struct fsregentry __filesystems_end[];
+
+        // Call this function at the bottom of filesystem implementation files to register them.
+#define REGFS(fsname, factoryfn, fsinfo) \
+    extern "C" __attribute__((section(".filesystems"), used)) struct NFS::VFS::fsregentry fsname##_entry = { \
+        .magic = NFS::VFS::FS_MAGIC, \
+        .factory = factoryfn, \
+        .info = fsinfo \
+    }
 
         class VFS {
             public:
@@ -541,17 +571,24 @@ namespace NFS {
                 NArch::Spinlock mountlock; // XXX: RW lock?
 
                 NLib::DoubleList<struct mntpoint> mounts;
+
+                NLib::HashMap<fsfactory_t *> filesystems;
             private:
 
                 INode *root = NULL;
 
+                struct mntpoint *_findmount(Path *path);
             public:
+                VFS(void) { };
+
                 struct mntpoint *findmount(Path *path);
 
-                // Mount filesystem on path.
-                int mount(const char *path, IFileSystem *fs);
+                // Mount filesystem on path, with a new filesystem instance.
+                int mount(const char *src, const char *path, const char *fs, uint64_t flags, const void *data);
+                // Mount filesystem on path, with an existing filesystem instance.
+                int mount(const char *src, const char *path, IFileSystem *fs, uint64_t flags, const void *data);
                 // Unmount filesystem on path.
-                int umount(const char *path);
+                int umount(const char *path, int flags);
 
                 virtual INode *getroot(void) {
                     this->root->ref();
@@ -673,7 +710,7 @@ namespace NFS {
                 void closeall(void);
         };
 
-        extern VFS vfs;
+        extern VFS *vfs;
     }
 }
 

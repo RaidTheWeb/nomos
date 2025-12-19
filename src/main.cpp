@@ -29,12 +29,6 @@
 #include <stddef.h>
 #include <sys/elf.hpp>
 
-static void hcf(void) {
-    for (;;) {
-        asm ("hlt");
-    }
-}
-
 // These operators must be defined here, or else they won't apply everywhere.
 
 void *operator new(size_t size) {
@@ -70,6 +64,15 @@ void operator delete[](void *ptr, size_t size) {
 
 // Called within the architecture-specific initialisation thread. Stage 1 (early).
 void kpostarch(void) {
+    NFS::VFS::vfs = new NFS::VFS::VFS();
+
+    // Initialise filesystem database from linker-provided registry.
+    for (NFS::VFS::fsregentry *entry = (NFS::VFS::fsregentry *)NFS::VFS::__filesystems_start; (uintptr_t)entry < (uintptr_t)NFS::VFS::__filesystems_end; entry++) {
+        if (entry->magic == NFS::VFS::FS_MAGIC) {
+            NUtil::printf("[nomos]: Discovered filesystem: %s.\n", entry->info->name);
+            NFS::VFS::vfs->filesystems.insert(entry->info->name, entry->factory);
+        }
+    }
 
     const char *initramfs = NArch::cmdline.get("initramfs");
     if (initramfs) { // Exists, load it.
@@ -77,23 +80,22 @@ void kpostarch(void) {
         assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
 
         if (NArch::cmdline.get("root") && !NLib::strcmp(NArch::cmdline.get("root"), "initramfs")) { // If the boot command line specifies that the initramfs should be used as the filesystem root, we should load it.
-            NFS::POSIXTAR::POSIXTARFileSystem *fs = new NFS::POSIXTAR::POSIXTARFileSystem(&NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
-            NFS::VFS::vfs.mount("/", fs);
+            NFS::POSIXTAR::POSIXTARFileSystem *fs = new NFS::POSIXTAR::POSIXTARFileSystem(NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
+            NFS::VFS::vfs->mount(NULL, "/", fs, 0, NULL);
         }
     }
 
-    NFS::PipeFS::pipefs = new NFS::PipeFS::PipeFileSystem(&NFS::VFS::vfs); // Create global PipeFS instance.
+    NFS::PipeFS::pipefs = new NFS::PipeFS::PipeFileSystem(NFS::VFS::vfs); // Create global PipeFS instance.
 
     NFS::VFS::INode *devnode;
-    NFS::VFS::vfs.create("/dev", &devnode, (struct NFS::VFS::stat) {
+    NFS::VFS::vfs->create("/dev", &devnode, (struct NFS::VFS::stat) {
         .st_mode = 0755 | NFS::VFS::S_IFDIR
     });
     devnode->unref();
 
     NDev::setup(); // Initialise device registry.
 
-    NFS::DEVFS::DevFileSystem *devfs = new NFS::DEVFS::DevFileSystem(&NFS::VFS::vfs); // Create and mount device filesystem.
-    NFS::VFS::vfs.mount("/dev", devfs);
+    NFS::VFS::vfs->mount(NULL, "/dev", "devfs", 0, NULL); // Mount devfs at /dev.
 
 
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
@@ -114,7 +116,7 @@ void kpostarch(void) {
     NDev::PCI::init(); // Initialise PCI.
 
     NFS::VFS::INode *node;
-    ssize_t ret = NFS::VFS::vfs.resolve("/bin/init", &node);
+    ssize_t ret = NFS::VFS::vfs->resolve("/bin/init", &node);
     assert(ret == 0, "Failed to locate file.\n");
 
     struct NSys::ELF::header elfhdr;

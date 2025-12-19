@@ -20,7 +20,6 @@
 namespace NSched {
     using namespace NArch;
 
-    static void cleanupthread(Thread *thread);
     static int vruntimecmp(struct RBTree::node *a, struct RBTree::node *b);
 
     // Global zombie list for deferred thread cleanup.
@@ -706,23 +705,18 @@ namespace NSched {
 
         cpu->runqueue.lock.acquire();
 
-        // Re-enqueue previous thread if it was running or suspended (not idle, not dead, not waiting).
+        // Re-enqueue previous thread if it was running (not idle, not dead, not waiting).
         if (prev != cpu->idlethread) {
-            enum Thread::state prevstate = (enum Thread::state)__atomic_load_n(&prev->tstate, memory_order_acquire);
-
-            if (prevstate == Thread::state::RUNNING) {
-                // Thread was running normally, put it back in the queue.
-                __atomic_store_n(&prev->tstate, Thread::state::SUSPENDED, memory_order_release);
-                NArch::CPU::writemb();
+            // Use CAS to atomically transition RUNNING -> SUSPENDED.
+            enum Thread::state expected = Thread::state::RUNNING;
+            if (__atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
+                // Successfully transitioned from RUNNING to SUSPENDED.
                 cpu->runqueue._insert(&prev->node, vruntimecmp);
-            } else if (prevstate == Thread::state::SUSPENDED) {
-                cpu->runqueue._insert(&prev->node, vruntimecmp);
-            } else if (prevstate == Thread::state::DEAD) {
+            } else if (expected == Thread::state::DEAD) {
                 // Thread died, queue for cleanup.
                 queuezombie(prev);
                 prev = NULL; // Don't access prev after this.
             }
-            // WAITING/WAITINGINT/PAUSED threads are handled by waitqueues, not re-enqueued here.
         }
 
         // Get next thread from runqueue.
@@ -838,8 +832,6 @@ namespace NSched {
         // Save our ID before releasing lock since parent may delete us after wake.
         size_t myid = this->id;
 
-        NUtil::printf("Process %lu zombifying, parent=%p (id=%d).\n", myid, parent, parent ? parent->id : -1);
-
         // Release our lock before waking parent and sending SIGCHLD to avoid deadlock.
         this->lock.release();
 
@@ -847,9 +839,7 @@ namespace NSched {
             // Wake parent's exit wait queue so it can reap us.
             // WARNING: After wake(), parent may delete us on another CPU.
             // Do not access 'this' after wake()!
-            NUtil::printf("Process %lu calling wake on parent %d.\n", myid, parent->id);
             parent->exitwq.wake();
-            NUtil::printf("Process %lu finished waking parent %d.\n", myid, parent->id);
 
             // Send SIGCHLD to parent per POSIX: signal sent when child terminates.
             signalproc(parent, SIGCHLD);
@@ -1092,9 +1082,9 @@ namespace NSched {
 
         while (true) {
 #ifdef __x86_64__
-            // Try to acquire the lock.
-            if (!__sync_lock_test_and_set(&this->locked, 1)) {
-                break; // Got the lock.
+            // Try to acquire the lock with a simple atomic exchange.
+            if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) {
+                break; // Got the lock (it was previously unlocked).
             }
 #endif
 
@@ -1103,7 +1093,7 @@ namespace NSched {
 
             // Double-check the lock is still held after acquiring waitqueue lock.
 #ifdef __x86_64__
-            if (!__sync_lock_test_and_set(&this->locked, 1)) {
+            if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) {
                 this->waitqueue.waitinglock.release();
                 break; // Got the lock.
             }
@@ -1111,7 +1101,6 @@ namespace NSched {
 
             // Use the WaitQueue's wait mechanism with lock already held.
             this->waitqueue.wait(true);
-            // When we return, we were woken up - try to acquire again.
         }
 
         __atomic_add_fetch(&current->locksheld, 1, memory_order_seq_cst);
@@ -1122,7 +1111,7 @@ namespace NSched {
         __atomic_sub_fetch(&current->locksheld, 1, memory_order_seq_cst);
 
 #ifdef __x86_64__
-        __sync_lock_release(&this->locked);
+        __atomic_store_n(&this->locked, 0, memory_order_release);
 #endif
 
         // Wake up all waiters so they can try to acquire the lock.
@@ -1245,7 +1234,7 @@ namespace NSched {
 
     // Schedule a thread for execution on the most idle CPU.
     void schedulethread(Thread *thread) {
-        // Atomically transition from any non-DEAD state to SUSPENDED.
+        // Atomically load the current state.
         enum Thread::state oldstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
 
         // Don't schedule dead threads.
@@ -1258,19 +1247,40 @@ namespace NSched {
             return;
         }
 
-        // Check if this thread is currently the active thread on some CPU.
-        size_t threadcid = __atomic_load_n(&thread->cid, memory_order_acquire);
-        if (threadcid < SMP::awakecpus) {
-            struct CPU::cpulocal *threadcpu = SMP::cpulist[threadcid];
-            if (threadcpu && threadcpu->currthread == thread) {
-                __atomic_store_n(&thread->tstate, Thread::state::SUSPENDED, memory_order_release);
-                APIC::sendipi(threadcpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+        // Don't schedule threads that are still running - they'll be re-enqueued by the scheduler.
+        if (oldstate == Thread::state::RUNNING) {
+            // Just send an IPI to trigger a reschedule.
+            size_t threadcid = __atomic_load_n(&thread->cid, memory_order_acquire);
+            if (threadcid < SMP::awakecpus) {
+                struct CPU::cpulocal *threadcpu = SMP::cpulist[threadcid];
+                if (threadcpu) {
+                    APIC::sendipi(threadcpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+                }
+            }
+            return;
+        }
+
+        // Try to atomically transition from the current state to SUSPENDED.
+        // This prevents races where multiple callers try to schedule the same thread.
+        enum Thread::state expected = oldstate;
+        if (!__atomic_compare_exchange_n(&thread->tstate, &expected,
+                                         Thread::state::SUSPENDED,
+                                         false, memory_order_acq_rel, memory_order_acquire)) {
+            // State changed from under us. Re-check what happened.
+            if (expected == Thread::state::DEAD || expected == Thread::state::SUSPENDED ||
+                expected == Thread::state::RUNNING) {
+                // Either dead, already scheduled, or still running - nothing to do.
+                return;
+            }
+            // Try again with the new state.
+            if (!__atomic_compare_exchange_n(&thread->tstate, &expected,
+                                             Thread::state::SUSPENDED,
+                                             false, memory_order_acq_rel, memory_order_acquire)) {
+                // Failed again, bail out.
                 return;
             }
         }
 
-        // Set state to SUSPENDED before adding to runqueue.
-        __atomic_store_n(&thread->tstate, Thread::state::SUSPENDED, memory_order_release);
         NArch::CPU::writemb();
 
         // Find the most idle CPU for this thread.
@@ -1942,7 +1952,7 @@ namespace NSched {
         current->lock.release();
 
         NFS::VFS::INode *inode;
-        ret = NFS::VFS::vfs.resolve(pathbuf, &inode, cwd, true);
+        ret = NFS::VFS::vfs->resolve(pathbuf, &inode, cwd, true);
         if (ret < 0) {
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
@@ -1952,7 +1962,7 @@ namespace NSched {
         delete[] pathbuf;
 
         // Check permission against EUID/EGID.
-        if (!NFS::VFS::vfs.checkaccess(inode, NFS::VFS::O_EXEC, euid, egid)) {
+        if (!NFS::VFS::vfs->checkaccess(inode, NFS::VFS::O_EXEC, euid, egid)) {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
@@ -2035,7 +2045,7 @@ namespace NSched {
 
             // Load interpreter ELF.
             NFS::VFS::INode *interpnode;
-            ssize_t r = NFS::VFS::vfs.resolve(interp, &interpnode, cwd, true);
+            ssize_t r = NFS::VFS::vfs->resolve(interp, &interpnode, cwd, true);
             delete[] interp;
             if (r < 0) {
                 inode->unref();
@@ -2136,80 +2146,77 @@ namespace NSched {
         // Mark that this process has called execve.
         current->hasexeced = true;
 
-            if (NFS::VFS::S_ISSUID(attr.st_mode)) {
-                current->euid = attr.st_uid; // Run as owner of file.
+        if (NFS::VFS::S_ISSUID(attr.st_mode)) {
+            current->euid = attr.st_uid; // Run as owner of file.
+        }
+
+        if (NFS::VFS::S_ISSGID(attr.st_mode)) {
+            current->egid = attr.st_gid; // Run as owner of file.
+        }
+
+        // "The effective UID of the process is copied to the saved set-user-ID"
+        current->suid = current->euid;
+        current->sgid = current->egid;
+
+        // RUID and RGID remain unchanged.
+
+        current->addrspace->lock.acquire();
+        current->addrspace->ref--;
+        size_t ref = current->addrspace->ref;
+        current->addrspace->lock.release();
+        if (ref == 0) {
+            delete current->addrspace;
+        }
+
+        newspace->ref++;
+        current->addrspace = newspace;
+
+        current->fdtable->doexec(); // Close FDs with O_CLOEXEC.
+
+        // Reset signal handlers to SIG_DFL on exec (except those set to SIG_IGN remain SIG_IGN).
+        for (size_t i = 0; i < NSIG; i++) {
+            if (current->signalstate.actions[i].handler != SIG_IGN) {
+                current->signalstate.actions[i].handler = SIG_DFL;
+                current->signalstate.actions[i].mask = 0;
+                current->signalstate.actions[i].flags = 0;
+                current->signalstate.actions[i].restorer = NULL;
             }
+        }
+        // Pending signals are cleared on exec.
+        current->signalstate.pending = 0;
+        // Signal mask is preserved across exec.
 
-            if (NFS::VFS::S_ISSGID(attr.st_mode)) {
-                current->egid = attr.st_gid; // Run as owner of file.
-            }
-
-            // "The effective UID of the process is copied to the saved set-user-ID"
-            current->suid = current->euid;
-            current->sgid = current->egid;
-
-            // RUID and RGID remain unchanged.
-
-            current->addrspace->lock.acquire();
-            current->addrspace->ref--;
-            size_t ref = current->addrspace->ref;
-            current->addrspace->lock.release();
-            if (ref == 0) {
-                delete current->addrspace;
-            }
-
-            newspace->ref++;
-            current->addrspace = newspace;
-
-            current->fdtable->doexec(); // Close FDs with O_CLOEXEC.
-
-            // Reset signal handlers to SIG_DFL on exec (except those set to SIG_IGN remain SIG_IGN).
-            for (size_t i = 0; i < NSIG; i++) {
-                if (current->signalstate.actions[i].handler != SIG_IGN) {
-                    current->signalstate.actions[i].handler = SIG_DFL;
-                    current->signalstate.actions[i].mask = 0;
-                    current->signalstate.actions[i].flags = 0;
-                    current->signalstate.actions[i].restorer = NULL;
-                }
-            }
-            // Pending signals are cleared on exec.
-            current->signalstate.pending = 0;
-            // Signal mask is preserved across exec.
-
-            NLib::memset(&NArch::CPU::get()->currthread->ctx, 0, sizeof(NArch::CPU::get()->currthread->ctx));
+        struct NArch::CPU::context *sysctx = NArch::CPU::get()->currthread->sysctx;
+        NLib::memset(sysctx, 0, sizeof(NArch::CPU::get()->currthread->ctx));
 #ifdef __x86_64__
-            NLib::memset(&NArch::CPU::get()->currthread->xctx, 0, sizeof(NArch::CPU::get()->currthread->xctx));
+        NLib::memset(&NArch::CPU::get()->currthread->xctx, 0, sizeof(NArch::CPU::get()->currthread->xctx));
 
-            NArch::CPU::get()->currthread->ctx.cs = 0x23; // User Code.
-            NArch::CPU::get()->currthread->ctx.ds = 0x1b; // User Data.
-            NArch::CPU::get()->currthread->ctx.es = 0x1b; // Ditto.
-            NArch::CPU::get()->currthread->ctx.ss = 0x1b; // Ditto.
+        sysctx->cs = 0x23; // User Code.
+        sysctx->ds = 0x1b; // User Data.
+        sysctx->es = 0x1b; // Ditto.
+        sysctx->ss = 0x1b; // Ditto.
 
-            NArch::CPU::get()->currthread->ctx.rip = isdynamic ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
-            NArch::CPU::get()->currthread->ctx.rsp = (uint64_t)rsp;
-            NArch::CPU::get()->currthread->ctx.rflags = 0x200; // Enable interrupts.
+        sysctx->rip = isdynamic ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
+        sysctx->rsp = (uint64_t)rsp;
+        sysctx->rflags = 0x200; // Enable interrupts.
 
 
-            NLib::memset(NArch::CPU::get()->currthread->fctx.fpustorage, 0, CPU::get()->fpusize);
-            NArch::CPU::get()->currthread->fctx.mathused = false; // Mark as unused.
+        NLib::memset(NArch::CPU::get()->currthread->fctx.fpustorage, 0, CPU::get()->fpusize);
+        NArch::CPU::get()->currthread->fctx.mathused = false; // Mark as unused.
 
-            if (CPU::get()->hasxsave) {
-                uint64_t cr0 = CPU::rdcr0();
-                asm volatile("clts");
-                // Initialise region.
-                asm volatile("xsave (%0)" : : "r"(NArch::CPU::get()->currthread->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
-                CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
-            }
+        if (CPU::get()->hasxsave) {
+            uint64_t cr0 = CPU::rdcr0();
+            asm volatile("clts");
+            // Initialise region.
+            asm volatile("xsave (%0)" : : "r"(NArch::CPU::get()->currthread->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
+            CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
+        }
 #endif
 
-            NArch::VMM::swapcontext(newspace);
+        NArch::VMM::swapcontext(newspace);
+        current->lock.release();
 
-            current->lock.release();
-
-            NArch::CPU::ctx_swap(&NArch::CPU::get()->currthread->ctx); // Context switch to new entry point.
-
-        panic("sys_execve ctx_swap returned unexpectedly!");
-        __builtin_unreachable();
+        SYSCALL_RET(sysctx->rax); // Success.
     }
 
     #define WNOHANG     1 // Don't block.

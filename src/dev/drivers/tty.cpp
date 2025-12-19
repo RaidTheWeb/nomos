@@ -366,7 +366,9 @@ namespace NDev {
                 NLib::ScopeIRQSpinlock guard(&this->linelock);
                 if (this->linebuffer.empty()) { // EOF is only valid at the start of a line.
                     this->pending_eof = true;
-                    this->readwait.wake();
+                    if (NSched::initialised) {
+                        this->readwait.wake();
+                    }
                     return;
                 }
             }
@@ -390,7 +392,9 @@ namespace NDev {
                     }
                     this->outbuffer.push(c);
                 }
-                this->readwait.wake(); // We have a full line now. Wake waiters.
+                if (NSched::initialised) {
+                    this->readwait.wake(); // We have a full line now. Wake waiters.
+                }
                 return;
                 // Forced to flush output to buffer, we've finished this line.
                 // POLLIN. We've got data! Canonical mode only does this if it finds a line.
@@ -428,7 +432,9 @@ namespace NDev {
 
             this->inbuffer.push(c); // Append character to input buffer. Raw mode doesn't process any input.
 
-            this->readwait.wake();
+            if (NSched::initialised) {
+                this->readwait.wake();
+            }
             // POLLIN. Raw will notify for every appending character.
         }
     }
@@ -782,14 +788,14 @@ dowrite:
                 };
 
                 VFS::INode *devnode;
-                ssize_t res = VFS::vfs.create("/dev/tty0", &devnode, st);
+                ssize_t res = VFS::vfs->create("/dev/tty0", &devnode, st);
                 assert(res == 0, "Failed to create device node."); // Create device node.
                 devnode->unref();
 
                 st.st_rdev = CURDEVICEID;
                 // Should be rw by all users. It's not an actual device itself, it just points to the current one.
                 st.st_mode = (VFS::S_IRUSR | VFS::S_IWUSR | VFS::S_IRGRP | VFS::S_IWGRP | VFS::S_IROTH | VFS::S_IWOTH) | VFS::S_IFCHR;
-                res = VFS::vfs.create("/dev/tty", &devnode, st);
+                res = VFS::vfs->create("/dev/tty", &devnode, st);
                 assert(res == 0, "Failed to create device node."); // Create abstract /dev/tty.
                 devnode->unref();
 
@@ -811,7 +817,7 @@ dowrite:
 
 
                     VFS::INode *devnode;
-                    ssize_t res = VFS::vfs.create(path, &devnode, st);
+                    ssize_t res = VFS::vfs->create(path, &devnode, st);
                     assert(res == 0, "Failed to create device node."); // Create device node. This will automatically assign the TTYDevice to the node, and give the TTYDevice reference to its node.
                     devnode->unref();
                 }

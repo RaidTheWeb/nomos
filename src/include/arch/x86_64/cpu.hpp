@@ -123,6 +123,11 @@ namespace NArch {
             uint64_t lapicfreq = 0;
             bool intstatus = false; // Interrupts enabled?
 
+            // IRQSpinlock state stack for nested lock acquisition.
+            static constexpr size_t IRQSTACKMAX = 16;
+            bool irqstatestack[IRQSTACKMAX];
+            size_t irqstackdepth = 0;
+
             struct tlblocal tlblocal;
 
             uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
@@ -135,11 +140,6 @@ namespace NArch {
             uint64_t xsavemask = 0;
 
             bool preemptdisabled = true; // Is preemption disabled on this CPU?
-
-            // Per-CPU IRQSpinlock state storage for proper nested lock handling.
-            static const size_t IRQSPINLOCK_MAXDEPTH = 16;
-            bool irqstatestack[IRQSPINLOCK_MAXDEPTH] = { false };
-            size_t irqstatedepth = 0;
 
             bool setint(bool status) {
                 asm volatile("cli");

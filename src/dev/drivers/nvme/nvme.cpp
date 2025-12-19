@@ -1,6 +1,7 @@
 #ifdef __x86_64__
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/e9.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
 
@@ -501,7 +502,7 @@ namespace NDev {
         char namebuf[64];
         NUtil::snprintf(namebuf, sizeof(namebuf), "/dev/nvme%un%u", ctrl->num, ns->nsnum + 1);
         VFS::INode *devnode;
-        ssize_t res = VFS::vfs.create(namebuf, &devnode, st);
+        ssize_t res = VFS::vfs->create(namebuf, &devnode, st);
         assert(res == 0, "Failed to create NVMe block device node.");
         devnode->unref();
 
@@ -521,7 +522,7 @@ namespace NDev {
                 );
                 registry->add(partblkdev);
 
-                res = VFS::vfs.create(namebuf, &devnode, st);
+                res = VFS::vfs->create(namebuf, &devnode, st);
                 assert(res == 0, "Failed to create NVMe partition block device node.");
                 devnode->unref();
             }

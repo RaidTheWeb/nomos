@@ -203,7 +203,7 @@ namespace NSched {
         uint64_t deliverable = proc->signalstate.pending & ~__atomic_load_n(&currthread->blocked, memory_order_acquire);
         if (deliverable == 0) {
             if (caller == NSched::POSTSYSCALL) {
-                NArch::CPU::get()->intstatus = true; // Restore interrupt status for syscall context.
+                NArch::CPU::get()->intstatus = true;
             }
             return; // No signals to deliver.
         }
@@ -215,8 +215,6 @@ namespace NSched {
         clearpending(&proc->signalstate, sig);
 
         deliversignal(currthread, sig, ctx, caller);
-
-        // Restore interrupt status if we're returning from syscall context.
         if (caller == NSched::POSTSYSCALL) {
             NArch::CPU::get()->intstatus = true;
         }
@@ -277,8 +275,8 @@ namespace NSched {
         SYSCALL_RET(0);
     }
 
-    extern "C" int sys_kill(size_t pid, int sig) {
-        SYSCALL_LOG("sys_kill(%u, %d).\n", pid, sig);
+    extern "C" int sys_kill(ssize_t pid, int sig) {
+        SYSCALL_LOG("sys_kill(%ld, %d).\n", pid, sig);
 
         if (sig < 0 || sig >= (int)NSIG) {
             SYSCALL_RET(-EINVAL);
@@ -358,11 +356,11 @@ namespace NSched {
 
                 it.next();
             }
-        } else if (pid == (size_t)-1) { // Send to all processes we have permission to send to.
+        } else if (pid == -1) { // Send to all processes we have permission to send to.
             // XXX: Figure out how the hell to do this efficiently.
             // This would basically be what is used when shutting down the system.
             SYSCALL_RET(-ENOSYS); // Not implemented.
-        } else if (pid < (size_t)-1) { // Send to specific process group.
+        } else if (pid < -1) { // Send to specific process group.
             Process **ptarget = pidtable->find(-pid); // PID is negative, so invert to get PGID.
             if (!ptarget || !*ptarget) {
                 SYSCALL_RET(-ESRCH); // No such process group.
@@ -767,48 +765,64 @@ namespace NSched {
             return -EINVAL;
         }
 
-        NLib::ScopeIRQSpinlock guard(&proc->lock);
-        // Set pending bit for signal.
-        setpending(&proc->signalstate, sig);
+        Thread *towake = NULL;
+        WaitQueue *wq = NULL;
 
-        // Find a thread to deliver the signal to.
-        Thread *paused_candidate = NULL;
+        {
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
+            // Set pending bit for signal.
+            setpending(&proc->signalstate, sig);
 
-        NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
-        for (; it.valid(); it.next()) {
-            Thread *thread = *it.get();
-            if (!thread) continue;
+            // Find a thread to deliver the signal to.
+            Thread *pausedcandidate = NULL;
 
-            // Check if this thread has the signal blocked (safe under process lock).
-            if (isblocked(&thread->blocked, sig)) {
-                continue; // This thread has the signal blocked, try next thread.
-            }
+            NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
+            for (; it.valid(); it.next()) {
+                Thread *thread = *it.get();
+                if (!thread) continue;
 
-            enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-
-            // Prefer threads that are already running or ready.
-            if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
-                // Signal will be delivered when this thread next checks for pending signals.
-                return 0;
-            }
-
-            // Remember first paused thread as candidate.
-            if (state == Thread::PAUSED && !paused_candidate) {
-                paused_candidate = thread;
-            }
-
-            if (state == Thread::WAITINGINT && thread->waitingon) { // Only interruptible waits can be woken.
-                WaitQueue *wq = thread->waitingon;
-                if (wq->dequeue(thread)) {
-                    NSched::schedulethread(thread);
+                // Check if this thread has the signal blocked (safe under process lock).
+                if (isblocked(&thread->blocked, sig)) {
+                    continue; // This thread has the signal blocked, try next thread.
                 }
-                return 0;
+
+                enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+                // Prefer threads that are already running or ready.
+                if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
+                    // Signal will be delivered when this thread next checks for pending signals.
+                    return 0;
+                }
+
+                // Remember first paused thread as candidate.
+                if (state == Thread::PAUSED && !pausedcandidate) {
+                    pausedcandidate = thread;
+                }
+
+                if (state == Thread::WAITINGINT && thread->waitingon) { // Only interruptible waits can be woken.
+                    wq = thread->waitingon;
+                    towake = thread;
+                    break;
+                }
+            }
+
+            // If no interruptible waiter found, use paused candidate.
+            if (!towake && pausedcandidate) {
+                towake = pausedcandidate;
             }
         }
 
-        // If we found a paused thread, wake it up.
-        if (paused_candidate) {
-            NSched::schedulethread(paused_candidate);
+        // Now schedule the thread outside of the process lock to avoid deadlocks.
+        if (towake) {
+            if (wq) {
+                // Dequeue from waitqueue first, then schedule.
+                if (wq->dequeue(towake)) {
+                    NSched::schedulethread(towake);
+                }
+            } else {
+                // Paused thread, just schedule it directly.
+                NSched::schedulethread(towake);
+            }
         }
 
         return 0;
@@ -839,38 +853,49 @@ namespace NSched {
         }
 
         Process *proc = thread->process;
-        NLib::ScopeIRQSpinlock guard(&proc->lock);
+        bool needschedule = false;
+        WaitQueue *wq = NULL;
 
-        // Set pending bit for signal at process level.
-        setpending(&proc->signalstate, sig);
+        {
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
 
-        // Check if the target thread has this signal blocked.
-        if (isblocked(&thread->blocked, sig)) {
-            // Signal is blocked in this thread, it will remain pending.
-            return 0;
+            // Set pending bit for signal at process level.
+            setpending(&proc->signalstate, sig);
+
+            // Check if the target thread has this signal blocked.
+            if (isblocked(&thread->blocked, sig)) {
+                // Signal is blocked in this thread, it will remain pending.
+                return 0;
+            }
+
+            // Check thread state and determine if we need to wake it.
+            enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+            if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
+                // Thread is already active, signal will be delivered when it checks.
+                return 0;
+            }
+
+            if (state == Thread::PAUSED) {
+                // Wake the paused thread so it can handle the signal.
+                needschedule = true;
+            } else if (state == Thread::WAITINGINT && thread->waitingon) {
+                // Only interruptible waits can be woken.
+                wq = thread->waitingon;
+                needschedule = true;
+            }
         }
+        // Process lock released here.
 
-        // Check thread state and wake if necessary.
-        enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-
-        if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
-            // Thread is already active, signal will be delivered when it checks.
-            return 0;
-        }
-
-        if (state == Thread::PAUSED) {
-            // Wake the paused thread so it can handle the signal.
-            // Paused threads are not in waitqueues, so this is safe.
-            NSched::schedulethread(thread);
-            return 0;
-        }
-
-        if (state == Thread::WAITINGINT && thread->waitingon) { // Only interruptible waits can be woken.
-            WaitQueue *wq = thread->waitingon;
-            if (wq->dequeue(thread)) { // Threads sitting in waitqueues MUST be dequeued by us.
+        // Schedule outside the lock.
+        if (needschedule) {
+            if (wq) {
+                if (wq->dequeue(thread)) {
+                    NSched::schedulethread(thread);
+                }
+            } else {
                 NSched::schedulethread(thread);
             }
-            return 0;
         }
 
         return 0;

@@ -96,9 +96,13 @@ namespace NFS {
                     this->root = new DevNode(this, "", attr);
                 }
 
-                int mount(const char *path, VFS::INode *mntnode) override;
+                static VFS::IFileSystem *instance(VFS::VFS *vfs) {
+                    return new DevFileSystem(vfs);
+                }
+
+                int mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) override;
                 int sync(void) override;
-                int umount(void) override;
+                int umount(int flags) override;
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
                 int unlink(VFS::INode *node, VFS::INode *parent) override;
         };

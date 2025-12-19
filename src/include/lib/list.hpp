@@ -46,8 +46,8 @@ namespace NLib {
 
             T popback(void) {
                 if (this->count > 0) {
-                    T item = this->buffer[this->tail];
                     this->tail = (this->tail + this->capacity - 1) % this->capacity;
+                    T item = this->buffer[this->tail];
                     this->count--;
                     return item;
                 }

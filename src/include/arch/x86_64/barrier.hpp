@@ -3,15 +3,15 @@
 
 namespace NArch {
     namespace CPU {
-        static __attribute__((always_inline)) void writemb(void) {
+        static __attribute__((always_inline)) inline void writemb(void) {
             asm volatile("" : : : "memory");
         }
 
-        static __attribute__((always_inline)) void readmb(void) {
+        static __attribute__((always_inline)) inline void readmb(void) {
             asm volatile("" : : : "memory");
         }
 
-        static __attribute__((always_inline)) void mb(void) {
+        static __attribute__((always_inline)) inline void mb(void) {
             asm volatile("mfence" : : : "memory");
         }
     }

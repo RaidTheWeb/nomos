@@ -40,9 +40,14 @@ namespace NFS {
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
                 ssize_t readdir(void *buf, size_t count, off_t offset) override {
+                    (void)buf;
+                    (void)count;
+                    (void)offset;
                     return -ENOTDIR;
                 }
                 ssize_t readlink(char *buf, size_t bufsiz) override {
+                    (void)buf;
+                    (void)bufsiz;
                     return -EINVAL;
                 }
                 VFS::INode *lookup(const char *name) override {
@@ -77,12 +82,16 @@ namespace NFS {
                     this->root = new PipeNode(this, "", attr, false);
                 }
 
-                int mount(const char *path, VFS::INode *mntnode) override {
+                int mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) override {
+                    (void)src;
                     (void)path;
                     (void)mntnode;
+                    (void)flags;
+                    (void)data;
                     return -EINVAL; // Purely virtual filesystem.
                 }
-                int umount(void) override {
+                int umount(int flags) override {
+                    (void)flags;
                     return 0;
                 }
                 int sync(void) override;
@@ -102,6 +111,8 @@ namespace NFS {
                 }
 
                 int unlink(VFS::INode *node, VFS::INode *parent) override {
+                    (void)node;
+                    (void)parent;
                     return -ENOSYS; // Not supported.
                 }
         };

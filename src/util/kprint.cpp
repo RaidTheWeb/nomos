@@ -11,7 +11,7 @@
 #include <util/kprint.hpp>
 
 namespace NUtil {
-    NArch::Spinlock printlock = NArch::Spinlock();
+    NArch::IRQSpinlock printlock = NArch::IRQSpinlock();
 
     void oprintlock(void) {
         printlock.release();
@@ -349,38 +349,17 @@ flagbreak:
         len -= 1; // Back out on null termination for this.
         bool writestatus = consolewrite;
 
-        // if (canmutex && NArch::CPU::get()->currthread) {
-            // mutex.acquire();
-        // } else {
-        bool state = false;
-        if (writestatus) {
-            printlock.acquire();
-        } else {
-            state = NArch::CPU::get()->setint(false);
-            printlock.acquire();
-        }
+        printlock.acquire();
 
 #ifdef __x86_64__
         if (writestatus) {
             NLimine::console_write(buffer, len);
         }
 
-        // for (size_t i = 0; i < len; i++) {
-            // NArch::Serial::ports[0].write(buffer[i]);
-        // }
-
         NArch::E9::puts(buffer);
 #endif
-        // if (canmutex && NArch::CPU::get()->currthread) {
-            // mutex.release();
-        // } else {
-        if (writestatus) {
-            printlock.release();
-        } else {
-            printlock.release();
-            NArch::CPU::get()->setint(state);
-        }
-        // }
+
+        printlock.release();
         return len;
     }
 }

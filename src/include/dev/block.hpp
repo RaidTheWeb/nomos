@@ -83,6 +83,8 @@ namespace NDev {
                 this->parent = parent;
                 this->blksize = parent->blksize;
                 this->cache = parent->cache; // Share cache with parent device.
+                this->startlba = startlba;
+                this->lastlba = lastlba;
             }
 
             ~PartitionBlockDevice() = default;

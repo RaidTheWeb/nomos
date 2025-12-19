@@ -37,23 +37,23 @@ namespace NDev {
                 };
 
                 VFS::INode *devnode;
-                VFS::vfs.create("/dev/null", &devnode, st);
+                VFS::vfs->create("/dev/null", &devnode, st);
                 devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, ZEROMINOR);
-                VFS::vfs.create("/dev/zero", &devnode, st);
+                VFS::vfs->create("/dev/zero", &devnode, st);
                 devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, FULLMINOR);
-                VFS::vfs.create("/dev/full", &devnode, st);
+                VFS::vfs->create("/dev/full", &devnode, st);
                 devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, RANDOMMINOR);
-                VFS::vfs.create("/dev/random", &devnode, st);
+                VFS::vfs->create("/dev/random", &devnode, st);
                 devnode->unref();
 
                 st.st_rdev = DEVFS::makedev(MAJOR, URANDOMMINOR);
-                VFS::vfs.create("/dev/urandom", &devnode, st);
+                VFS::vfs->create("/dev/urandom", &devnode, st);
                 devnode->unref();
             }
 

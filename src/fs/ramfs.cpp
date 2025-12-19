@@ -279,8 +279,11 @@ namespace NFS {
             return this->children.remove(name);
         }
 
-        int RAMFileSystem::mount(const char *path, VFS::INode *mntnode) {
+        int RAMFileSystem::mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) {
+            (void)src;
             (void)path;
+            (void)flags;
+            (void)data;
 
             NLib::ScopeSpinlock guard(&this->spin);
 
@@ -297,7 +300,8 @@ namespace NFS {
             return 0;
         }
 
-        int RAMFileSystem::umount(void) {
+        int RAMFileSystem::umount(int flags) {
+            (void)flags;
             NLib::ScopeSpinlock guard(&this->spin);
 
             if (!this->mounted) {
@@ -318,6 +322,7 @@ namespace NFS {
             } else {
                 attr.st_nlink = 1; // Files start with 1 link.
             }
+
             *nodeout = new RAMNode(this, name, attr);
             return 0;
         }
@@ -341,5 +346,16 @@ namespace NFS {
             }
             return 0;
         }
+
+        static struct VFS::fsreginfo ramfsinfo = {
+            .name = "ramfs"
+        };
+
+        static struct VFS::fsreginfo tmpfsinfo = {
+            .name = "tmpfs"
+        };
+
+        REGFS(ramfs, RAMFileSystem::instance, &ramfsinfo);
+        REGFS(tmpfs, RAMFileSystem::instance, &tmpfsinfo);
     }
 }

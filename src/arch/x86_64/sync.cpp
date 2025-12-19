@@ -50,31 +50,34 @@ namespace NArch {
     }
 
     void IRQSpinlock::acquire(void) {
-        struct CPU::cpulocal *cpu = CPU::get();
-        bool oldstate = false;
-
-        if (cpu != NULL) {
-            oldstate = cpu->setint(false);
-
-            // Push state onto per-CPU stack.
-            assert(cpu->irqstatedepth < CPU::cpulocal::IRQSPINLOCK_MAXDEPTH, "IRQSpinlock nesting depth exceeded.\n");
-            cpu->irqstatestack[cpu->irqstatedepth++] = oldstate;
+        bool oldstate;
+        if (CPU::get()) {
+            oldstate = CPU::get()->setint(false);
+            // Push saved state onto per-CPU stack for nested locks.
+            size_t depth = CPU::get()->irqstackdepth;
+            if (depth < CPU::cpulocal::IRQSTACKMAX) {
+                CPU::get()->irqstatestack[depth] = oldstate;
+                CPU::get()->irqstackdepth = depth + 1;
+            }
+            // If stack overflows, we just lose the state - interrupts stay disabled.
         } else {
             asm volatile("cli");
         }
-
         this->lock.acquire(); // Raw acquire internal lock.
     }
 
     void IRQSpinlock::release(void) {
         this->lock.release(); // Raw release internal lock.
-
-        // Restore interrupt state from per-CPU stack.
-        struct CPU::cpulocal *cpu = CPU::get();
-        if (cpu != NULL) {
-            assert(cpu->irqstatedepth > 0, "IRQSpinlock release without matching acquire.\n");
-            bool oldstate = cpu->irqstatestack[--cpu->irqstatedepth];
-            cpu->setint(oldstate);
+        if (CPU::get()) {
+            // Pop and restore state from per-CPU stack.
+            size_t depth = CPU::get()->irqstackdepth;
+            if (depth > 0) {
+                depth--;
+                CPU::get()->irqstackdepth = depth;
+                CPU::get()->setint(CPU::get()->irqstatestack[depth]);
+            }
+        } else {
+            asm volatile("sti");
         }
     }
 

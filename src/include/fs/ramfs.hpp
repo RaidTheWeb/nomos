@@ -60,8 +60,13 @@ namespace NFS {
                     this->root = new RAMNode(this, "", attr);
                 }
 
-                int mount(const char *path, VFS::INode *mntnode) override;
-                int umount(void) override;
+                static VFS::IFileSystem *instance(VFS::VFS *vfs) {
+                    return new RAMFileSystem(vfs);
+                }
+
+
+                int mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) override;
+                int umount(int flags) override;
                 int sync(void) override { return 0; }
 
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;

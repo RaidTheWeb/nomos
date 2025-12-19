@@ -35,7 +35,7 @@ namespace NDev {
                 };
 
                 VFS::INode *devnode;
-                ssize_t res = VFS::vfs.create("/dev/console", &devnode, st);
+                ssize_t res = VFS::vfs->create("/dev/console", &devnode, st);
                 assert(res == 0, "Failed to create device node.\n");
                 devnode->unref();
 
@@ -47,7 +47,7 @@ namespace NDev {
                 }
                 char path[1024];
                 NUtil::snprintf(path, sizeof(path), "/dev/%s", target);
-                assert(VFS::vfs.resolve(path, &this->targetnode, NULL, false) == 0, "Failed to resolve syscon target node.\n");
+                assert(VFS::vfs->resolve(path, &this->targetnode, NULL, false) == 0, "Failed to resolve syscon target node.\n");
 
                 assert(this->targetnode, "Invalid syscon target.");
                 this->targetnode->unref();

@@ -10,43 +10,117 @@
 
 namespace NFS {
     namespace VFS {
-        VFS vfs = VFS();
+        VFS *vfs = NULL;
 
-        int VFS::mount(const char *path, IFileSystem *fs) {
+        int VFS::mount(const char *src, const char *path, const char *fs, uint64_t flags, const void *data) {
+            fsfactory_t *factory = NULL;
+            {
+                NLib::ScopeSpinlock guard(&this->mountlock);
+                fsfactory_t **fsp = this->filesystems.find(fs);
+                if (!fsp) {
+                    return -ENODEV; // Filesystem not found.
+                }
+                factory = *fsp;
+            }
+
+            IFileSystem *filesystem = factory(this); // Create new filesystem instance.
+
+            return this->mount(src, path, filesystem, flags, data);
+        }
+
+        int VFS::mount(const char *src, const char *_path, IFileSystem *fs, uint64_t flags, const void *data) {
             INode *mntnode = NULL;
-            Path mntpath = Path(path);
+            Path mntpath = Path(_path);
+
+            // Mount paths must be absolute.
+            if (!mntpath.isabsolute()) {
+                return -EINVAL;
+            }
+
+            const char *path = mntpath.construct();
 
             // Resolve the mountpoint node (except for root mount).
             if (mntpath.depth() > 0) {
                 ssize_t ret = this->resolve(path, &mntnode, NULL, true);
                 if (ret < 0) {
+                    delete[] path;
                     return ret; // Mountpoint doesn't exist.
+                }
+
+                // Ensure mountpoint is a directory.
+                if (!S_ISDIR(mntnode->getattr().st_mode)) {
+                    delete[] path;
+                    mntnode->unref();
+                    return -ENOTDIR;
                 }
             }
 
             {
                 NLib::ScopeSpinlock guard(&this->mountlock);
-                this->mounts.push((struct VFS::mntpoint) { path, fs, mntnode });
+                // Check if there is a mountpoint on this specific path already. Findmount cannot be used here, as it finds the best match, not exact match.
+                NLib::DoubleList<struct mntpoint>::Iterator it = this->mounts.begin();
+                // Shadow path with mount path.
+                for (; it.valid(); it.next()) {
+                    if (!NLib::strcmp(it.get()->path, path)) {
+                        if (mntnode) {
+                            mntnode->unref();
+                        }
+                        delete[] path;
+                        return -EBUSY; // Mountpoint already in use.
+                    }
+                }
+
+            }
+            if (mntpath.depth() > 0) {
+                // Ensure we have permission to mount here.
+                NSched::Process *proc = NArch::CPU::get()->currthread->process;
+                proc->lock.acquire();
+                bool access = this->checkaccess(mntnode, R_OK | X_OK, proc->euid, proc->egid);
+                proc->lock.release();
+                if (!access) {
+                    delete[] path;
+                    mntnode->unref();
+                    return -EACCES;
+                }
+            }
+
+            {
+                NLib::ScopeSpinlock guard(&this->mountlock);
+
+                this->mounts.push((struct VFS::mntpoint) { NLib::strdup(path), fs, mntnode });
 
                 if (!mntpath.depth() && !this->root) { // Attempt to assign root if we haven't already.
                     this->root = fs->getroot();
                 }
             }
 
-            if (fs->mount(path, mntnode) != 0) {
-                this->umount(path);
+            if (fs->mount(src, path, mntnode, flags, data) != 0) {
+                this->umount(path, 0); // Rollback mount on failure.
                 if (mntnode) {
                     mntnode->unref();
                 }
+                delete[] path;
                 return -EINVAL;
             }
+            delete[] path;
             return 0;
         }
 
-        int VFS::umount(const char *path) {
+        int VFS::umount(const char *_path, int flags) {
+            // Normalize and validate path.
+            Path upath = Path(_path);
+
+            // Umount paths must be absolute.
+            if (!upath.isabsolute()) {
+                return -EINVAL;
+            }
+
+            const char *path = upath.construct();
+
             struct umount_ud {
                 const char *match;
                 IFileSystem *fs;
+                INode *mntnode;
                 size_t depth;
                 bool found;
             } ud = { path, NULL, 0, false };
@@ -59,6 +133,8 @@ namespace NFS {
                     if (!NLib::strcmp(mnt.path, u->match)) {
                         u->fs = mnt.fs;
                         Path mntpath = Path(mnt.path);
+                        u->mntnode = mnt.mntnode;
+                        mnt.mntnode->ref(); // Hold reference for unmounting.
                         u->depth = mntpath.depth();
                         u->found = true;
                         return true;
@@ -67,25 +143,37 @@ namespace NFS {
                 }, (void *)&ud);
 
                 if (ud.found) {
+                    // If mount node is busy (i.e., has open references), we cannot unmount.
+                    if (ud.mntnode->getrefcount() > 1) { // More than one reference means it's busy (the resolve above adds one reference).
+                        NUtil::printf("VFS: Mountpoint %s is busy with %lu references, cannot unmount.\n", path, ud.mntnode->getrefcount());
+                        // Reinsert mountpoint.
+                        this->mounts.push((struct VFS::mntpoint) { NLib::strdup(ud.match), ud.fs, ud.mntnode });
+                        ud.mntnode->unref();
+                        delete[] path;
+                        return -EBUSY;
+                    }
+                    ud.mntnode->unref();
+
                     if (!ud.depth && this->root) { // If this was the root mount, clear root reference.
                         this->root = NULL;
                     }
                 }
 
                 if (!ud.found) {
+                    delete[] path;
                     return -1;
                 }
             }
 
             if (ud.fs) {
-                ud.fs->umount();
+                ud.fs->umount(flags);
             }
 
+            delete[] path;
             return 0;
         }
 
-        struct VFS::mntpoint *VFS::findmount(Path *path) {
-            NLib::ScopeSpinlock guard(&this->mountlock);
+        struct VFS::mntpoint *VFS::_findmount(Path *path) {
             // Find the best matching mount point for the given path.
             // The best matching mount point is the one with the longest matching prefix.
             // However, we must consider mounting points shadowed by others.
@@ -120,6 +208,11 @@ namespace NFS {
             }
 
             return best;
+        }
+
+        struct VFS::mntpoint *VFS::findmount(Path *path) {
+            NLib::ScopeSpinlock guard(&this->mountlock);
+            return this->_findmount(path);
         }
 
         ssize_t VFS::resolve(const char *path, INode **nodeout, INode *relativeto, bool symlink) {
@@ -265,6 +358,24 @@ namespace NFS {
                 return -EINVAL; // Cannot create root.
             }
 
+            // Convert to absolute path if relative, same as resolve() does.
+            if (!pobj.isabsolute()) {
+                INode *base = relativeto ? relativeto : this->root;
+
+                // Prepend elements to construct an absolute path.
+                while (base && base != this->root) {
+                    pobj.pushcomponent(base->getname(), false);
+                    base = base->getparent();
+                }
+
+                pobj.setabsolute();
+            }
+
+            // Reconstruct to collapse any ".." components properly.
+            const char *pobjstr = pobj.construct();
+            Path abspobj = Path(pobjstr);
+            delete[] pobjstr;
+
             // Check if path already exists.
             INode *existing = NULL;
             ssize_t res = this->resolve(path, &existing, relativeto, false);
@@ -273,7 +384,7 @@ namespace NFS {
                 return -EEXIST; // Path already exists.
             }
 
-            const char *parentpath = pobj.dirname();
+            const char *parentpath = abspobj.dirname();
             INode *parent;
             res = this->resolve(parentpath, &parent, relativeto);
             delete parentpath; // Caller is expected to free `dirname()`.
@@ -281,14 +392,14 @@ namespace NFS {
                 return res; // Parent doesn't already exist.
             }
 
-            struct mntpoint *mount = this->findmount(&pobj);
+            struct mntpoint *mount = this->findmount(&abspobj);
             if (!mount) {
                 parent->unref(); // Don't leak parent reference.
                 return -ENOENT; // Invalid mounting point.
             }
 
             INode *node = NULL;
-            res = mount->fs->create(pobj.basename(), &node, attr);
+            res = mount->fs->create(abspobj.basename(), &node, attr);
             if (res < 0) {
                 parent->unref();
                 return res; // Creation failed.
@@ -730,12 +841,12 @@ namespace NFS {
             proc->lock.acquire();
 
             if (pathbuf[0] == '/') { // Absolute path invalidates dirfd.
-                dirnode = vfs.getroot();
+                dirnode = vfs->getroot();
             } else {
                 if (dirfd == AT_FDCWD) { // Special case: FD is CWD.
                     dirnode = proc->cwd;
                     if (!dirnode) { // If the process has no CWD, we use root.
-                        dirnode = vfs.getroot();
+                        dirnode = vfs->getroot();
                     } else {
                         dirnode->ref(); // Increase reference.
                     }
@@ -757,30 +868,31 @@ namespace NFS {
                 }
             }
 
+            int uid = proc->euid;;
+            int gid = proc->egid;
+            proc->lock.release();
+
             INode *node;
-            ssize_t res = vfs.resolve(pathbuf, &node, dirnode, !(flags & O_NOFOLLOW));
+            ssize_t res = vfs->resolve(pathbuf, &node, dirnode, !(flags & O_NOFOLLOW));
             dirnode->unref();
             if (res == -EACCES) { // We don't have permission to traverse the path.
                 delete[] pathbuf;
-                proc->lock.release();
                 SYSCALL_RET(-EACCES); // Propagate access error.
             }
 
             if (res != 0) { // Couldn't find it. Check if there's a reason to create it.
                 if (!(flags & O_CREAT)) {
                     delete[] pathbuf;
-                    proc->lock.release();
                     SYSCALL_RET(res); // Don't bother if there's no create flag.
                 }
                 // Create the node.
                 struct stat attr = { 0 };
                 attr.st_mode = mode | S_IFREG;
-                attr.st_uid = proc->euid;
-                attr.st_gid = proc->egid;
-                ssize_t res = vfs.create(pathbuf, &node, attr, dirnode);
+                attr.st_uid = uid;
+                attr.st_gid = gid;
+                ssize_t res = vfs->create(pathbuf, &node, attr, dirnode);
                 if (res < 0) {
                     delete[] pathbuf;
-                    proc->lock.release();
                     SYSCALL_RET(res); // Creation failed.
                 }
             }
@@ -791,13 +903,11 @@ namespace NFS {
 
             if ((flags & O_DIRECTORY) && !S_ISDIR(st.st_mode)) { // If we're supposed to open a directory, we'd have to verify that the node is a directory.
                 node->unref();
-                proc->lock.release();
                 SYSCALL_RET(-ENOTDIR);
             }
 
-            if (!vfs.checkaccess(node, flags, proc->euid, proc->egid)) { // Check if current process' effective UID and GID are valid for access the node in this way.
+            if (!vfs->checkaccess(node, flags, uid, gid)) { // Check if current process' effective UID and GID are valid for access the node in this way.
                 node->unref();
-                proc->lock.release();
                 SYSCALL_RET(-EACCES);
             }
 
@@ -807,7 +917,6 @@ namespace NFS {
                 case O_RDONLY:
                     if (flags & O_TRUNC) {
                         node->unref();
-                        proc->lock.release();
                         SYSCALL_RET(-EINVAL); // Can't truncate without write access.
                     }
                     break;
@@ -815,13 +924,11 @@ namespace NFS {
                 case O_RDWR:
                     if (S_ISDIR(st.st_mode)) {
                         node->unref();
-                        proc->lock.release();
                         SYSCALL_RET(-EISDIR); // Can't write to directory.
                     }
                     break;
                 default:
                     node->unref();
-                    proc->lock.release();
                     SYSCALL_RET(-EINVAL);
             }
 
@@ -830,7 +937,6 @@ namespace NFS {
             // }
 
             int fd = proc->fdtable->open(node, flags);
-            proc->lock.release(); // Release process lock, because open() hooks may sleep.
             if (fd < 0) {
                 node->unref();
                 SYSCALL_RET(fd); // Propagate error.
@@ -838,9 +944,7 @@ namespace NFS {
 
             res = node->open(flags); // Trigger open hook.
             if (res < 0) {
-                proc->lock.acquire(); // Reacquire process lock to safely modify FD table.
                 proc->fdtable->close(fd); // Clean up FD table entry.
-                proc->lock.release();
                 node->unref();
                 SYSCALL_RET(res); // Open failed.
             }
@@ -948,7 +1052,6 @@ namespace NFS {
             }
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
@@ -962,6 +1065,8 @@ namespace NFS {
                 node->unref();
                 SYSCALL_RET(-ENOTDIR);
             }
+
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
 
             if (proc->cwd) {
                 proc->cwd->unref(); // Unreference old CWD.
@@ -992,12 +1097,19 @@ namespace NFS {
             pathbuf[pathsize] = '\0';
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
-
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
+            proc->lock.acquire();
+            int uid = proc->euid;
+            int gid = proc->egid;
+            INode *cwd = proc->cwd;
+            if (cwd) {
+                cwd->ref(); // Increase reference for our use.
+            }
+            proc->lock.release();
 
             INode *node;
-            ssize_t res = vfs.resolve(pathbuf, &node, proc->cwd, true);
+            ssize_t res = vfs->resolve(pathbuf, &node, cwd, true);
             delete[] pathbuf;
+
 
             if (res < 0) {
                 SYSCALL_RET(res);
@@ -1009,9 +1121,10 @@ namespace NFS {
                 SYSCALL_RET(-ENOTDIR);
             }
 
-            if (proc->cwd) {
-                proc->cwd->unref(); // Unreference old CWD.
+            if (cwd) {
+                cwd->unref(); // Unreference old CWD.
             }
+            NLib::ScopeIRQSpinlock guard(&proc->lock);
             proc->cwd = node; // Set new CWD.
             SYSCALL_RET(0);
         }
@@ -1032,7 +1145,7 @@ namespace NFS {
 
             INode *cwd = proc->cwd;
             if (!cwd) {
-                cwd = vfs.getroot(); // getroot() increments refcount.
+                cwd = vfs->getroot(); // getroot() increments refcount.
                 if (!cwd) {
                     SYSCALL_RET(-ENOENT);
                 }
@@ -1043,7 +1156,7 @@ namespace NFS {
             // Build path by walking up the parent chain to root.
             Path resultpath = Path(true); // Start with absolute path.
             INode *current = cwd;
-            INode *root = vfs.getroot(); // getroot() increments refcount.
+            INode *root = vfs->getroot(); // getroot() increments refcount.
 
             while (current && current != root) {
                 const char *name = current->getname();
@@ -1366,9 +1479,18 @@ namespace NFS {
 
                 NSched::Process *proc = NArch::CPU::get()->currthread->process;
                 proc->lock.acquire();
-                INode *node;
-                ssize_t res = vfs.resolve(pathbuf, &node, proc->cwd, !(flags & AT_SYMLINK_NOFOLLOW));
+
+                INode *cwd = proc->cwd;
+                if (!cwd) {
+                    cwd = vfs->getroot(); // If the process has no CWD, we use root.
+                } else {
+                    cwd->ref(); // Increase reference.
+                }
                 proc->lock.release();
+
+                INode *node;
+                ssize_t res = vfs->resolve(pathbuf, &node, cwd, !(flags & AT_SYMLINK_NOFOLLOW));
+                cwd->unref();
                 delete[] pathbuf;
                 if (res < 0) {
                     SYSCALL_RET(res);
@@ -1478,7 +1600,7 @@ namespace NFS {
                     }
 
                     INode *node;
-                    ssize_t res = vfs.resolve(pathbuf, &node, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
+                    ssize_t res = vfs->resolve(pathbuf, &node, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
                     dirnode->unref();
                     delete[] pathbuf;
                     if (res < 0) {
@@ -1542,7 +1664,7 @@ namespace NFS {
             if (fd == AT_FDCWD) {
                 dirnode = proc->cwd;
                 if (!dirnode) {
-                    dirnode = vfs.getroot();
+                    dirnode = vfs->getroot();
                 } else {
                     dirnode->ref();
                 }
@@ -1565,7 +1687,7 @@ namespace NFS {
             proc->lock.release();
 
             INode *node;
-            ssize_t res = vfs.resolve(pathbuf, &node, dirnode, true);
+            ssize_t res = vfs->resolve(pathbuf, &node, dirnode, true);
             dirnode->unref();
             delete[] pathbuf;
             if (res < 0) {
@@ -1589,7 +1711,7 @@ namespace NFS {
 
             proc->lock.acquire();
             // Compare against real UID/GID.
-            bool ok = vfs.checkaccess(node, accflags, proc->uid, proc->gid);
+            bool ok = vfs->checkaccess(node, accflags, proc->uid, proc->gid);
             proc->lock.release();
             node->unref();
             if (ok) {
@@ -1690,7 +1812,7 @@ namespace NFS {
             if (fd == AT_FDCWD) {
                 dirnode = proc->cwd;
                 if (!dirnode) {
-                    dirnode = vfs.getroot();
+                    dirnode = vfs->getroot();
                 } else {
                     dirnode->ref();
                 }
@@ -1713,7 +1835,7 @@ namespace NFS {
             proc->lock.release();
 
             INode *node;
-            ssize_t res = vfs.resolve(pathbuf, &node, dirnode, false);
+            ssize_t res = vfs->resolve(pathbuf, &node, dirnode, false);
             dirnode->unref();
             delete[] pathbuf;
             if (res < 0) {
@@ -1753,7 +1875,7 @@ namespace NFS {
             if (fd == AT_FDCWD) {
                 dirnode = proc->cwd;
                 if (!dirnode) {
-                    dirnode = vfs.getroot();
+                    dirnode = vfs->getroot();
                 } else {
                     dirnode->ref();
                 }
@@ -1773,8 +1895,10 @@ namespace NFS {
                 }
             }
 
-            ssize_t res = vfs.unlink(pathbuf, dirnode, flags, proc->uid, proc->gid);
+            int uid = proc->uid;
+            int gid = proc->gid;
             proc->lock.release();
+            ssize_t res = vfs->unlink(pathbuf, dirnode, flags, uid, gid);
             dirnode->unref();
             delete[] pathbuf;
             SYSCALL_RET(res); // Return result of unlink operation.
@@ -2043,7 +2167,7 @@ namespace NFS {
             if (fd == AT_FDCWD) {
                 dirnode = proc->cwd;
                 if (!dirnode) {
-                    dirnode = vfs.getroot();
+                    dirnode = vfs->getroot();
                 } else {
                     dirnode->ref();
                 }
@@ -2064,7 +2188,7 @@ namespace NFS {
             }
 
             // Check permissions to create in this directory.
-            bool ok = vfs.checkaccess(dirnode, O_WRONLY | O_EXEC, proc->euid, proc->egid);
+            bool ok = vfs->checkaccess(dirnode, O_WRONLY | O_EXEC, proc->euid, proc->egid);
             if (!ok) {
                 dirnode->unref();
                 delete[] pathbuf;
@@ -2080,11 +2204,12 @@ namespace NFS {
                 .st_rdev = dev
             };
 
+            proc->lock.release();
+
             INode *nodeout = NULL;
-            ssize_t res = vfs.create(pathbuf, &nodeout, attr, dirnode);
+            ssize_t res = vfs->create(pathbuf, &nodeout, attr, dirnode);
             dirnode->unref();
             delete[] pathbuf;
-            proc->lock.release();
             if (res < 0) {
                 SYSCALL_RET(res);
             }
@@ -2126,7 +2251,7 @@ namespace NFS {
             if (fd == AT_FDCWD) {
                 dirnode = proc->cwd;
                 if (!dirnode) {
-                    dirnode = vfs.getroot();
+                    dirnode = vfs->getroot();
                 } else {
                     dirnode->ref();
                 }
@@ -2146,17 +2271,20 @@ namespace NFS {
                 }
             }
 
+            int uid = proc->euid;
+            int gid = proc->egid;
+            proc->lock.release();
+
             // If AT_EMPTY_PATH is set and path is empty, change mode of dirnode itself.
             INode *targetnode = NULL;
             if ((flags & AT_EMPTY_PATH) && pathsize == 0) {
                 targetnode = dirnode;
                 targetnode->ref();
             } else {
-                res = vfs.resolve(pathbuf, &targetnode, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
+                res = vfs->resolve(pathbuf, &targetnode, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
                 if (res < 0) {
                     dirnode->unref();
                     delete[] pathbuf;
-                    proc->lock.release();
                     SYSCALL_RET(res);
                 }
             }
@@ -2166,15 +2294,14 @@ namespace NFS {
             // Check if we have permission to change the mode.
             bool ok = false;
             struct stat st = targetnode->getattr();
-            if (proc->euid == 0) {
+            if (uid == 0) {
                 ok = true; // Root can always change mode.
-            } else if (proc->euid == st.st_uid) {
+            } else if (uid == st.st_uid) {
                 ok = true; // Owner can change mode.
             }
 
             if (!ok) {
                 targetnode->unref();
-                proc->lock.release();
                 SYSCALL_RET(-EACCES);
             }
 
@@ -2182,7 +2309,6 @@ namespace NFS {
             newattr.st_mode = (st.st_mode & S_IFMT) | (mode & ~S_IFMT);
             targetnode->setattr(newattr);
             targetnode->unref();
-            proc->lock.release();
             SYSCALL_RET(0);
         }
 
@@ -2217,7 +2343,7 @@ namespace NFS {
             if (fd == AT_FDCWD) {
                 dirnode = proc->cwd;
                 if (!dirnode) {
-                    dirnode = vfs.getroot();
+                    dirnode = vfs->getroot();
                 } else {
                     dirnode->ref();
                 }
@@ -2237,17 +2363,20 @@ namespace NFS {
                 }
             }
 
+            int euid = proc->euid;
+            int egid = proc->egid;
+            proc->lock.release();
+
             // If AT_EMPTY_PATH is set and path is empty, change owner of dirnode itself.
             INode *targetnode = NULL;
             if ((flags & AT_EMPTY_PATH) && pathsize == 0) {
                 targetnode = dirnode;
                 targetnode->ref();
             } else {
-                res = vfs.resolve(pathbuf, &targetnode, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
+                res = vfs->resolve(pathbuf, &targetnode, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
                 if (res < 0) {
                     dirnode->unref();
                     delete[] pathbuf;
-                    proc->lock.release();
                     SYSCALL_RET(res);
                 }
             }
@@ -2256,9 +2385,9 @@ namespace NFS {
             // Check if we have permission to change the owner.
             bool ok = false;
             struct stat st = targetnode->getattr();
-            if (proc->euid == 0) {
+            if (euid == 0) {
                 ok = true; // Root can always change owner.
-            } else if (proc->euid == st.st_uid) {
+            } else if (euid == st.st_uid) {
                 // Non-root can change group to one of their groups.
                 if (gid == -1 || gid == st.st_gid) {
                     ok = true;
@@ -2266,7 +2395,6 @@ namespace NFS {
             }
             if (!ok) {
                 targetnode->unref();
-                proc->lock.release();
                 SYSCALL_RET(-EACCES);
             }
 
@@ -2279,7 +2407,6 @@ namespace NFS {
             }
             targetnode->setattr(newattr);
             targetnode->unref();
-            proc->lock.release();
             SYSCALL_RET(0);
         }
 
@@ -2299,7 +2426,6 @@ namespace NFS {
             SYSCALL_LOG("sys_ftruncate(%d, %ld).\n", fd, len);
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
@@ -2315,7 +2441,7 @@ namespace NFS {
         extern "C" ssize_t sys_sync(void) {
             SYSCALL_LOG("sys_sync().\n");
 
-            vfs.syncall();
+            vfs->syncall();
 
             SYSCALL_RET(0);
         }
@@ -2324,7 +2450,6 @@ namespace NFS {
             SYSCALL_LOG("sys_fsync(%d, %d).\n", fd, opt);
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
 
             FileDescriptor *desc = proc->fdtable->get(fd);
             if (!desc) {
@@ -2337,5 +2462,101 @@ namespace NFS {
             SYSCALL_RET(res);
         }
 
+        extern "C" ssize_t sys_mount(const char *source, const char *target, const char *fstype, uint64_t flags, const void *data) {
+            SYSCALL_LOG("sys_mount(%s, %s, %s, %lu, %p).\n", source, target, fstype, flags, data);
+
+            ssize_t srclen = NMem::UserCopy::strnlen(source, 4096);
+            if (srclen < 0) {
+                SYSCALL_RET(srclen); // Contains errno.
+            }
+
+            ssize_t tgtlen = NMem::UserCopy::strnlen(target, 4096);
+            if (tgtlen < 0) {
+                SYSCALL_RET(tgtlen); // Contains errno.
+            }
+
+            ssize_t fstlen = NMem::UserCopy::strnlen(fstype, 256);
+            if (fstlen < 0) {
+                SYSCALL_RET(fstlen); // Contains errno.
+            }
+
+            char *srcbuf = new char[srclen + 1];
+            if (!srcbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            char *tgtbuf = new char[tgtlen + 1];
+            if (!tgtbuf) {
+                delete[] srcbuf;
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            char *fstbuf = new char[fstlen + 1];
+            if (!fstbuf) {
+                delete[] srcbuf;
+                delete[] tgtbuf;
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            int res = NMem::UserCopy::strncpyfrom(srcbuf, source, srclen);
+            if (res < 0) {
+                delete[] srcbuf;
+                delete[] tgtbuf;
+                delete[] fstbuf;
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            res = NMem::UserCopy::strncpyfrom(tgtbuf, target, tgtlen);
+            if (res < 0) {
+                delete[] srcbuf;
+                delete[] tgtbuf;
+                delete[] fstbuf;
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            res = NMem::UserCopy::strncpyfrom(fstbuf, fstype, fstlen);
+            if (res < 0) {
+                delete[] srcbuf;
+                delete[] tgtbuf;
+                delete[] fstbuf;
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            srcbuf[srclen] = '\0';
+            tgtbuf[tgtlen] = '\0';
+            fstbuf[fstlen] = '\0';
+
+            // Perform the mount operation.
+            res = vfs->mount(srcbuf, tgtbuf, fstbuf, flags, data);
+            delete[] srcbuf;
+            delete[] tgtbuf;
+            delete[] fstbuf;
+            SYSCALL_RET(res);
+        }
+
+        extern "C" ssize_t sys_umount(const char *target, int flags) {
+            SYSCALL_LOG("sys_umount(%s, %d).\n", target, flags);
+            ssize_t tgtlen = NMem::UserCopy::strnlen(target, 4096);
+            if (tgtlen < 0) {
+                SYSCALL_RET(tgtlen); // Contains errno.
+            }
+
+            char *tgtbuf = new char[tgtlen + 1];
+            if (!tgtbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+
+            int res = NMem::UserCopy::strncpyfrom(tgtbuf, target, tgtlen);
+            if (res < 0) {
+                delete[] tgtbuf;
+                SYSCALL_RET(res); // Contains errno.
+            }
+
+            tgtbuf[tgtlen] = '\0';
+            // Perform the unmount operation.
+            res = vfs->umount(tgtbuf, flags);
+            delete[] tgtbuf;
+            SYSCALL_RET(res);
+        }
     }
 }

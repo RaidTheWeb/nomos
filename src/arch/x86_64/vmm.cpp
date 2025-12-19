@@ -222,6 +222,12 @@ namespace NArch {
                 if (node->used) {
                     size_t size = node->end - node->start;
 
+                    // Unreference backing file if present.
+                    if (node->backingfile) {
+                        node->backingfile->unref();
+                        node->backingfile = NULL;
+                    }
+
                     for (size_t i = 0; i < size; i += PAGESIZE) {
                         uintptr_t phys = VMM::_virt2phys(space, node->start + i);
                         if (phys == 0) {

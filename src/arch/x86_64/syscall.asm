@@ -64,6 +64,8 @@ extern sys_sigpending
 extern sys_getitimer
 extern sys_setitimer
 extern sys_msync
+extern sys_mount
+extern sys_umount
 
 MAXSYSCALLS equ 256
 
@@ -131,6 +133,8 @@ syscall_table:
     dq sys_getitimer
     dq sys_setitimer
     dq sys_msync
+    dq sys_mount
+    dq sys_umount
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 
