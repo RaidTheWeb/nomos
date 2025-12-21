@@ -142,6 +142,7 @@ section .text
 global syscall_entry
 syscall_entry:
     swapgs ; Swap GS, because we need the kernel's view on the GS base.
+    lfence
 
     mov [gs:0x8], rax ; Save RAX into temp. Yay!
 

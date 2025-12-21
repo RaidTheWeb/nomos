@@ -1,5 +1,6 @@
 #include <arch/x86_64/panic.hpp>
 #include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/stacktrace.hpp>
 
 namespace NArch {
     void panic(const char *msg) {
@@ -13,7 +14,6 @@ namespace NArch {
 
         NUtil::undropwrite(); // Ensure we can write to console during panic.
         NUtil::oprintlock();
-        NUtil::canmutex = false; // Prevent usage of mutexes during panic.
         NUtil::printf("[\x1b[1;31mPANIC\x1b[0m]: %s", msg);
         for (;;) {
             asm volatile("hlt");

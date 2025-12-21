@@ -27,10 +27,13 @@ namespace NSched {
             this->waitinglock.acquire(); // We MUST acquire the lock before setting the thread to waiting, otherwise we'll never be rescheduled when the timeslice expires.
         }
 
-        // Set state to WAITING before adding to queue.
-        __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        // This prevents the race where a signal wakes us before our context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAIT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         this->waitinglock.release();
 
@@ -40,7 +43,9 @@ namespace NSched {
         yield();
 
         // After waking, clear the waitingon pointer.
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
     }
 
     void WaitQueue::waitlocked(NArch::IRQSpinlock *lock) {
@@ -49,10 +54,12 @@ namespace NSched {
         // Acquire waitqueue lock while still holding external lock.
         this->waitinglock.acquire();
 
-        // Set up wait state while holding both locks.
-        __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAIT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         // Release locks in correct order: waitqueue first, then external.
         this->waitinglock.release();
@@ -61,7 +68,9 @@ namespace NSched {
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
 
         // When we wake up, re-acquire the external lock before returning
         lock->acquire();
@@ -72,9 +81,12 @@ namespace NSched {
 
         this->waitinglock.acquire();
 
-        __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAIT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         this->waitinglock.release();
         lock->release();
@@ -82,7 +94,9 @@ namespace NSched {
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
         lock->acquire();
     }
 
@@ -91,9 +105,12 @@ namespace NSched {
 
         this->waitinglock.acquire();
 
-        __atomic_store_n(&thread->tstate, Thread::state::WAITING, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAIT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         this->waitinglock.release();
         lock->release();
@@ -101,7 +118,9 @@ namespace NSched {
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
         lock->acquire();
     }
 
@@ -118,16 +137,21 @@ namespace NSched {
             return -EINTR;
         }
 
-        __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         this->waitinglock.release();
 
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
 
         // After waking, check if we were interrupted by a signal.
         if (haspendingsignal(thread)) {
@@ -148,10 +172,12 @@ namespace NSched {
             return -EINTR;
         }
 
-        // Set up wait state.
-        __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         // Release locks: waitqueue first, then external.
         this->waitinglock.release();
@@ -160,7 +186,9 @@ namespace NSched {
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
 
         // Re-acquire external lock before returning.
         lock->acquire();
@@ -184,9 +212,12 @@ namespace NSched {
             return -EINTR;
         }
 
-        __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         this->waitinglock.release();
         lock->release();
@@ -194,7 +225,9 @@ namespace NSched {
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
 
         lock->acquire();
 
@@ -216,9 +249,12 @@ namespace NSched {
             return -EINTR;
         }
 
-        __atomic_store_n(&thread->tstate, Thread::state::WAITINGINT, memory_order_release);
+        // Set pending wait state - actual state transition happens in scheduler after context is saved.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release);
+        thread->waitingonlock.acquire();
         thread->waitingon = this;
         this->waiting.pushback(thread);
+        thread->waitingonlock.release();
 
         this->waitinglock.release();
         lock->release();
@@ -226,7 +262,9 @@ namespace NSched {
         NArch::CPU::writemb();
         yield();
 
+        thread->waitingonlock.acquire();
         thread->waitingon = NULL;
+        thread->waitingonlock.release();
 
         lock->acquire();
 
@@ -239,29 +277,53 @@ namespace NSched {
 
     // Wake up all threads waiting on this waitqueue.
     void WaitQueue::wake(void) {
-        NLib::SingleList<Thread *> towake;
-
         this->waitinglock.acquire();
 
         // Collect all waiting threads into a temporary list.
         while (!this->waiting.empty()) {
             Thread *thread = this->waiting.pop();
 
-            // Verify thread is still in a waiting state.
+            // Check if thread has a pending wait or is in a waiting state.
             enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-            if (tstate == Thread::state::WAITING || tstate == Thread::state::WAITINGINT) {
-                towake.push(thread);
+            enum Thread::pendingwait pwait = (enum Thread::pendingwait)__atomic_load_n(&thread->pendingwaitstate, memory_order_acquire);
+
+            if (tstate == Thread::state::DEAD) {
+                continue; // Thread is dead, skip it.
             }
-            // If thread is not waiting (e.g., already marked DEAD), skip it.
+
+            // Clear pending wait state so the scheduler knows not to transition to waiting.
+            __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+
+            // Only schedule if thread was in a waiting state (context already saved).
+            if (tstate == Thread::state::WAITING || tstate == Thread::state::WAITINGINT) {
+                schedulethread(thread);
+            }
+            // If tstate == RUNNING and pwait != PENDING_NONE, the thread was in the process of going to sleep. By clearing pendingwaitstate, we ensure its scheduler will re-enqueue it instead of transitioning to WAITING state.
         }
 
         this->waitinglock.release();
+    }
 
-        // Schedule all collected threads outside of the lock.
-        for (NLib::SingleList<Thread *>::Iterator it = towake.begin(); it.valid(); it.next()) {
-            Thread *thread = *(it.get());
-            schedulethread(thread);
+    void WaitQueue::wakeone(void) {
+        this->waitinglock.acquire();
+
+        if (!this->waiting.empty()) {
+            Thread *thread = this->waiting.pop();
+
+            enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+            if (tstate != Thread::state::DEAD) {
+                // Clear pending wait state so the scheduler knows not to transition to waiting.
+                __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+
+                // Only schedule if thread was in a waiting state (context already saved).
+                if (tstate == Thread::state::WAITING || tstate == Thread::state::WAITINGINT) {
+                    schedulethread(thread);
+                }
+            }
         }
+
+        this->waitinglock.release();
     }
 
     // Remove a specific thread from the waitqueue.
@@ -276,7 +338,9 @@ namespace NSched {
         this->waitinglock.release();
 
         if (found) {
+            target->waitingonlock.acquire();
             target->waitingon = NULL;
+            target->waitingonlock.release();
         }
 
         return found;

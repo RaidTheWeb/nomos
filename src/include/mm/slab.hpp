@@ -54,7 +54,6 @@ namespace NMem {
             };
 
             SubAllocator slabs[numslabs];
-            NArch::IRQSpinlock largelock;  // Lock for large (page-based) allocations.
         public:
             SlabAllocator(void) { };
             void setup(void);

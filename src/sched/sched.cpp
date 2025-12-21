@@ -17,6 +17,16 @@
 #include <sys/syscall.hpp>
 #include <sys/timer.hpp>
 
+// NOTE: Lock ordering:
+// - When acquiring multiple locks, always acquire in this order to prevent deadlocks:
+// 1. pidtablelock
+// 2. proc->lock
+// 3. session->lock
+// 4. runqueue.lock (ordered by CPU ID)
+// 5. waitqueue.waitinglock
+// 6. thread->waitingonlock
+// 7. zombielock
+
 namespace NSched {
     using namespace NArch;
 
@@ -492,12 +502,12 @@ namespace NSched {
             Thread *candidate = RBTree::getentry<Thread>(node);
             struct RBTree::node *prev = cpu->runqueue._prev(node);
 
-            // Check if thread is eligible for migration.
-            // Must not hold locks, must have migration enabled, must be in SUSPENDED state.
+            // Check if thread is eligible for migration and must not have unsaved FPU context (mathused indicates pending save).
             enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
             if (tstate != Thread::state::SUSPENDED ||
                 __atomic_load_n(&candidate->locksheld, memory_order_acquire) > 0 ||
-                candidate->migratedisabled) {
+                candidate->migratedisabled ||
+                candidate->fctx.mathused) { // Don't migrate threads with potentially unsaved FPU state.
                 node = prev; // Skip nodes we can't migrate.
                 continue;
             }
@@ -545,9 +555,11 @@ namespace NSched {
             enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
 
             // Only steal threads that are actually waiting to run and can be migrated.
+            // Also check mathused to avoid stealing threads with potentially unsaved FPU state.
             if (tstate == Thread::state::SUSPENDED &&
                 __atomic_load_n(&candidate->locksheld, memory_order_acquire) == 0 &&
-                !candidate->migratedisabled) {
+                !candidate->migratedisabled &&
+                !candidate->fctx.mathused) { // Don't steal threads with potentially unsaved FPU state.
                 busiest->runqueue._erase(node);
                 stolen = candidate;
                 break;
@@ -703,20 +715,45 @@ namespace NSched {
 
         Thread *next = NULL;
 
+        bool shouldsave = prev && prev != cpu->idlethread;
+
+        if (shouldsave) {
+#ifdef __x86_64__
+            if (prev->fctx.mathused) {
+                CPU::savefctx(&prev->fctx);
+            }
+#endif
+            prev->savexctx();
+            prev->savectx(ctx);
+        }
+
+        // Memory barrier to ensure context writes are visible before state transition.
+        NArch::CPU::writemb();
+
         cpu->runqueue.lock.acquire();
 
         // Re-enqueue previous thread if it was running (not idle, not dead, not waiting).
         if (prev != cpu->idlethread) {
-            // Use CAS to atomically transition RUNNING -> SUSPENDED.
-            enum Thread::state expected = Thread::state::RUNNING;
-            if (__atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
-                // Successfully transitioned from RUNNING to SUSPENDED.
-                cpu->runqueue._insert(&prev->node, vruntimecmp);
-            } else if (expected == Thread::state::DEAD) {
-                // Thread died, queue for cleanup.
+            enum Thread::state prevstate = (enum Thread::state)__atomic_load_n(&prev->tstate, memory_order_acquire);
+            enum Thread::pendingwait pendwait = (enum Thread::pendingwait)__atomic_load_n(&prev->pendingwaitstate, memory_order_acquire);
+
+            if (prevstate == Thread::state::DEAD) {
                 queuezombie(prev);
-                prev = NULL; // Don't access prev after this.
+                prev = NULL; // No previous thread to save context for.
+            } else if (pendwait != Thread::pendingwait::PENDING_NONE) {
+                if (pendwait == Thread::pendingwait::PENDING_WAIT) {
+                    __atomic_store_n(&prev->tstate, Thread::state::WAITING, memory_order_release);
+                } else { // PENDING_WAITINT
+                    __atomic_store_n(&prev->tstate, Thread::state::WAITINGINT, memory_order_release);
+                }
+                // Clear the pending wait state.
+                __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+            } else if (prevstate == Thread::state::RUNNING) {
+                __atomic_store_n(&prev->tstate, Thread::state::SUSPENDED, memory_order_release);
+                NArch::CPU::writemb(); // Ensure writes are seen before insertion.
+                cpu->runqueue._insert(&prev->node, vruntimecmp);
             }
+            // If prevstate is WAITING/WAITINGINT (already transitioned by a previous scheduler run but woken before context switch completed), don't re-enqueue.
         }
 
         // Get next thread from runqueue.
@@ -735,22 +772,11 @@ namespace NSched {
 
         assert(next != NULL, "Next thread is NULL.\n");
 
-        // Save context of previous thread if switching.
-        if (prev && prev != next && prev != cpu->idlethread) {
-#ifdef __x86_64__
-            if (prev->fctx.mathused) {
-                CPU::savefctx(&prev->fctx);
-            }
-#endif
-            prev->savexctx();
-            prev->savectx(ctx);
-        }
-
         // Update CPU tracking.
         if (prev) {
             prev->lastcid = cpu->id;
         }
-        next->cid = cpu->id;
+        __atomic_store_n(&next->cid, cpu->id, memory_order_release);
 
         // Perform context switch if needed.
         if (prev != next) {
@@ -767,8 +793,6 @@ namespace NSched {
         cpu->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
         Timer::rearm();
         cpu->setint(true);
-
-        // If it's the same thread, we'll just be dumped right back to where we are.
     }
 
 
@@ -972,7 +996,7 @@ namespace NSched {
         if (!state->completed) { // Only bother waking if not already completed (interrupted by signal).
             state->completed = true;
             state->lock.release();
-            state->wq.wake();
+            state->wq.wakeone(); // Wake the sleeping thread.
         } else {
             // Thread was interrupted and marked completed. We can't assume it's still around, so just cleanup.
             state->lock.release();
@@ -1109,13 +1133,12 @@ namespace NSched {
     void Mutex::release(void) {
         Thread *current = NArch::CPU::get()->currthread;
         __atomic_sub_fetch(&current->locksheld, 1, memory_order_seq_cst);
-
 #ifdef __x86_64__
         __atomic_store_n(&this->locked, 0, memory_order_release);
 #endif
 
-        // Wake up all waiters so they can try to acquire the lock.
-        this->waitqueue.wake();
+        // Wake one waiting thread, if any (next in line).
+        this->waitqueue.wakeone();
     }
 
     void exit(int status, int sig) {
@@ -1189,7 +1212,7 @@ namespace NSched {
         this->ctx.rip = (uint64_t)entry;
         this->ctx.rdi = (uint64_t)arg; // Pass argument in through RDI (System V ABI first argument).
 
-        this->ctx.rflags = 0x200; // Enable interrupts.
+        this->ctx.rflags = 0x202; // Enable interrupts.
 
         if (!this->process->kernel) {
             this->fctx.fpustorage = PMM::alloc(CPU::get()->fpusize);
@@ -1234,50 +1257,16 @@ namespace NSched {
 
     // Schedule a thread for execution on the most idle CPU.
     void schedulethread(Thread *thread) {
-        // Atomically load the current state.
-        enum Thread::state oldstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
 
-        // Don't schedule dead threads.
-        if (oldstate == Thread::state::DEAD) {
-            return;
-        }
-
-        // Don't re-schedule threads that are already suspended (already in a runqueue).
-        if (oldstate == Thread::state::SUSPENDED) {
-            return;
-        }
-
-        // Don't schedule threads that are still running - they'll be re-enqueued by the scheduler.
-        if (oldstate == Thread::state::RUNNING) {
-            // Just send an IPI to trigger a reschedule.
-            size_t threadcid = __atomic_load_n(&thread->cid, memory_order_acquire);
-            if (threadcid < SMP::awakecpus) {
-                struct CPU::cpulocal *threadcpu = SMP::cpulist[threadcid];
-                if (threadcpu) {
-                    APIC::sendipi(threadcpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
-                }
+        // Attempt to transition thread from current state to SUSPENDED state with CAS atomic operation, aborting if thread is marked DEAD.
+        enum Thread::state expected = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+        while (true) {
+            if (expected == Thread::state::DEAD) {
+                return; // Thread is dead, do not schedule.
             }
-            return;
-        }
 
-        // Try to atomically transition from the current state to SUSPENDED.
-        // This prevents races where multiple callers try to schedule the same thread.
-        enum Thread::state expected = oldstate;
-        if (!__atomic_compare_exchange_n(&thread->tstate, &expected,
-                                         Thread::state::SUSPENDED,
-                                         false, memory_order_acq_rel, memory_order_acquire)) {
-            // State changed from under us. Re-check what happened.
-            if (expected == Thread::state::DEAD || expected == Thread::state::SUSPENDED ||
-                expected == Thread::state::RUNNING) {
-                // Either dead, already scheduled, or still running - nothing to do.
-                return;
-            }
-            // Try again with the new state.
-            if (!__atomic_compare_exchange_n(&thread->tstate, &expected,
-                                             Thread::state::SUSPENDED,
-                                             false, memory_order_acq_rel, memory_order_acquire)) {
-                // Failed again, bail out.
-                return;
+            if (__atomic_compare_exchange_n(&thread->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
+                break; // Successfully transitioned to SUSPENDED.
             }
         }
 
@@ -1289,7 +1278,9 @@ namespace NSched {
             cpu = CPU::get(); // Fallback to current CPU.
         }
 
-        thread->cid = cpu->id;
+        __atomic_store_n(&thread->cid, cpu->id, memory_order_release);
+        NArch::CPU::writemb();
+
         enqueuethread(cpu, thread);
         updateload(cpu);
 
@@ -1729,11 +1720,13 @@ namespace NSched {
         }
 
         // If thread was waiting on a waitqueue, dequeue it.
+        thread->waitingonlock.acquire();
         WaitQueue *wq = thread->waitingon;
         if (wq && (oldstate == Thread::state::WAITING || oldstate == Thread::state::WAITINGINT)) {
             wq->dequeue(thread);
             thread->waitingon = NULL;
         }
+        thread->waitingonlock.release();
 
         // The dead thread needs to be cleaned up. How we handle this depends on its previous state.
         if (oldstate == Thread::state::SUSPENDED) {
@@ -2187,18 +2180,12 @@ namespace NSched {
         // Signal mask is preserved across exec.
 
         struct NArch::CPU::context *sysctx = NArch::CPU::get()->currthread->sysctx;
-        NLib::memset(sysctx, 0, sizeof(NArch::CPU::get()->currthread->ctx));
 #ifdef __x86_64__
         NLib::memset(&NArch::CPU::get()->currthread->xctx, 0, sizeof(NArch::CPU::get()->currthread->xctx));
 
-        sysctx->cs = 0x23; // User Code.
-        sysctx->ds = 0x1b; // User Data.
-        sysctx->es = 0x1b; // Ditto.
-        sysctx->ss = 0x1b; // Ditto.
-
         sysctx->rip = isdynamic ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
         sysctx->rsp = (uint64_t)rsp;
-        sysctx->rflags = 0x200; // Enable interrupts.
+        sysctx->rflags = 0x202; // Enable interrupts.
 
 
         NLib::memset(NArch::CPU::get()->currthread->fctx.fpustorage, 0, CPU::get()->fpusize);
@@ -2232,9 +2219,10 @@ namespace NSched {
             bool match = false;
 
             child->lock.acquire();
-            if (child->pstate != Process::state::ZOMBIE && zombie) {
+            // Skip processes being reaped by another waitpid call.
+            if (zombie && child->pstate != Process::state::ZOMBIE) {
                 child->lock.release();
-                continue; // Wanted zombies.
+                continue; // Wanted zombies, but this is not one (or already being reaped).
             }
 
             if (pid == -1) { // Any child.
@@ -2251,6 +2239,14 @@ namespace NSched {
                 if (child->pgrp->id == (size_t)(-pid)) {
                     match = true;
                 }
+            }
+
+            if (match && zombie) {
+                // Atomically claim the zombie by transitioning to REAPING state.
+                // This prevents other concurrent waitpid calls from reaping the same child.
+                child->pstate = Process::state::REAPING;
+                child->lock.release();
+                return child;
             }
 
             child->lock.release();
@@ -2318,17 +2314,21 @@ namespace NSched {
             }
         }
 
-        // Release parent lock before acquiring zombie lock to avoid deadlock.
-        // The zombie is in ZOMBIE state and won't go anywhere.
+        // The zombie is now in REAPING state (claimed by us in findchild),
+        // so no other waitpid can race with us to reap it.
         current->lock.release();
 
         zombie->lock.acquire();
+        // Verify we still own the zombie (should always be true since we claimed it).
+        assert(zombie->pstate == Process::state::REAPING, "Zombie not in REAPING state after claim");
         int zstatus = zombie->exitstatus;
         size_t zid = zombie->id;
 
         if (status) {
             // Copy status out.
             if (NMem::UserCopy::copyto(status, &zstatus, sizeof(int)) < 0) {
+                // Revert to ZOMBIE state so another waiter can try.
+                zombie->pstate = Process::state::ZOMBIE;
                 zombie->lock.release();
                 SYSCALL_RET(-EFAULT);
             }
@@ -2528,8 +2528,6 @@ namespace NSched {
 
         newthread->ctx.rip = (uint64_t)entry;
         newthread->ctx.rsp = (uint64_t)stack;
-
-        NUtil::printf("Scheduling new thread %u in process %u with entry %p and stack %p.\n", newthread->id, proc->id, entry, stack);
 
         NSched::schedulethread(newthread);
         SYSCALL_RET(newthread->id);

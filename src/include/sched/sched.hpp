@@ -184,6 +184,9 @@ namespace NSched {
             // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
             void wake(void);
 
+            // Wake up a single sleeping thread in the wait queue.
+            void wakeone(void);
+
             // Dequeue a specific thread from the waitqueue (used by signal delivery).
             bool dequeue(Thread *thread);
     };
@@ -197,6 +200,7 @@ namespace NSched {
             enum state {
                 RUNNING,
                 ZOMBIE,
+                REAPING, // Being reaped by waitpid - prevents double-reap races.
                 DEAD
             };
 
@@ -290,6 +294,14 @@ namespace NSched {
                 DEAD // Thread has exited and is awaiting cleanup.
             };
 
+            // Pending wait state - set before yield, consumed by scheduler after context save.
+            // This prevents the race where a thread is woken before its context is saved.
+            enum pendingwait {
+                PENDING_NONE, // No pending wait.
+                PENDING_WAIT, // Wants to enter WAITING state (non-interruptible).
+                PENDING_WAITINT // Wants to enter WAITINGINT state (interruptible).
+            };
+
             struct NArch::CPU::context ctx; // CPU working context (save state).
             struct NArch::CPU::extracontext xctx; // CPU extra context (save state).
             struct NArch::CPU::fpucontext fctx; // CPU fpu context (save state).
@@ -305,6 +317,7 @@ namespace NSched {
             volatile bool rescheduling = false; // Set when thread needs to be rescheduled.
 
             volatile enum state tstate = state::READY; // Current state of thread. Access atomically.
+            volatile enum pendingwait pendingwaitstate = pendingwait::PENDING_NONE; // Pending wait state. Access atomically.
             struct RBTree::node node; // Red-Black tree node for this thread.
             struct Thread *nextzombie = NULL; // Next zombie in the zombie list.
             size_t id = 0; // Thread ID.
@@ -315,6 +328,7 @@ namespace NSched {
             volatile size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
 
             NLib::sigset_t blocked = 0; // Signals blocked in this thread.
+            NArch::IRQSpinlock waitingonlock; // Lock for waitingon property.
             WaitQueue *waitingon = NULL; // Waitqueue this thread is sleeping on (if any).
 
             // Alternate signal stack.

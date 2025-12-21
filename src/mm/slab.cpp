@@ -104,18 +104,14 @@ namespace NMem {
             return (void *)((uintptr_t)block + sizeof(struct SubAllocator::metadata));
         } else {
             // Unable to find slab (too big). Try to allocate this as a page.
-
-            this->largelock.acquire();  // Lock for large allocations.
+            // PMM has its own internal lock, so no external lock needed here.
 
             size_t needed = ((aligned + NArch::PAGESIZE - 1) / NArch::PAGESIZE) * NArch::PAGESIZE;
             void *ptr = NArch::PMM::alloc(needed);
             if (ptr == NULL) {
-                this->largelock.release();
                 return NULL;
             }
             ptr = NArch::hhdmoff(ptr);
-
-            this->largelock.release();  // Unlock after PMM allocation.
 
             // Store metadata header at the start of page allocation.
             struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)ptr;
@@ -142,11 +138,15 @@ namespace NMem {
 
         // Get the header from the allocation meta data.
         struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)((uintptr_t)ptr - sizeof(struct SubAllocator::metadata));
-        assert(meta->magic == ALLOCMAGIC, "Invalid free on potentially non-allocated block.\n");
-        assert(meta->startcanary == CANARY && meta->endcanary == CANARY, "Slab memory corruption detected.\n");
 
-        // Clear the magic to detect double-frees.
-        meta->magic = 0;
+        // Atomically check and clear magic to prevent double-free race.
+        // Two threads could otherwise both pass the magic check before either clears it.
+        uint32_t expected = ALLOCMAGIC;
+        bool success = __atomic_compare_exchange_n(&meta->magic, &expected, 0,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        assert(success, "Double free or invalid free on potentially non-allocated block.\n");
+
+        assert(meta->startcanary == CANARY && meta->endcanary == CANARY, "Slab memory corruption detected.\n");
 
         size_t size = meta->size;
 
@@ -156,12 +156,12 @@ namespace NMem {
             // Release slabbed
             SubAllocator *sub = &this->slabs[idx];
 
+            sub->lock.acquire();  // Lock slab BEFORE any operations to prevent races.
+
             if (sanitisefreed) {
                 // Overwrite freed memory with nonsense (sanitisation).
                 NLib::memset(meta, 0xaa, size);
             }
-
-            sub->lock.acquire();  // Lock slab before modifying freelist.
 
             struct SubAllocator::header *block = (struct SubAllocator::header *)meta; // Reinterpret pointer as free block.
             block->next = sub->freelist; // This metadata'd allocation (indicating that it's allocated) is now free, so we need to point it somewhere.
@@ -201,15 +201,16 @@ namespace NMem {
         }
 
         struct SubAllocator::metadata *meta = (struct SubAllocator::metadata *)((uintptr_t)ptr - sizeof(struct SubAllocator::metadata));
-        size_t old = meta->size; // Find old size, so we can figure out how much to copy.
+        // meta->size stores the aligned size including metadata overhead.
+        // Compute the actual user-usable size by subtracting metadata size.
+        size_t old = meta->size - sizeof(struct SubAllocator::metadata);
 
         void *newptr = this->alloc(newsize);
         if (newptr == NULL) {
-            this->free(ptr);
+            // NOTE: Per C/POSIX standard, do NOT free original pointer on allocation failure.
+            // The caller is responsible for the original memory.
             return NULL;
         }
-
-        size_t aligned = (((newsize + sizeof(struct SubAllocator::metadata)) + (16 - 1)) & ~(16 - 1));
 
         // Pick if we should be copying all the data from the old one, or up until the new size.
         size_t copysize = old < newsize ? old : newsize;

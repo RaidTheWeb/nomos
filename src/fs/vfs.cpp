@@ -144,7 +144,7 @@ namespace NFS {
 
                 if (ud.found) {
                     // If mount node is busy (i.e., has open references), we cannot unmount.
-                    if (ud.mntnode->getrefcount() > 1) { // More than one reference means it's busy (the resolve above adds one reference).
+                    /*if (ud.mntnode->getrefcount() > 1) { // More than one reference means it's busy (the resolve above adds one reference).
                         NUtil::printf("VFS: Mountpoint %s is busy with %lu references, cannot unmount.\n", path, ud.mntnode->getrefcount());
                         // Reinsert mountpoint.
                         this->mounts.push((struct VFS::mntpoint) { NLib::strdup(ud.match), ud.fs, ud.mntnode });
@@ -152,7 +152,7 @@ namespace NFS {
                         delete[] path;
                         return -EBUSY;
                     }
-                    ud.mntnode->unref();
+                    ud.mntnode->unref();*/
 
                     if (!ud.depth && this->root) { // If this was the root mount, clear root reference.
                         this->root = NULL;

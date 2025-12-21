@@ -4,6 +4,7 @@
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/panic.hpp>
 #include <arch/x86_64/pmm.hpp>
+#include <arch/x86_64/stacktrace.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <fs/vfs.hpp>
 #include <lib/align.hpp>
@@ -275,6 +276,18 @@ pffault:
                 NSched::signalproc(NArch::CPU::get()->currthread->process, sig);
                 return;
             }
+
+            // Print register dump and stack trace for kernel exceptions.
+            NUtil::printf("Register dump:\n");
+            NUtil::printf("  RAX=%016lx RBX=%016lx RCX=%016lx RDX=%016lx\n", ctx->rax, ctx->rbx, ctx->rcx, ctx->rdx);
+            NUtil::printf("  RSI=%016lx RDI=%016lx RBP=%016lx RSP=%016lx\n", ctx->rsi, ctx->rdi, ctx->rbp, ctx->rsp);
+            NUtil::printf("  R8 =%016lx R9 =%016lx R10=%016lx R11=%016lx\n", ctx->r8, ctx->r9, ctx->r10, ctx->r11);
+            NUtil::printf("  R12=%016lx R13=%016lx R14=%016lx R15=%016lx\n", ctx->r12, ctx->r13, ctx->r14, ctx->r15);
+            NUtil::printf("  RIP=%016lx RFLAGS=%016lx CS=%04lx SS=%04lx\n", ctx->rip, ctx->rflags, ctx->cs, ctx->ss);
+            NUtil::printf("  CR2=%016lx ERR=%016lx\n", ctx->cr2, ctx->err);
+
+            // Print stack trace starting from exception context.
+            printstacktrace(ctx->rbp, ctx->rip);
 
             // Kernel exceptions are always fatal.
             panic(errbuffer);

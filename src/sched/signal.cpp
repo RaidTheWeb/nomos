@@ -787,9 +787,11 @@ namespace NSched {
                 }
 
                 enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+                enum Thread::pendingwait pwait = (enum Thread::pendingwait)__atomic_load_n(&thread->pendingwaitstate, memory_order_acquire);
 
-                // Prefer threads that are already running or ready.
-                if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
+                // Prefer threads that are already running or ready (but not about to wait).
+                if ((state == Thread::RUNNING && pwait == Thread::pendingwait::PENDING_NONE) ||
+                    state == Thread::READY || state == Thread::SUSPENDED) {
                     // Signal will be delivered when this thread next checks for pending signals.
                     return 0;
                 }
@@ -799,11 +801,18 @@ namespace NSched {
                     pausedcandidate = thread;
                 }
 
-                if (state == Thread::WAITINGINT && thread->waitingon) { // Only interruptible waits can be woken.
+                thread->waitingonlock.acquire();
+                // Check for interruptible wait: either already in WAITINGINT state (context saved),
+                // or has pending interruptible wait (context not yet saved, but will check signal on wake).
+                bool isinterruptiblewait = (state == Thread::WAITINGINT) ||
+                    (pwait == Thread::pendingwait::PENDING_WAITINT);
+                if (isinterruptiblewait && thread->waitingon) {
                     wq = thread->waitingon;
                     towake = thread;
+                    thread->waitingonlock.release();
                     break;
                 }
+                thread->waitingonlock.release();
             }
 
             // If no interruptible waiter found, use paused candidate.
@@ -815,12 +824,20 @@ namespace NSched {
         // Now schedule the thread outside of the process lock to avoid deadlocks.
         if (towake) {
             if (wq) {
-                // Dequeue from waitqueue first, then schedule.
+                // Dequeue from waitqueue first.
                 if (wq->dequeue(towake)) {
-                    NSched::schedulethread(towake);
+                    // Check the thread state again after dequeue.
+                    enum Thread::state state = (enum Thread::state)__atomic_load_n(&towake->tstate, memory_order_acquire);
+                    if (state == Thread::WAITINGINT) {
+                        NSched::schedulethread(towake);
+                    } else {
+                        // Thread is still RUNNING, just clear pending wait state.
+                        __atomic_store_n(&towake->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+                    }
                 }
             } else {
                 // Paused thread, just schedule it directly.
+                // PAUSED threads have saved context, so this is safe.
                 NSched::schedulethread(towake);
             }
         }
@@ -870,20 +887,29 @@ namespace NSched {
 
             // Check thread state and determine if we need to wake it.
             enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+            enum Thread::pendingwait pwait = (enum Thread::pendingwait)__atomic_load_n(&thread->pendingwaitstate, memory_order_acquire);
 
-            if (state == Thread::RUNNING || state == Thread::READY || state == Thread::SUSPENDED) {
-                // Thread is already active, signal will be delivered when it checks.
+            // Thread is already active (and not about to wait), signal will be delivered when it checks.
+            if ((state == Thread::RUNNING && pwait == Thread::pendingwait::PENDING_NONE) ||
+                state == Thread::READY || state == Thread::SUSPENDED) {
                 return 0;
             }
 
+            thread->waitingonlock.acquire();
             if (state == Thread::PAUSED) {
                 // Wake the paused thread so it can handle the signal.
                 needschedule = true;
-            } else if (state == Thread::WAITINGINT && thread->waitingon) {
-                // Only interruptible waits can be woken.
-                wq = thread->waitingon;
-                needschedule = true;
+            } else {
+                // Check for interruptible wait: either already in WAITINGINT state,
+                // or has pending interruptible wait.
+                bool isinterruptiblewait = (state == Thread::WAITINGINT) ||
+                    (pwait == Thread::pendingwait::PENDING_WAITINT);
+                if (isinterruptiblewait && thread->waitingon) {
+                    wq = thread->waitingon;
+                    needschedule = true;
+                }
             }
+            thread->waitingonlock.release();
         }
         // Process lock released here.
 
@@ -891,9 +917,18 @@ namespace NSched {
         if (needschedule) {
             if (wq) {
                 if (wq->dequeue(thread)) {
-                    NSched::schedulethread(thread);
+                    // Check the thread state again after dequeue.
+                    enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+                    if (state == Thread::WAITINGINT) {
+                        NSched::schedulethread(thread);
+                    } else {
+                        // Thread is still RUNNING, just clear pending wait state.
+                        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+                    }
                 }
             } else {
+                // Paused thread, just schedule it directly.
+                // PAUSED threads have saved context, so this is safe.
                 NSched::schedulethread(thread);
             }
         }

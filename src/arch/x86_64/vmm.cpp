@@ -205,9 +205,16 @@ namespace NArch {
                     bool make_cow = !cowexempt && !readonly;
 
                     // Map page into destination address space.
-                    assertarg(_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, make_cow)), "Failed to destination map page %p during address space fork.\n", node->start + i);
+                    if (!_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, make_cow))) {
+                        meta->unref(); // Release the reference we just took on failure.
+                        assertarg(false, "Failed to destination map page %p during address space fork.\n", node->start + i);
+                    }
                     if (make_cow) { // Only bother remapping the source if we're doing CoW.
-                        assertarg(_mappage(work->src, node->start + i, phys, vmatovmm(node->flags, true)), "Failed to source remap page during %p address space fork.\n", node->start + i);
+                        if (!_mappage(work->src, node->start + i, phys, vmatovmm(node->flags, true))) {
+                            // Note: We do not unref here since dest mapping succeeded and holds a ref.
+                            // The page will be cleaned up when the dest address space is destroyed.
+                            assertarg(false, "Failed to source remap page during %p address space fork.\n", node->start + i);
+                        }
                     }
                 }
             }
@@ -215,6 +222,9 @@ namespace NArch {
 
         addrspace::~addrspace(void) {
             NLib::ScopeIRQSpinlock guard(&this->lock);
+
+            // Perform full TLB shootdown (we're about to free a LOT of pages).
+            doshootdown(CPU::TLBSHOOTDOWN_FULL, 0, 0);
 
             this->vmaspace->traversedata(this->vmaspace->getroot(), [](struct NMem::Virt::vmanode *node, void *data) {
                 struct addrspace *space = (struct addrspace *)data;

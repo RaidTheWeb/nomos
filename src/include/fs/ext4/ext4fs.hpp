@@ -55,13 +55,19 @@ namespace NFS {
                 // Read file data using extent mapping.
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
 
-                ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override {
-                    (void)buf;
-                    (void)count;
-                    (void)offset;
-                    (void)fdflags;
-                    return -EROFS;
-                }
+                ssize_t write(const void *buf, size_t count, off_t offset, int fdflags) override;
+
+                // Truncate file to specified length.
+                int truncate(off_t length) override;
+
+                // Allocate a new extent for the file.
+                uint64_t allocextent(uint64_t logicalblk, uint16_t len);
+
+                // Update inode timestamps.
+                void touchtime(bool mtime, bool ctime, bool atime);
+
+                // Write the inode back to disk.
+                int writeback(void);
 
                 // Read directory entries.
                 ssize_t readdir(void *buf, size_t count, off_t offset) override;
@@ -72,15 +78,11 @@ namespace NFS {
                 // Lookup a child node by name.
                 VFS::INode *lookup(const char *name) override;
 
-                // Read-only filesystem - modifications not supported.
-                bool add(VFS::INode *node) override {
-                    (void)node;
-                    return false;
-                }
-                bool remove(const char *name) override {
-                    (void)name;
-                    return false;
-                }
+                // Add a child node to this directory (on disk).
+                bool add(VFS::INode *node) override;
+
+                // Remove a child node from this directory (on disk).
+                bool remove(const char *name) override;
 
                 // Check if directory is empty.
                 bool empty(void) override;
@@ -122,35 +124,84 @@ namespace NFS {
                 // Read a block from the filesystem.
                 ssize_t readblock(uint64_t blknum, void *buf);
 
+                // Write a block to the filesystem.
+                ssize_t writeblock(uint64_t blknum, const void *buf);
+
+                // Write an inode back to disk.
+                int writeinode(uint32_t ino, struct inode *diskino);
+
+                // Write the superblock back to disk.
+                int writesuperblock(void);
+
+                // Write a group descriptor back to disk.
+                int writegroupdesc(uint32_t group);
+
+                // Calculate inode checksum over a full inode buffer.
+                uint32_t calcinodecsum(uint32_t ino, void *inodebuf, size_t inodesize);
+
+                // Calculate group descriptor checksum.
+                uint16_t calcgroupdesccsum(uint32_t group);
+
+                // Calculate superblock checksum.
+                uint32_t calcsuperblocksum(void);
+
+                // Check if metadata checksums are enabled.
+                bool hasmetadatacsum(void);
+
+                // Get checksum seed (computed or from superblock).
+                uint32_t getcsumseed(void);
+
+                // Calculate block bitmap checksum.
+                uint32_t calcblockbitmapcsum(uint32_t group, const void *bitmap);
+
+                // Calculate inode bitmap checksum.
+                uint32_t calcinodebitmapcsum(uint32_t group, const void *bitmap);
+
+                // Update block bitmap checksum in group descriptor.
+                void updateblockbitmapcsum(uint32_t group, const void *bitmap);
+
+                // Update inode bitmap checksum in group descriptor.
+                void updateinodebitmapcsum(uint32_t group, const void *bitmap);
+
+                // Count free blocks in a bitmap.
+                uint32_t countfreeblocks(uint32_t group, const void *bitmap);
+
+                // Count free inodes in a bitmap.
+                uint32_t countfreeinodes(uint32_t group, const void *bitmap);
+
+                // Set padding bits in inode bitmap (bits beyond inodespergroup).
+                void setinodebitmappadding(void *bitmap);
+
+                // Set padding bits in block bitmap (bits beyond blockspergroup).
+                void setblockbitmappadding(void *bitmap);
+
+                // Calculate directory block checksum.
+                uint32_t calcdirblkcsum(uint32_t ino, uint32_t gen, const void *blk, size_t size);
+
+                // Set directory block checksum in the block's tail.
+                void setdirblkcsum(uint32_t ino, uint32_t gen, void *blk);
+
+                // Allocate a block from a specific block group.
+                uint64_t allocblock(uint32_t prefgroup = 0);
+
+                // Free a previously allocated block.
+                int freeblock(uint64_t blknum);
+
+                // Allocate an inode from a specific block group.
+                uint32_t allocinode(uint32_t prefgroup = 0, bool isdir = false);
+
+                // Free a previously allocated inode.
+                int freeinode(uint32_t ino, bool isdir = false);
+
                 int mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) override;
 
-                int umount(int flags) override {
-                    (void)flags;
-                    this->mounted = false;
-                    // Delete root node; its destructor will cascade and free all cached child nodes.
-                    if (this->root) {
-                        delete this->root;
-                        this->root = NULL;
-                    }
-                    return 0;
-                }
+                int umount(int flags) override;
 
-                int sync(void) override {
-                    return 0;
-                }
+                int sync(void) override;
 
-                ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override {
-                    (void)name;
-                    (void)nodeout;
-                    (void)attr;
-                    return -EROFS;
-                }
+                ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
 
-                int unlink(VFS::INode *node, VFS::INode *parent) override {
-                    (void)node;
-                    (void)parent;
-                    return -EROFS;
-                }
+                int unlink(VFS::INode *node, VFS::INode *parent) override;
         };
     }
 }

@@ -117,8 +117,10 @@ namespace NUtil {
             }
         }
 
-        if (!(flags & LEFTJUST) && width > idx) {
-            for (int i = idx; i < width; i++) {
+        int numdigits = idx; // Save the count of digits before modifying idx
+
+        if (!(flags & LEFTJUST) && width > numdigits) {
+            for (int i = numdigits; i < width; i++) {
                 putchar(buf, flags & ZEROPAD ? '0' : ' ', counter, max);
             }
         }
@@ -127,8 +129,8 @@ namespace NUtil {
             putchar(buf, temp[idx], counter, max);
         }
 
-        if (flags & LEFTJUST && width > (idx + 1)) {
-            for (int i = (idx + 1); i < width; i++) {
+        if (flags & LEFTJUST && width > numdigits) {
+            for (int i = numdigits; i < width; i++) {
                 putchar(buf, ' ', counter, max); // Left justification is spaces.
             }
         }
@@ -331,8 +333,6 @@ flagbreak:
         return len;
     }
 
-    static NSched::Mutex mutex;
-    bool canmutex = false;
     static bool consolewrite = true;
 
     void dropwrite(void) {

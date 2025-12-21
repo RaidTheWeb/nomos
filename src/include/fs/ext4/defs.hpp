@@ -74,20 +74,22 @@ namespace NFS {
             uint32_t freeblkcnthi; // Free blocks count high 32 bits.
             uint16_t minextraisize; // All inodes have at least this much space.
             uint16_t wantextraisize; // New inodes should reserve this much space.
-            uint32_t maxextraisize; // New inodes should not reserve more than this much space.
             uint32_t mflags; // Miscellaneous flags.
-            uint16_t raidstripesize; // RAID stripe size.
+            uint16_t raidstride; // RAID stride (blocks read/written before moving to next disk).
+            uint16_t mmpinterval; // Multi-mount protection check interval in seconds.
+            uint64_t mmpblock; // Block number for multi-mount protection data.
+            uint32_t raidstripewidth; // RAID stripe width (blocks on all data disks).
             uint8_t loggroupsperflex; // Number of block groups per flex group.
             uint8_t csumtype; // Checksum type.
             uint8_t encryptlevel; // Encryption level.
-            uint8_t rsvd;
+            uint8_t rsvdpad; // Padding to 32-bit alignment.
             uint64_t kbyteswritten; // Number of kilobytes written to this FS.
             uint32_t snapshotinodenum; // Inode number of active snapshot.
             uint32_t snapshotid; // Sequential ID of active snapshot.
             uint64_t snapshotrsvdblocks; // Reserved blocks for active snapshot.
             uint32_t snapshotlist; // Inode number of the head of the snapshot list.
 
-            uint32_t erroff; // Offset of the last error.
+            uint32_t errorcount; // Number of errors seen.
 
             uint32_t firsterrortime; // Time of first error.
             uint32_t firsterrinode; // Inode involved in first error.
@@ -114,13 +116,13 @@ namespace NFS {
             uint32_t csumseed; // Checksum seed.
             uint8_t wtimehi; // High bits of write time.
             uint8_t mtimehi; // High bits of mount time.
-            uint8_t ctimehi; // High bits of creation time.
+            uint8_t mkfstimehi; // High bits of mkfs time.
             uint8_t lastcheckhi; // High bits of last check time.
 
             uint8_t firsterrtimehi; // High bits of first error time.
             uint8_t lasterrtimehi; // High bits of last error time.
-            uint8_t firsterrcodehi; // High bits of first error code.
-            uint8_t lasterrcodehi; // High bits of last error code.
+            uint8_t firsterrcode; // Error code from first error.
+            uint8_t lasterrcode; // Error code from last error.
 
             uint16_t encoding; // Filename encoding.
             uint16_t encodingflags; // Filename encoding flags.
@@ -128,8 +130,8 @@ namespace NFS {
             uint32_t orphanfileino; // Inode number of the orphan file.
             uint16_t defresuidhi; // High bits of default reserved UID.
             uint16_t defresgidhi; // High bits of default reserved GID.
-            uint32_t reserved[98];
-            uint32_t checksum; // Checksum of superblock.
+            uint32_t reserved[93]; // Padding to make superblock 1024 bytes.
+            uint32_t checksum; // Checksum of superblock at offset 0x3FC.
         } __attribute__((packed));
 
 
@@ -240,6 +242,17 @@ namespace NFS {
             FT_SYMLINK = 7,
             FT_MAX = 8
         };
+
+        // Directory entry tail for checksums (fake entry with inode=0, reclen=12).
+        struct dirtail {
+            uint32_t reserved; // Reserved (should be 0).
+            uint16_t reclen; // Must be 12.
+            uint8_t reserved_namelen; // Must be 0.
+            uint8_t reserved_filetype; // Must be 0xDE (EXT4_FTDIRCSUM).
+            uint32_t checksum; // CRC32c checksum.
+        } __attribute__((packed));
+
+        #define EXT4_FTDIRCSUM 0xDE
 
         struct direntry {
             uint32_t inode; // Inode number.

@@ -412,7 +412,7 @@ namespace NDev {
                         struct nvmepending *pending = &ctrl->pending[(ns->nsnum + 1) * QUEUESIZE + (cid % QUEUESIZE)];
                         pending->status = cqe->sc;
                         __atomic_store_n(&pending->done, true, memory_order_release);
-                        pending->wq.wake();
+                        pending->wq.wakeone(); // Generally speaking, there should only be one waiter per I/O.
 
                         // Consume!
                         ctrl->iocq[ns->nsnum + 1].head++;

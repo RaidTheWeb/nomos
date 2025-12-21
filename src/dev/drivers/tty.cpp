@@ -267,7 +267,6 @@ namespace NDev {
 
     void TTY::process(char c, void (*writefn)(const char *, size_t)) {
         bool canwrite = writefn != NULL;
-        NUtil::printf("TTY: Processing character 0x%02x ('%c')\n", c, (c >= 32 && c <= 126) ? c : '.');
 
         if (termios.lflag & ISIG) {
             int signal = -1;
@@ -367,7 +366,7 @@ namespace NDev {
                 if (this->linebuffer.empty()) { // EOF is only valid at the start of a line.
                     this->pending_eof = true;
                     if (NSched::initialised) {
-                        this->readwait.wake();
+                        this->readwait.wakeone();
                     }
                     return;
                 }
@@ -393,7 +392,7 @@ namespace NDev {
                     this->outbuffer.push(c);
                 }
                 if (NSched::initialised) {
-                    this->readwait.wake(); // We have a full line now. Wake waiters.
+                    this->readwait.wakeone(); // We have a full line now. Wake one waiter.
                 }
                 return;
                 // Forced to flush output to buffer, we've finished this line.
@@ -433,7 +432,7 @@ namespace NDev {
             this->inbuffer.push(c); // Append character to input buffer. Raw mode doesn't process any input.
 
             if (NSched::initialised) {
-                this->readwait.wake();
+                this->readwait.wakeone();
             }
             // POLLIN. Raw will notify for every appending character.
         }

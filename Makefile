@@ -71,10 +71,11 @@ NASMFLAGS ?= -F dwarf -g
 
 SHAREDFLAGS ?= \
 	-Wall -Wextra -nostdinc -ffreestanding -fno-stack-protector \
-	-fno-stack-check -fno-PIC -ffunction-sections -fdata-sections
+	-fno-stack-check -fno-PIC -ffunction-sections -fdata-sections \
+	-fno-omit-frame-pointer
 
 ifeq ($(DEBUG),1)
-	CPPFLAGS += -DSYSCALL_DEBUG -DSYSCALL_DEBUGRET
+#	CPPFLAGS += -DSYSCALL_DEBUG -DSYSCALL_DEBUGRET
 	SHAREDFLAGS += -fsanitize=undefined
 endif
 

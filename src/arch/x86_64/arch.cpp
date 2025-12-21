@@ -194,8 +194,6 @@ namespace NArch {
 
         Timer::init(); // Initialise timer subsystem.
 
-        NUtil::canmutex = true; // We're allowed to print mutex now.
-
         NSched::Thread *kthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)archthreadinit);
         NSched::schedulethread(kthread);
 

@@ -329,6 +329,7 @@ namespace NDev {
                 }
             } else {
                 NUtil::printf("[dev/blockcache]: Failed to write back block %llu during flush (err=%d).\n", lba, (int)res);
+                NArch::panic("[dev/blockcache]: Flush writeback failure.\n");
             }
             delete[] scratch;
             this->cachelock.release();

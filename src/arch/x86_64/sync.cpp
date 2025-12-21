@@ -7,9 +7,6 @@
 namespace NArch {
 
     void Spinlock::acquire(void) {
-        if (SMP::initialised && CPU::get()->currthread) {
-            __atomic_add_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
-        }
         while (true) {
             if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) { // Try to exchange, if it goes through with success, we now own the lock.
                 break; // Success!
@@ -30,6 +27,10 @@ namespace NArch {
                 }
             } while (this->locked);
         }
+
+        if (SMP::initialised && CPU::get()->currthread) {
+            __atomic_add_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
+        }
     }
 
     bool Spinlock::trylock(void) {
@@ -43,10 +44,10 @@ namespace NArch {
     }
 
     void Spinlock::release(void) {
-        __atomic_store_n(&this->locked, 0, memory_order_release);
         if (SMP::initialised && CPU::get()->currthread) {
             __atomic_sub_fetch(&CPU::get()->currthread->locksheld, 1, memory_order_seq_cst);
         }
+        __atomic_store_n(&this->locked, 0, memory_order_release);
     }
 
     void IRQSpinlock::acquire(void) {
