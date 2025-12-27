@@ -341,9 +341,60 @@ namespace NFS {
 
             ssize_t res = node->unlink(); // Returns 0 if we're good to delete the node.
             if (res == 0) {
-                NUtil::printf("RAMFS: Deleting node %s ino %llu\n", node->getname(), ino);
                 delete node; // Delete the node.
             }
+            return 0;
+        }
+
+        int RAMFileSystem::rename(VFS::INode *oldparent, VFS::INode *node, VFS::INode *newparent, const char *newname, VFS::INode *target) {
+            // If target exists, we need to unlink it first.
+            if (target) {
+                // If target is a directory, it must be empty.
+                if (VFS::S_ISDIR(target->getattr().st_mode)) {
+                    if (!target->empty()) {
+                        oldparent->unref();
+                        node->unref();
+                        newparent->unref();
+                        target->unref();
+                        return -ENOTEMPTY;
+                    }
+                }
+
+                // Remove target from newparent.
+                bool worked = newparent->remove(target->getname());
+                if (!worked) {
+                    oldparent->unref();
+                    node->unref();
+                    newparent->unref();
+                    target->unref();
+                    return -EINVAL;
+                }
+
+                // Unlink target.
+                ssize_t res = target->unlink();
+                if (res == 0) {
+                    delete target; // Delete if no more links/refs.
+                } else {
+                    target->unref();
+                }
+            }
+
+            // Remove node from old parent.
+            const char *oldname = node->getname();
+            bool worked = oldparent->remove(oldname);
+            oldparent->unref();
+            if (!worked) {
+                node->unref();
+                newparent->unref();
+                return -EINVAL;
+            }
+
+            // Set new name and add to new parent.
+            node->setname(newname);
+            newparent->add(node);
+            newparent->unref();
+            node->unref();
+
             return 0;
         }
 

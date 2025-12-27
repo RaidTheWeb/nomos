@@ -11,6 +11,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Forward declaration for page cache integration.
+namespace NMem {
+    class RadixTree;
+    class CachePage;
+}
+
 namespace NFS {
 
     namespace VFS {
@@ -343,6 +349,8 @@ namespace NFS {
 
                 // Special redirect node for abstracting operations to another node (e.g., for FIFOs).
                 INode *redirect = NULL;
+
+                NMem::RadixTree *pagecache = NULL;
             public:
                 IFileSystem *fs;
 
@@ -457,6 +465,12 @@ namespace NFS {
                     return this->name;
                 }
 
+                void setname(const char *newname) {
+                    NLib::ScopeSpinlock guard(&this->metalock);
+                    delete this->name;
+                    this->name = NLib::strdup(newname);
+                }
+
                 INode *getredirect(void) {
                     NLib::ScopeSpinlock guard(&this->metalock);
                     if (!this->redirect) {
@@ -497,6 +511,34 @@ namespace NFS {
                     assert(this->refcount > 0, "INode: Attempting to unref node with zero refcount.\n");
                     __atomic_sub_fetch(&this->refcount, 1, memory_order_seq_cst);
                 }
+
+                // Get the page cache for this inode. Creates one if it doesn't exist.
+                NMem::RadixTree *getpagecache(void);
+
+                // Find a cached page by offset.
+                NMem::CachePage *findcachedpage(off_t offset);
+
+                // Find or create a cached page.
+                NMem::CachePage *getorcacheepage(off_t offset);
+
+                // Invalidate all cached pages for this inode.
+                void invalidatecache(void);
+
+                // Sync all dirty cached pages for this inode.
+                int synccache(void);
+
+                // Read data through the page cache.
+                ssize_t readcached(void *buf, size_t count, off_t offset);
+
+                // Write data through the page cache.
+                ssize_t writecached(const void *buf, size_t count, off_t offset);
+
+
+
+                // Read page, but we can override it for speeding up page-wise reads.
+                virtual int readpage(NMem::CachePage *page);
+                // Write page, but we can override it for speeding up page-wise writes.
+                virtual int writepage(NMem::CachePage *page);
         };
 
         class VFS;
@@ -532,6 +574,15 @@ namespace NFS {
                 virtual ssize_t create(const char *name, INode **nodeout, struct stat attr) = 0;
                 // Unlink a node from its parent, on the filesystem. NOTE: Expects caller to hold references to both node and parent, and will unref them as needed.
                 virtual int unlink(INode *node, INode *parent) = 0; // Unlink a node.
+                // Rename a node.
+                virtual int rename(INode *oldparent, INode *node, INode *newparent, const char *newname, INode *target) {
+                    (void)oldparent;
+                    (void)node;
+                    (void)newparent;
+                    (void)newname;
+                    (void)target;
+                    return -EXDEV;
+                }
         };
 
         typedef IFileSystem *(fsfactory_t)(VFS *vfs);
@@ -603,6 +654,9 @@ namespace NFS {
 
                 ssize_t create(const char *path, INode **nodeout, struct stat attr, INode *relativeto = NULL);
                 int unlink(const char *path, INode *relativeto = NULL, int flags = 0, int uid = 0, int gid = 0);
+                int rename(const char *oldpath, INode *oldrelativeto, const char *newpath, INode *newrelativeto, int uid = 0, int gid = 0);
+
+                int identifyfs(const char *src);
 
                 // Sync all mounted filesystems.
                 void syncall(void);

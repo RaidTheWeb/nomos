@@ -828,7 +828,8 @@ dowrite:
                 Input::registerhandler(&handler); // Register handler.
             }
 
-            static void event(uint16_t type, uint16_t code, int32_t value) {
+            static void event(uint64_t tmstmp, uint16_t type, uint16_t code, int32_t value) {
+                (void)tmstmp;
                 assert(type == Input::event::KEY, "Invalid event type received.\n");
 
                 if (code == Input::key::KLSHIFT || code == Input::key::KRSHIFT) {

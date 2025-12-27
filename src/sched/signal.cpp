@@ -459,7 +459,6 @@ namespace NSched {
         sysctx->rflags = ctx->rflags;
 
         // XXX: Investigate potentially incorrect syscall return values.
-        NUtil::printf("[sched/signal] sigreturn to RIP %p, RSP %p, RAX %p.\n", ctx->rip, ctx->rsp, ctx->rax);
         return ctx->rax; // Return original RAX so interrupted system calls return their original value.
 #else
         SYSCALL_RET(-ENOSYS);
@@ -538,8 +537,8 @@ namespace NSched {
         SYSCALL_RET(0);
     }
 
-    extern "C" int sys_sigaltstack(struct stack_t *ss, struct stack_t *old_ss) {
-        SYSCALL_LOG("sys_sigaltstack(%p, %p).\n", ss, old_ss);
+    extern "C" int sys_sigaltstack(struct stack_t *ss, struct stack_t *oldss) {
+        SYSCALL_LOG("sys_sigaltstack(%p, %p).\n", ss, oldss);
 
         Thread *thread = NArch::CPU::get()->currthread;
         if (!thread) {
@@ -547,16 +546,16 @@ namespace NSched {
         }
 
         // Check if we're currently on the alternate stack.
-        bool on_altstack = (thread->altstackflags & SS_ONSTACK) != 0;
+        bool onalt = (thread->altstackflags & SS_ONSTACK) != 0;
 
         // Return old alternate stack info if requested.
-        if (old_ss) {
+        if (oldss) {
             struct stack_t old_stack;
             old_stack.ss_sp = thread->altstackbase;
             old_stack.ss_size = thread->altstacksize;
             old_stack.ss_flags = thread->altstackflags;
 
-            int ret = NMem::UserCopy::copyto(old_ss, &old_stack, sizeof(struct stack_t));
+            int ret = NMem::UserCopy::copyto(oldss, &old_stack, sizeof(struct stack_t));
             if (ret < 0) {
                 SYSCALL_RET(ret);
             }
@@ -565,7 +564,7 @@ namespace NSched {
         // Set new alternate stack if provided.
         if (ss) {
             // Cannot change alternate stack while executing on it.
-            if (on_altstack) {
+            if (onalt) {
                 SYSCALL_RET(-EPERM);
             }
 
@@ -802,8 +801,7 @@ namespace NSched {
                 }
 
                 thread->waitingonlock.acquire();
-                // Check for interruptible wait: either already in WAITINGINT state (context saved),
-                // or has pending interruptible wait (context not yet saved, but will check signal on wake).
+                // Check for interruptible wait: either already in WAITINGINT state (context saved), or has pending interruptible wait (context not yet saved, but will check signal on wake).
                 bool isinterruptiblewait = (state == Thread::WAITINGINT) ||
                     (pwait == Thread::pendingwait::PENDING_WAITINT);
                 if (isinterruptiblewait && thread->waitingon) {
@@ -900,8 +898,7 @@ namespace NSched {
                 // Wake the paused thread so it can handle the signal.
                 needschedule = true;
             } else {
-                // Check for interruptible wait: either already in WAITINGINT state,
-                // or has pending interruptible wait.
+                // Check for interruptible wait: either already in WAITINGINT state, or has pending interruptible wait.
                 bool isinterruptiblewait = (state == Thread::WAITINGINT) ||
                     (pwait == Thread::pendingwait::PENDING_WAITINT);
                 if (isinterruptiblewait && thread->waitingon) {

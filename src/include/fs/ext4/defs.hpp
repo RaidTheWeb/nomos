@@ -169,6 +169,11 @@ namespace NFS {
         #define EXT4_TINDBLOCK (EXT4_DINDBLOCK + 1)
         #define EXT4_NBLOCKS (EXT4_TINDBLOCK + 1)
 
+        // Feature flags for checksums.
+        #define EXT4_FEATUREROCOMPATMETADATACSUM 0x0400
+        #define EXT4_FEATUREROCOMPATGDTCSUM 0x0010
+        #define EXT4_FEATUREINCOMPATCSUMSEED 0x2000
+
         struct inode {
             uint16_t mode; // File mode.
             uint16_t uid; // Low 16 bits of owner UID.

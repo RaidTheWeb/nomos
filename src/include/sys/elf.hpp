@@ -88,7 +88,7 @@ namespace NSys {
         } __attribute__((packed));
 
         bool verifyheader(struct header *hdr);
-        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t execbase, uintptr_t lnbase, uintptr_t phdraddr);
+        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t entry, uintptr_t lnbase, uintptr_t phdraddr);
         char *getinterpreter(struct header *hdr, NFS::VFS::INode *node);
         bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry, uintptr_t base, uintptr_t *phdraddr);
     }

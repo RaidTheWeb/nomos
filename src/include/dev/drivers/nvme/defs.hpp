@@ -280,9 +280,9 @@ namespace NDev {
     // Struct for pending operations.
     struct nvmepending {
         NSched::WaitQueue wq; // Wait queue for this pending operation.
-        bool done; // Is the operation done? Atomic.
+        volatile bool done; // Is the operation done? Accessed atomically.
         int status;
-        uint8_t inuse; // Are we using this slot? Atomic.
+        volatile bool inuse; // Are we using this slot? Accessed atomically.
     };
 
     struct nvmectrl {

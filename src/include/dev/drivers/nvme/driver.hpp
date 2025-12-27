@@ -3,7 +3,6 @@
 
 #include <dev/drivers/nvme/defs.hpp>
 #include <dev/block.hpp>
-#include <dev/blockcache.hpp>
 #include <std/stddef.h>
 
 namespace NDev {
@@ -39,7 +38,6 @@ namespace NDev {
                 this->ctrl = ctrl;
                 this->ns = ns;
                 this->blksize = ns->blksize;
-                this->cache = new BlockCache(this, 64 * 1024 * 1024 / ns->blksize, ns->blksize); // 64MB cache.
             }
 
             ~NVMEBlockDevice();
@@ -52,6 +50,63 @@ namespace NDev {
             ssize_t writeblock(uint64_t lba, const void *buffer) override {
                 size_t blksize = ns->blksize;
                 return ((NVMEDriver *)driver)->iorequest(ctrl, ns->nsnum + 1, IOWRITE, ns->nsid, lba, 1, (void *)buffer, blksize);
+            }
+
+            // Multi-block read using single NVMe command for better performance.
+            ssize_t readblocks(uint64_t lba, size_t count, void *buffer) override {
+                if (count == 0) {
+                    return 0;
+                }
+                if (count == 1) {
+                    return readblock(lba, buffer);
+                }
+
+                size_t maxsectors = 256;
+                size_t blksize = ns->blksize;
+                uint8_t *buf = (uint8_t *)buffer;
+                size_t remaining = count;
+                uint64_t curlba = lba;
+                while (remaining > 0) {
+                    size_t batch = (remaining > maxsectors) ? maxsectors : remaining;
+                    ssize_t res = ((NVMEDriver *)driver)->iorequest(ctrl, ns->nsnum + 1, IOREAD, ns->nsid, curlba, batch, buf, batch * blksize);
+
+                    if (res < 0) {
+                        return res;
+                    }
+
+                    buf += batch * blksize;
+                    curlba += batch;
+                    remaining -= batch;
+                }
+                return 0;
+            }
+
+            ssize_t writeblocks(uint64_t lba, size_t count, const void *buffer) override {
+                if (count == 0) {
+                    return 0;
+                }
+                if (count == 1) {
+                    return writeblock(lba, buffer);
+                }
+
+                size_t maxsectors = 256;
+                size_t blksize = ns->blksize;
+                const uint8_t *buf = (const uint8_t *)buffer;
+                size_t remaining = count;
+                uint64_t curlba = lba;
+                while (remaining > 0) {
+                    size_t batch = (remaining > maxsectors) ? maxsectors : remaining;
+                    ssize_t res = ((NVMEDriver *)driver)->iorequest(ctrl, ns->nsnum + 1, IOWRITE, ns->nsid, curlba, batch, (void *)buf, batch * blksize);
+
+                    if (res < 0) {
+                        return res;
+                    }
+
+                    buf += batch * blksize;
+                    curlba += batch;
+                    remaining -= batch;
+                }
+                return 0;
             }
     };
 }

@@ -9,54 +9,83 @@
 
 namespace NSched {
 
-// Wait on this wait queue, testing for condition().
-// The condition is checked under the waitqueue lock to avoid races.
+// Wait on this wait queue until condition becomes true. Non-interruptible.
 #define waitevent(wq, condition) do { \
-        for (;;) { \
+        (wq)->waitinglock.acquire(); \
+        while (!(condition)) { \
+            (wq)->preparewait(); \
+            (wq)->waitinglock.release(); \
+            NSched::yield(); \
             (wq)->waitinglock.acquire(); \
-            if ((condition)) { \
-                (wq)->waitinglock.release(); \
-                break; \
-            } \
-            (wq)->wait(true); \
+            (wq)->finishwait(); \
         } \
+        (wq)->waitinglock.release(); \
     } while (0)
 
-// Wait on this wait queue, testing for condition(). Manages waiting upon an active lock, will leave the lock acquired on return. NOTE: The condition should only depend on state protected by the provided lock. The lock is released during sleep and re-acquired before the condition is checked again.
+// Wait on this wait queue, with external lock held, until condition becomes true. Non-interruptible.
 #define waiteventlocked(wq, condition, lock) do { \
         while (!(condition)) { \
-            (wq)->waitlocked(lock); \
+            (wq)->waitinglock.acquire(); \
+            (wq)->preparewait(); \
+            (wq)->waitinglock.release(); \
+            (lock)->release(); \
+            NSched::yield(); \
+            (lock)->acquire(); \
+            (wq)->waitinglock.acquire(); \
+            (wq)->finishwait(); \
+            (wq)->waitinglock.release(); \
         } \
     } while (0)
 
-// Interruptible wait on this wait queue, testing for condition(). Returns -EINTR if interrupted by a signal, 0 on success. The condition is checked under the waitqueue lock to avoid races.
+// Wait on this wait queue, until condition becomes true. Interruptible by signals.
 #define waiteventinterruptible(wq, condition, result) do { \
         (result) = 0; \
-        for (;;) { \
-            (wq)->waitinglock.acquire(); \
-            if ((condition)) { \
+        (wq)->waitinglock.acquire(); \
+        while (!(condition)) { \
+            if ((wq)->preparewaitinterruptible()) { \
                 (wq)->waitinglock.release(); \
+                (result) = -EINTR; \
                 break; \
             } \
-            int __ret = (wq)->waitinterruptible(true); \
-            if (__ret < 0) { \
-                (result) = __ret; \
+            (wq)->waitinglock.release(); \
+            NSched::yield(); \
+            (wq)->waitinglock.acquire(); \
+            int __finret = (wq)->finishwaitinterruptible(); \
+            if (__finret < 0) { \
+                (wq)->waitinglock.release(); \
+                (result) = __finret; \
                 break; \
             } \
         } \
+        if ((result) == 0) { \
+            (wq)->waitinglock.release(); \
+        } \
     } while (0)
 
-// Interruptible wait on this wait queue with external lock held. Returns -EINTR if interrupted by a signal, 0 on success. NOTE: The condition should only depend on state protected by the provided lock. The lock is released during sleep and re-acquired before the condition is checked again.
+// Wait on this wait queue, with external lock held, until condition becomes true. Interruptible by signals.
 #define waiteventinterruptiblelocked(wq, condition, lock, result) do { \
         (result) = 0; \
         while (!(condition)) { \
-            int __ret = (wq)->waitinterruptiblelocked(lock); \
-            if (__ret < 0) { \
-                (result) = __ret; \
+            (wq)->waitinglock.acquire(); \
+            if ((wq)->preparewaitinterruptible()) { \
+                (wq)->waitinglock.release(); \
+                (result) = -EINTR; \
+                break; \
+            } \
+            (wq)->waitinglock.release(); \
+            (lock)->release(); \
+            NSched::yield(); \
+            (lock)->acquire(); \
+            (wq)->waitinglock.acquire(); \
+            int __finret = (wq)->finishwaitinterruptible(); \
+            (wq)->waitinglock.release(); \
+            if (__finret < 0) { \
+                (result) = __finret; \
                 break; \
             } \
         } \
     } while (0)
+
 }
 
 #endif

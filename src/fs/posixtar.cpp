@@ -25,16 +25,18 @@ namespace NFS {
 
             struct info *current = (struct info *)loc; // First file is at the start of the archive.
             char longpath[4096] = {0}; // Buffer to store long paths (GNU tar extension).
-            bool has_longpath = false; // Track if we have a pending long path.
+            char longlink[4096] = {0}; // Buffer to store long link names (GNU tar extension).
+            bool haslongpath = false; // Track if we have a pending long path.
+            bool haslonglink = false; // Track if we have a pending long link name.
 
             // As long as we feature the USTAR magic value, it's "theoretically" a valid file.
             while ((uintptr_t)current + sizeof(struct info) <= (loc + size) && !NLib::strncmp(current->magic, "ustar", 5)) {
-                char basename[256] = {0};
+                char basename[4096] = {0};
                 char *lname = current->linkname;
 
-                if (has_longpath) { // Use the long path previously stored.
+                if (haslongpath) { // Use the long path previously stored.
                     NLib::strncpy(basename, longpath, sizeof(basename) - 1);
-                    has_longpath = false;
+                    haslongpath = false;
                 } else { // Use the name field.
                     size_t namelen = 0;
                     while (namelen < sizeof(current->name) && current->name[namelen] != '\0') {
@@ -45,7 +47,9 @@ namespace NFS {
                 }
 
                 if (!NLib::strcmp(basename, "./")) {
-                    continue; // We should skip the "current directory".
+                    uint64_t skipsize = oct2int(current->size, sizeof(current->size));
+                    current = (struct info *)((uintptr_t)current + 512 + NLib::alignup(skipsize, 512));
+                    continue;
                 }
 
                 char name[8192];
@@ -104,12 +108,22 @@ namespace NFS {
                         ssize_t res = VFS::vfs->create(name, &node, attr);
                         assert(res == 0, "Failed to allocate VFS node.\n");
 
-                        size_t len = 0;
-                        while (len < sizeof(current->linkname) && lname[len] != '\0') {
-                            len++;
+                        // Use long link name if available, otherwise use linkname field.
+                        const char *linktarget;
+                        size_t len;
+                        if (haslonglink) {
+                            linktarget = longlink;
+                            len = NLib::strlen(longlink);
+                            haslonglink = false;
+                        } else {
+                            linktarget = lname;
+                            len = 0;
+                            while (len < sizeof(current->linkname) && lname[len] != '\0') {
+                                len++;
+                            }
                         }
 
-                        size_t count = node->write(lname, len + 1, 0, 0);
+                        size_t count = node->write(linktarget, len + 1, 0, 0);
                         assert(count == len + 1, "Failed to write link to VFS node.\n");
                         node->unref();
                         break;
@@ -126,7 +140,90 @@ namespace NFS {
                         // Copy the long path data into our buffer
                         NLib::memcpy(longpath, (void *)((uintptr_t)current + 512), fsize);
                         longpath[fsize] = '\0';
-                        has_longpath = true;
+                        haslongpath = true;
+                        break;
+                    }
+                    case type::LINK: {
+                        if ((uintptr_t)current + 512 + fsize > loc + size) {
+                            NUtil::printf("[fs/ustar]: Invalid long link size %lu exceeding archive bounds.\n", fsize);
+                            return -EINVAL;
+                        }
+                        if (fsize >= sizeof(longlink)) {
+                            NUtil::printf("[fs/ustar]: Long link too large (%lu >= %lu).\n", fsize, sizeof(longlink));
+                            return -E2BIG;
+                        }
+                        // Copy the long link data into our buffer
+                        NLib::memcpy(longlink, (void *)((uintptr_t)current + 512), fsize);
+                        longlink[fsize] = '\0';
+                        haslonglink = true;
+                        break;
+                    }
+
+                    default:
+                        NUtil::printf("[fs/ustar]: Unsupported file type `%c` for file `%s`, skipping.\n", current->type, name);
+                        break;
+                    case type::HARDLINK: {
+                        const char *linktarget;
+                        if (haslonglink) {
+                            linktarget = longlink;
+                            haslonglink = false;
+                        } else {
+                            // Copy linkname to a null-terminated buffer.
+                            static char linkbuf[101];
+                            size_t len = 0;
+                            while (len < sizeof(current->linkname) && lname[len] != '\0') {
+                                len++;
+                            }
+                            NLib::memcpy(linkbuf, lname, len);
+                            linkbuf[len] = '\0';
+                            linktarget = linkbuf;
+                        }
+
+                        // Build full path to the target.
+                        char targetpath[8192];
+                        NUtil::snprintf(targetpath, sizeof(targetpath), "%s/%s", path, linktarget);
+
+                        // Resolve the target node.
+                        VFS::INode *target = NULL;
+                        ssize_t res = VFS::vfs->resolve(targetpath, &target, NULL, false);
+                        if (res < 0 || target == NULL) {
+                            NUtil::printf("[fs/ustar]: Hard link target `%s` not found for `%s`.\n", targetpath, name);
+                            break;
+                        }
+
+                        // Get target's attributes and data.
+                        struct VFS::stat targetattr;
+                        target->stat(&targetattr);
+
+                        // Create a new node with the same attributes.
+                        struct VFS::stat attr;
+                        attr.st_mode = targetattr.st_mode;
+                        attr.st_uid = uid;
+                        attr.st_gid = gid;
+                        attr.st_mtime = mtime;
+                        attr.st_atime = mtime;
+                        attr.st_ctime = mtime;
+                        attr.st_blksize = targetattr.st_blksize;
+
+                        res = VFS::vfs->create(name, &node, attr);
+                        if (res != 0) {
+                            NUtil::printf("[fs/ustar]: Failed to create hard link `%s`.\n", name);
+                            target->unref();
+                            break;
+                        }
+
+                        // Copy data from target to new node.
+                        if (targetattr.st_size > 0) {
+                            uint8_t *buf = new uint8_t[targetattr.st_size];
+                            ssize_t readcount = target->read(buf, targetattr.st_size, 0, 0);
+                            if (readcount > 0) {
+                                node->write(buf, readcount, 0, 0);
+                            }
+                            delete[] buf;
+                        }
+
+                        target->unref();
+                        node->unref();
                         break;
                     }
                 }

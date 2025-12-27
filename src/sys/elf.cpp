@@ -1,5 +1,6 @@
 #include <lib/align.hpp>
 #include <sys/elf.hpp>
+#include <util/kprint.hpp>
 
 namespace NSys {
     namespace ELF {
@@ -27,10 +28,24 @@ namespace NSys {
                 return false;
             }
 
+            // Validate ELF type.
+            if (hdr->type != ET_EXECUTABLE && hdr->type != ET_DYNAMIC) {
+                return false;
+            }
+
+            // Validate program header table.
+            if (hdr->phcount == 0) {
+                return false; // Must have at least one program header.
+            }
+
+            if (hdr->phsize < sizeof(struct pheader)) {
+                return false; // Program header size too small.
+            }
+
             return true;
         }
 
-        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t execbase, uintptr_t lnbase, uintptr_t phdraddr) {
+        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t entry, uintptr_t lnbase, uintptr_t phdraddr) {
             size_t argc = 0;
             size_t argvsize = 0;
             size_t envc = 0;
@@ -46,14 +61,24 @@ namespace NSys {
                 }
             }
 
+            static uint64_t rngseed = 0x5deece66d;
+            uint64_t randdata[2];
+            rngseed = (rngseed * 0x5deece66dULL + 0xbULL) & ((1ULL << 48) - 1);
+            randdata[0] = rngseed ^ (uintptr_t)argv ^ (uintptr_t)envp;
+            rngseed = (rngseed * 0x5deece66dULL + 0xbULL) & ((1ULL << 48) - 1);
+            randdata[1] = rngseed ^ entry ^ phdraddr;
+
+            // XXX: Integrate with /dev/random entropy "pool" at some point.
+
             struct auxv auxv[] = {
                 { auxvtype::PHDR, phdraddr },
                 { auxvtype::PHENT, elfhdr->phsize },
                 { auxvtype::PHNUM, elfhdr->phcount },
                 { auxvtype::PAGESZ, NArch::PAGESIZE },
                 { auxvtype::BASE, lnbase },
+                { auxvtype::RAND, 0 }, // Placeholder, will be set to point to random data on stack.
                 { auxvtype::EXECFN, 0 }, // Placeholder, will set below.
-                { auxvtype::ENTRY, execbase + elfhdr->entryoff },
+                { auxvtype::ENTRY, entry },
                 { auxvtype::SECURE, 0 },
                 { 0, 0 } // NULL entry terminator - MUST BE LAST
             };
@@ -67,6 +92,7 @@ namespace NSys {
             totalsize += argvsize;
             totalsize += envpsize;
             totalsize += auxvsize;
+            totalsize += 16; // 16 bytes for AT_RANDOM data.
 
             totalsize = NLib::alignup(totalsize, 16); // 16-byte align.
 
@@ -86,6 +112,11 @@ namespace NSys {
             // Simply advance the stack pointer by the size of the auxiliary vector, we'll fill it in later.
             stackptr += auxvsize;
 
+            // Place random data on stack for AT_RANDOM.
+            uintptr_t randoff = stackptr;
+            NLib::memcpy((void *)randoff, randdata, 16);
+            stackptr += 16;
+
             for (size_t i = 0; i < argc; i++) {
                 size_t len = NLib::strlen(argv[i]) + 1;
                 NLib::memcpy((void *)stackptr, argv[i], len); // Copy argv element into stack.
@@ -95,8 +126,10 @@ namespace NSys {
             }
             ((uint64_t *)argvptrs)[argc] = NULL; // NULL terminator.
 
-            // Point EXECFN to argv[0] location.
-            auxv[5].value = ((uint64_t *)argvptrs)[0];
+            // Point AT_RAND to the random data on stack (virtual address).
+            auxv[5].value = virttop - (stacktop - randoff);
+            // Point AT_EXECFN to argv[0] location.
+            auxv[6].value = ((uint64_t *)argvptrs)[0];
 
             NLib::memcpy((void *)auxvoff, auxv, auxvsize); // Copy auxiliary vector.
 
@@ -132,6 +165,18 @@ namespace NSys {
 
             for (size_t i = 0; i < hdr->phcount; i++) {
                 if (phdrs[i].type == PH_INTERPRETER) {
+                    // Validate interpreter path size.
+                    if (phdrs[i].fsize == 0 || phdrs[i].fsize > 4096) {
+                        delete[] phdrs;
+                        return NULL; // Invalid interpreter path size.
+                    }
+
+                    // Check for overflow in offset + size.
+                    if (phdrs[i].doff > __UINT64_MAX__ - phdrs[i].fsize) {
+                        delete[] phdrs;
+                        return NULL;
+                    }
+
                     char *interp = new char[phdrs[i].fsize + 1];
                     if (!interp) {
                         delete[] phdrs;
@@ -145,6 +190,14 @@ namespace NSys {
                     }
 
                     interp[phdrs[i].fsize] = 0; // Null terminate.
+
+                    // Verify path is actually null-terminated within bounds (no embedded nulls before end).
+                    size_t pathlen = NLib::strlen(interp);
+                    if (pathlen == 0 || interp[0] != '/') {
+                        delete[] interp;
+                        delete[] phdrs;
+                        return NULL; // Invalid interpreter path (must be absolute).
+                    }
 
                     delete[] phdrs;
                     return interp;
@@ -180,25 +233,57 @@ namespace NSys {
             }
             size_t loadcount = 0;
 
+            const uintptr_t USERSPACE_LIMIT = 0x0000800000000000ULL;
+
             for (size_t i = 0; i < hdr->phcount; i++) {
                 if (!phdrs[i].type) {
                     continue;
                 }
 
                 if (phdrs[i].type == PH_LOAD) {
-                    size_t misalign = phdrs[i].vaddr % NArch::PAGESIZE;
+                    // Validate segment sizes.
+                    if (phdrs[i].fsize > phdrs[i].msize) {
+                        // File size cannot exceed memory size.
+                        goto fail;
+                    }
+
+                    // Check for zero-size segments (skip them).
+                    if (phdrs[i].msize == 0) {
+                        continue;
+                    }
+
+                    // Check for overflow in base + vaddr.
+                    if (phdrs[i].vaddr > USERSPACE_LIMIT - base) {
+                        goto fail;
+                    }
+
                     uintptr_t vaddr = base + phdrs[i].vaddr;
+
+                    // Check for overflow in vaddr + msize.
+                    if (phdrs[i].msize > USERSPACE_LIMIT - vaddr) {
+                        goto fail;
+                    }
+
+                    // Ensure segment is within user address space.
+                    if (vaddr + phdrs[i].msize > USERSPACE_LIMIT) {
+                        goto fail;
+                    }
+
+                    // Check for overflow in doff + fsize.
+                    if (phdrs[i].fsize > 0 && phdrs[i].doff > __UINT64_MAX__ - phdrs[i].fsize) {
+                        goto fail;
+                    }
+
+                    size_t misalign = phdrs[i].vaddr % NArch::PAGESIZE;
+
+                    // Check for overflow in msize + misalign.
+                    if (phdrs[i].msize > __SIZE_MAX__ - misalign) {
+                        goto fail;
+                    }
 
                     void *phys = NArch::PMM::alloc(NLib::alignup(phdrs[i].msize + misalign, NArch::PAGESIZE)); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
                     if (!phys) {
-                        // Failed. Free everything we've currently acquired.
-                        for (size_t j = 0; j < loadcount; j++) {
-                            NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
-                            NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
-                        }
-                        delete[] loaded;
-                        delete[] phdrs;
-                        return false;
+                        goto fail;
                     }
 
                     // Reserve region in VMA space.
@@ -216,32 +301,23 @@ namespace NSys {
                         (phdrs[i].flags & flag::ELF_WRITE ? NArch::VMM::WRITEABLE : 0),
                         phdrs[i].msize
                     )) {
-                        // Failed. Free everything we've currently acquired.
+                        // Failed to map. Free physical memory.
                         NArch::PMM::free(phys, phdrs[i].msize + misalign);
-                        for (size_t j = 0; j < loadcount; j++) {
-                            NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
-                            NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
-                        }
-                        delete[] loaded;
-                        delete[] phdrs;
-                        return false;
+                        goto fail;
                     }
 
-                    if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
-                        // Failed. Free everything we've currently acquired.
-                        NArch::VMM::unmaprange(space, vaddr, phdrs[i].msize); // Unmap range in space.
-                        NArch::PMM::free(phys, phdrs[i].msize + misalign);
-                        for (size_t j = 0; j < loadcount; j++) {
-                            NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
-                            NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
+                    // Read file data if there is any.
+                    if (phdrs[i].fsize > 0) {
+                        if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
+                            // Failed. Unmap and free.
+                            NArch::VMM::unmaprange(space, vaddr, phdrs[i].msize);
+                            NArch::PMM::free(phys, phdrs[i].msize + misalign);
+                            goto fail;
                         }
-                        delete[] loaded;
-                        delete[] phdrs;
-                        return false;
                     }
 
                     if (phdrs[i].msize > phdrs[i].fsize) {
-                        // Fill remaining region of allocation with zeroes.
+                        // Fill remaining region of allocation with zeroes (BSS).
                         NLib::memset((void *)((uintptr_t)NArch::hhdmoff(phys) + phdrs[i].fsize + misalign), 0, (phdrs[i].msize - phdrs[i].fsize));
                     }
 
@@ -258,10 +334,35 @@ namespace NSys {
                 }
             }
 
+            // Validate entry point is within user address space.
+            if (hdr->entryoff > USERSPACE_LIMIT - base) {
+                goto fail;
+            }
+
+            if (phdraddr && *phdraddr == 0) { // No PHDR? No Problem.
+                for (size_t i = 0; i < hdr->phcount; i++) {
+                    if (phdrs[i].type == PH_LOAD && hdr->phoff >= phdrs[i].doff && hdr->phoff < phdrs[i].doff + phdrs[i].fsize) {
+                        // Sort of unreliable way to determine PHDR location, but better than nothing.
+                        *phdraddr = base + phdrs[i].vaddr + (hdr->phoff - phdrs[i].doff);
+                        break;
+                    }
+                }
+            }
+
             *entry = (void *)(base + hdr->entryoff);
             delete[] loaded;
             delete[] phdrs;
             return true;
+
+        fail:
+            // Clean up all successfully loaded segments.
+            for (size_t j = 0; j < loadcount; j++) {
+                NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
+                NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
+            }
+            delete[] loaded;
+            delete[] phdrs;
+            return false;
         }
     }
 }

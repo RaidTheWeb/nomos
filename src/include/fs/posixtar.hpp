@@ -19,7 +19,8 @@ namespace NFS {
             BLKDEV          = '4',
             DIR             = '5',
             FIFO            = '6',
-            PATH            = 'L'
+            PATH            = 'L',
+            LINK            = 'K'  // GNU tar long link name.
         };
 
         // USTAR stores file information as ASCII strings, instead of properly encoded values.
@@ -56,7 +57,12 @@ namespace NFS {
         // Convert octal to binary integer.
         static inline uint64_t oct2int(const char *str, size_t len) {
             uint64_t val = 0;
-            while (*str && len > 0) {
+            // Skip leading spaces and zeros.
+            while (len > 0 && (*str == ' ' || *str == '0')) {
+                str++;
+                len--;
+            }
+            while (len > 0 && *str >= '0' && *str <= '7') {
                 val = val * 8 + (*str++ - '0');
                 len--;
             }

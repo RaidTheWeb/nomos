@@ -579,30 +579,103 @@ namespace NArch {
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
-            NLib::ScopeIRQSpinlock guard(&space->lock);
-
             uint64_t vmaflags = prottovma(prot);
             if (flags & MAP_SHARED) {
                 vmaflags |= NMem::Virt::VIRT_SHARED; // Map as shared, it won't be copy-on-write (changes visible to all processes sharing the mapping).
             }
+
+            NFS::VFS::FileDescriptor *filedesc = NULL;
+            NFS::VFS::INode *node = NULL;
+            int fdflags = 0;
+            struct NFS::VFS::stat nodeattr = {};
+            bool isfilebacked = !(flags & MAP_ANONYMOUS);
+
+            if (isfilebacked) {
+                if (fd < 0) {
+                    SYSCALL_RET(-EBADF);
+                }
+
+                filedesc = proc->fdtable->get(fd);
+                if (!filedesc) {
+                    SYSCALL_RET(-EBADF);
+                }
+
+                node = filedesc->getnode();
+                if (!node) {
+                    filedesc->unref();
+                    SYSCALL_RET(-EBADF);
+                }
+
+                fdflags = filedesc->getflags();
+                nodeattr = node->getattr();
+
+                // File not opened with read access?
+                if (!((fdflags & NFS::VFS::O_ACCMODE) == NFS::VFS::O_RDWR || (fdflags & NFS::VFS::O_ACCMODE) == NFS::VFS::O_RDONLY)) {
+                    node->unref();
+                    filedesc->unref();
+                    SYSCALL_RET(-EACCES);
+                }
+
+                if ((fdflags & NFS::VFS::O_APPEND) && (prot & PROT_WRITE)) {
+                    // Can't map with write access if opened in append mode.
+                    node->unref();
+                    filedesc->unref();
+                    SYSCALL_RET(-EACCES);
+                }
+
+                if (NFS::VFS::S_ISDIR(nodeattr.st_mode)) {
+                    // Can't map a directory.
+                    node->unref();
+                    filedesc->unref();
+                    SYSCALL_RET(-EISDIR);
+                }
+
+                if (off < 0 || (size_t)off + size > nodeattr.st_size) {
+                    // Mapping beyond end of file.
+                    node->unref();
+                    filedesc->unref();
+                    SYSCALL_RET(-EINVAL);
+                }
+            }
+
+            // Now acquire the address space lock for the actual memory operations.
+            NLib::ScopeIRQSpinlock guard(&space->lock);
 
             void *addr = NULL;
 
             if (flags & MAP_FIXED) {
                 if ((uintptr_t)hint % PAGESIZE != 0) {
                     // Misaligned hint address.
+                    if (node) {
+                        node->unref();
+                    }
+                    if (filedesc) {
+                        filedesc->unref();
+                    }
                     SYSCALL_RET(-EINVAL);
                 }
                 space->vmaspace->free(hint, size); // Free any existing mappings in the range.
                 addr = space->vmaspace->reserve((uintptr_t)hint, (uintptr_t)hint + size, vmaflags);
                 if (!addr) {
                     // Failed to reserve at fixed address.
+                    if (node) {
+                        node->unref();
+                    }
+                    if (filedesc) {
+                        filedesc->unref();
+                    }
                     SYSCALL_RET(-ENOMEM);
                 }
             } else {
                 // Allocate anywhere, it really doesn't matter.
                 addr = space->vmaspace->alloc(size, vmaflags);
                 if (!addr) {
+                    if (node) {
+                        node->unref();
+                    }
+                    if (filedesc) {
+                        filedesc->unref();
+                    }
                     SYSCALL_RET(-ENOMEM);
                 }
             }
@@ -640,61 +713,10 @@ namespace NArch {
                     }
                 }
             } else { // File-backed mapping.
-                if (fd < 0) {
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EBADF);
-                }
-
-                // We're going to need to get the file descriptor from the process's file descriptor table.
-                NFS::VFS::FileDescriptor *filedesc = proc->fdtable->get(fd);
-                if (!filedesc) {
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EBADF);
-                }
-
-                NFS::VFS::INode *node = filedesc->getnode();
-                if (!node) {
-                    filedesc->unref();
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EBADF);
-                }
-
-                // File not opened with read access?
-                if (!((filedesc->getflags() & NFS::VFS::O_ACCMODE) == NFS::VFS::O_RDWR || (filedesc->getflags() & NFS::VFS::O_ACCMODE) == NFS::VFS::O_RDONLY)) {
-                    node->unref();
-                    filedesc->unref();
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EACCES);
-                }
-
-                if ((filedesc->getflags() & NFS::VFS::O_APPEND) && (prot & PROT_WRITE)) {
-                    // Can't map with write access if opened in append mode.
-                    node->unref();
-                    filedesc->unref();
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EACCES);
-                }
-
-                if (NFS::VFS::S_ISDIR(node->getattr().st_mode)) {
-                    // Can't map a directory.
-                    node->unref();
-                    filedesc->unref();
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EISDIR);
-                }
-
-                if (off < 0 || (size_t)off + size > node->getattr().st_size) {
-                    // Mapping beyond end of file.
-                    node->unref();
-                    filedesc->unref();
-                    space->vmaspace->free(addr, size);
-                    SYSCALL_RET(-EINVAL);
-                }
-
                 // Demand paging:
-                bool demandback = NFS::VFS::S_ISBLK(node->getattr().st_mode) || NFS::VFS::S_ISREG(node->getattr().st_mode);
+                bool demandback = NFS::VFS::S_ISBLK(nodeattr.st_mode) || NFS::VFS::S_ISREG(nodeattr.st_mode);
                 // Character devices are demand paged unless MAP_SHARED is specified (in which case, they're DMA).
-                demandback = demandback || (NFS::VFS::S_ISCHR(node->getattr().st_mode) && !(flags & MAP_SHARED));
+                demandback = demandback || (NFS::VFS::S_ISCHR(nodeattr.st_mode) && !(flags & MAP_SHARED));
 
                 if (demandback) { // We can map regular files and block devices.
                     // Allocate file-backed VMA with demand paging.
@@ -712,7 +734,7 @@ namespace NArch {
                         vma->fileoffset = off;
                         node->ref(); // Keep a reference to the file.
                     }
-                } else if (NFS::VFS::S_ISCHR(node->getattr().st_mode)) {
+                } else if (NFS::VFS::S_ISCHR(nodeattr.st_mode)) {
                     // Character devices fall through to implementation-specific mapping.
 
                     NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)addr);
@@ -727,7 +749,7 @@ namespace NArch {
                         SYSCALL_RET(-EINVAL);
                     }
 
-                    int ret = node->mmap(addr, size, off, vmaflags, filedesc->getflags());
+                    int ret = node->mmap(addr, size, off, vmaflags, fdflags);
                     if (ret < 0) {
                         node->unref();
                         filedesc->unref();

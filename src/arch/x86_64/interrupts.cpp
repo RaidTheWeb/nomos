@@ -240,6 +240,8 @@ namespace NArch {
                     NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
                     return;
                 }
+
+                space->lock.release();
 pffault:
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", NArch::CPU::get()->currthread->process->id);
                 sig = SIGSEGV;
@@ -273,6 +275,7 @@ pffault:
 
             // If this is a userspace exception and we have a signal, send it instead of panicking.
             if (isuserspace && sig > 0) {
+                NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Exception: %s\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, errbuffer);
                 NSched::signalproc(NArch::CPU::get()->currthread->process, sig);
                 return;
             }

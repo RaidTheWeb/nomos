@@ -9,6 +9,7 @@
 #endif
 #include <fs/vfs.hpp>
 #include <sched/jobctrl.hpp>
+#include <sched/rbtree.hpp>
 #include <sched/signal.hpp>
 #include <util/kmarker.hpp>
 #include <stddef.h>
@@ -31,122 +32,6 @@ namespace NSched {
     static const uint64_t LOADTHRESHOLD = 2; // Don't attempt load balancing if we exceed this threshold.
     static const uint64_t QUANTUMMS = 10; // 10ms scheduler quantum.
 
-
-    // Red-Black tree for fair task queue.
-    class RBTree {
-        private:
-            enum colour {
-                RED,
-                BLACK
-            };
-
-        public:
-            struct node {
-                uintptr_t parent = 0; // Parent + Colour.
-                struct node *left = NULL;
-                struct node *right = NULL;
-                uint8_t pad[64 - (sizeof(uintptr_t) + (sizeof(struct node *) * 2))]; // Cache alignment. We *could* have used __attribute__((aligned(64))) here, but then aligned new would have to be implemented.
-
-                struct node *getparent(void) {
-                    return (struct node *)(this->parent & ~0b11); // Colour is stored within lower bit, we use this to extract only the parent from the node property.
-                }
-
-                enum colour getcolour(void) {
-                    return (enum colour)(this->parent & 0b01); // Extract colour from last bit.
-                }
-
-                // Pack parent of node, given the parent. Uses original colour.
-                void packparent(struct node *parent) {
-                    this->parent = (uintptr_t)parent | this->getcolour();
-                }
-
-                // Pack colour of node, given the colour. Uses original parent.
-                void packcolour(enum colour colour) {
-                    this->parent = (uintptr_t)this->getparent() | colour;
-                }
-            };
-
-            template <typename T>
-            static T *getentry(struct node *node) {
-                return reinterpret_cast<T *>(
-                    reinterpret_cast<uint8_t *>(node) - offsetof(T, node)
-                );
-            }
-
-            NArch::IRQSpinlock lock;
-        private:
-
-            size_t nodecount = 0;
-            struct node *root = NULL; // Tree root.
-
-            void rebalance(struct node *node);
-            void reerase(struct node *child, struct node *parent);
-
-            void rotateleft(struct node *node);
-            void rotateright(struct node *node);
-            void transplant(struct node *u, struct node *v);
-        public:
-            RBTree(void) { };
-
-            // Insert into Red-Black tree using cmp to compare left child against right child, for traversal (Unlocked).
-            void _insert(struct node *node, int (*cmp)(struct node *, struct node *));
-
-            // Remove a node (Unlocked).
-            void _erase(struct node *node);
-
-            // Get first node (Unlocked).
-            struct node *_first(void);
-
-            // Get next node (Unlocked).
-            struct node *_next(struct node *node);
-
-            // Get previous node (Unlocked).
-            struct node *_prev(struct node *node);
-
-            // Get last node (Unlocked).
-            struct node *_last(void);
-
-            struct node *_sibling(struct node *node);
-
-            // Insert into Red-Black tree using cmp to compare left child against right child, for traversal.
-            void insert(struct node *node, int (*cmp)(struct node *, struct node *)) {
-                NLib::ScopeIRQSpinlock guard(&this->lock);
-                this->_insert(node, cmp);
-            }
-
-            // Remove a node.
-            void erase(struct node *node) {
-                NLib::ScopeIRQSpinlock guard(&this->lock);
-                this->_erase(node);
-            }
-
-            // Get first node.
-            struct node *first(void) {
-                NLib::ScopeIRQSpinlock guard(&this->lock);
-                return this->_first();
-            }
-
-            // Get last node.
-            struct node *last(void) {
-                NLib::ScopeIRQSpinlock guard(&this->lock);
-                return this->_last();
-            }
-
-            // Get next node.
-            struct node *next(struct node *node) {
-                NLib::ScopeIRQSpinlock guard(&this->lock);
-                return this->_next(node);
-            }
-
-            struct node *prev(struct node *node) {
-                NLib::ScopeIRQSpinlock guard(&this->lock);
-                return this->_prev(node);
-            }
-
-            // Count the number of nodes within the Red-Black tree.
-            size_t count(void);
-    };
-
     class Thread;
 
     enum stdfds {
@@ -163,31 +48,36 @@ namespace NSched {
         public:
 
             NArch::IRQSpinlock waitinglock;
-            // Dump current thread into waiting queue, to be woken up upon wake(), if it's its turn. Takes an optional parameter specifying whether the wait queue lock is already held.
+
+            void preparewait(void);
+            bool preparewaitinterruptible(void);
+
+
+            void finishwait(void);
+            int finishwaitinterruptible(void);
+
+            // Non-interruptible wait. If locked=true, waitinglock is already held.
             void wait(bool locked = false);
-            // Atomic wait on condition with external IRQSpinlock held.
+            // Non-interruptible wait with external lock held.
             void waitlocked(NArch::IRQSpinlock *lock);
-            // Atomic wait on condition with external Spinlock held.
             void waitlocked(NArch::Spinlock *lock);
-            // Atomic wait on condition with external Mutex held.
             void waitlocked(NSched::Mutex *lock);
 
-            // Interruptible wait that returns -EINTR if a signal is pending. Takes an optional parameter specifying whether the wait queue lock is already held.
+            // Interruptible wait. If locked=true, waitinglock is already held.
             int waitinterruptible(bool locked = false);
-            // Atomic interruptible wait on condition with external IRQSpinlock held. Returns -EINTR if interrupted.
+            // Interruptible wait with external lock held.
             int waitinterruptiblelocked(NArch::IRQSpinlock *lock);
-            // Atomic interruptible wait on condition with external Spinlock held. Returns -EINTR if interrupted.
             int waitinterruptiblelocked(NArch::Spinlock *lock);
-            // Atomic interruptible wait on condition with external Mutex held. Returns -EINTR if interrupted.
             int waitinterruptiblelocked(NSched::Mutex *lock);
 
-            // Wake up sleeping threads in the wait queue, so they'll check if they can run again.
+            // Wake up all threads waiting on this queue.
             void wake(void);
 
-            // Wake up a single sleeping thread in the wait queue.
+            // Wake up a single thread waiting on this queue.
             void wakeone(void);
 
             // Dequeue a specific thread from the waitqueue (used by signal delivery).
+            // Returns true if the thread was found and removed.
             bool dequeue(Thread *thread);
     };
 

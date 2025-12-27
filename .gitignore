@@ -13,3 +13,6 @@ src/include/limine.h
 # Editor Artifacts
 .github/
 .vscode/
+
+# OS Artifacts
+**.bak

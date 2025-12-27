@@ -23,7 +23,10 @@ namespace NArch {
         class PageMeta {
             public:
                 enum flags {
-                    PAGEMETA_DEVICEMAP  = (1 << 0)       // Page is used for memory-mapped device (no free, allocating context is expected to clean this up).
+                    PAGEMETA_DEVICEMAP  = (1 << 0),      // Page is used for memory-mapped device (no free, allocating context is expected to clean this up).
+                    PAGEMETA_PAGECACHE  = (1 << 1),      // Page is managed by the page cache.
+                    PAGEMETA_ANONYMOUS  = (1 << 2),      // Anonymous page (not backed by file, for future swap support).
+                    PAGEMETA_SLAB       = (1 << 3)       // Page is part of slab allocator.
                 };
 
                 NArch::IRQSpinlock pagelock; // Lock for this page's metadata.
@@ -31,12 +34,16 @@ namespace NArch {
                 uint8_t flags = 0;
                 uintptr_t addr = 0; // Physical address of this page.
 
+                // Page cache linkage (valid when PAGEMETA_PAGECACHE is set).
+                void *cacheentry = NULL;
+
                 void ref(void);
                 void unref(void);
                 void zeroref(void) {
                     NLib::ScopeIRQSpinlock guard(&this->pagelock);
                     this->flags = 0;
                     this->refcount = 0;
+                    this->cacheentry = NULL;
                 }
         };
 

@@ -1,6 +1,7 @@
 #ifdef __x86_64__
 #include <arch/x86_64/io.hpp>
 #include <arch/x86_64/panic.hpp>
+#include <arch/x86_64/stacktrace.hpp>
 #endif
 #include <debug/ubsan.hpp>
 #include <util/kprint.hpp>
@@ -29,6 +30,7 @@ namespace NDebug {
 
         void handleviolation(const char *violation, struct sourceloc *loc) {
             char errbuffer[2048];
+            NArch::printstacktrace();
             NUtil::snprintf(errbuffer, sizeof(errbuffer), "UBSan violation (%s) at %s:%d failed:\n", violation, loc->file, loc->line);
             NArch::panic(errbuffer);
         }

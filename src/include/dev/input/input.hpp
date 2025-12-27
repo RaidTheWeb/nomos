@@ -187,7 +187,7 @@ namespace NDev {
             // Called by input system on connection of a new device with even a partial match of subscribed input events. The supported events are passed in through the argument.
             bool (*connect)(Device *dev, uint64_t supported);
             bool (*disconnect)(void);
-            void (*event)(uint16_t type, uint16_t code, int32_t value);
+            void (*event)(uint64_t tmstmp, uint16_t type, uint16_t code, int32_t value);
         };
 
         extern NLib::DoubleList<Device *> devices;

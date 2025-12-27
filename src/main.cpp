@@ -22,6 +22,7 @@
 #include <lib/assert.hpp>
 #include <lib/bitmap.hpp>
 #include <lib/cmdline.hpp>
+#include <mm/pagecache.hpp>
 #include <mm/slab.hpp>
 #include <mm/vmalloc.hpp>
 #include <util/kprint.hpp>
@@ -95,6 +96,8 @@ void kpostarch(void) {
 
     NDev::setup(); // Initialise device registry.
 
+    NMem::initpagecache(); // Initialise global page cache.
+
     NFS::VFS::vfs->mount(NULL, "/dev", "devfs", 0, NULL); // Mount devfs at /dev.
 
 
@@ -135,6 +138,7 @@ void kpostarch(void) {
 
     // PROCESS
     NSched::Process *proc = new NSched::Process(uspace);
+    proc->cwd = NFS::VFS::vfs->getroot(); // Set initial CWD to root.
 
     NSched::pidtable->insert(proc->id, proc); // PID 1
 
@@ -170,7 +174,7 @@ void kpostarch(void) {
 
     // We pass in the hhdm-offset physical stack top. The user will be given the mapped version.
     //void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
-    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), argv, NULL, &elfhdr, ustacktop, 0, 0, phdr);
+    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), argv, NULL, &elfhdr, ustacktop, (uintptr_t)ent, 0, phdr);
     assert(rsp, "Stack alignment failed.\n");
 
     // Reserve stack location. We don't want to end up allocating into the stack region on requests for virtual memory.

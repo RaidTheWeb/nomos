@@ -241,7 +241,7 @@ namespace NDev {
         }
 
         const size_t entries_per_page = PAGESIZE / sizeof(uint64_t);
-        size_t numlistpages = (numpages - 2 + entries_per_page - 1) / entries_per_page;
+        size_t numlistpages = (numpages - 1 + entries_per_page - 1) / entries_per_page;
 
         uintptr_t listsphys = (uintptr_t)NArch::PMM::alloc(numlistpages * PAGESIZE);
         if (!listsphys) {
@@ -255,7 +255,7 @@ namespace NDev {
         size_t currentidx = 0;
         struct nvmeprplist *curr = base; // Virtual pointer to current list page.
 
-        for (size_t i = 2; i < numpages; i++) {
+        for (size_t i = 1; i < numpages; i++) {
             uintptr_t virt = firstpage + (i * PAGESIZE);
             uintptr_t phys = NArch::VMM::virt2phys(&NArch::VMM::kspace, virt);
 
@@ -269,6 +269,27 @@ namespace NDev {
         }
 
         return listsphys;
+    }
+
+    static void freeprplist(uintptr_t listphys, void *buffer, size_t size) {
+        if (!listphys) {
+            return; // No list to free.
+        }
+
+        uintptr_t start = (uintptr_t)buffer;
+        uintptr_t end = start + size;
+        uintptr_t firstpage = NLib::aligndown(start, PAGESIZE);
+        uintptr_t lastpage = NLib::alignup(end, PAGESIZE);
+
+        size_t numpages = (lastpage - firstpage) / PAGESIZE;
+        if (numpages <= 2) {
+            return; // No PRP list was actually needed.
+        }
+
+        const size_t entries_per_page = PAGESIZE / sizeof(uint64_t);
+        size_t numlistpages = (numpages - 1 + entries_per_page - 1) / entries_per_page;
+
+        NArch::PMM::free((void *)listphys, numlistpages * PAGESIZE);
     }
 
     // Prepare PRPs for a command.
@@ -286,7 +307,9 @@ namespace NDev {
             cmd->prp2 = 0;
         } else if (size <= (2 * PAGESIZE)) { // Fits within two PRPs.
             cmd->prp1 = bufferphys;
-            cmd->prp2 = bufferphys + PAGESIZE;
+            // PRP2 must point to the physical address of the second page, properly aligned.
+            uintptr_t secondpagevirt = NLib::aligndown((uintptr_t)buffer, PAGESIZE) + PAGESIZE;
+            cmd->prp2 = NArch::VMM::virt2phys(&NArch::VMM::kspace, secondpagevirt);
         } else { // Needs a PRP list.
             cmd->prp1 = bufferphys; // First PRP is direct.
 
@@ -302,22 +325,34 @@ namespace NDev {
     }
 
     // Prepare a pending operation slot.
-    static int preparewait(struct nvmectrl *ctrl, uint16_t qid, uint16_t cid, struct nvmepending **outpending) {
-        size_t idx = qid * QUEUESIZE + (cid % QUEUESIZE);
-        struct nvmepending *pending = &ctrl->pending[idx];
+    static int preparewait(struct nvmectrl *ctrl, uint16_t qid, uint16_t *outcid, struct nvmepending **outpending) {
+        size_t baseidx = qid * QUEUESIZE;
 
-        bool expected = false;
-        bool desired = true;
-        if (!__atomic_compare_exchange_n(&pending->inuse, &expected, desired, false, memory_order_acq_rel, memory_order_acquire)) {
-            return -1; // Slot is already in use.
+        static uint16_t hint = 0; // Use a hint instead of always beginning search to reduce contention.
+        uint16_t start = __atomic_load_n(&hint, memory_order_relaxed) % QUEUESIZE;
+
+        for (uint16_t i = 0; i < QUEUESIZE; i++) {
+            uint16_t slot = (start + i) % QUEUESIZE;
+            struct nvmepending *pending = &ctrl->pending[baseidx + slot];
+
+            bool expected = false;
+            bool desired = true;
+            if (__atomic_compare_exchange_n(&pending->inuse, &expected, desired, false, memory_order_acq_rel, memory_order_acquire)) {
+                // Successfully claimed this slot.
+                __atomic_store_n(&pending->done, false, memory_order_relaxed);
+                __atomic_thread_fence(memory_order_release);
+                pending->status = 0;
+
+                // Update hint for next allocation.
+                __atomic_store_n(&hint, (slot + 1) % QUEUESIZE, memory_order_relaxed);
+
+                *outcid = slot; // CID matches the slot index within the queue.
+                *outpending = pending;
+                return 0;
+            }
         }
 
-        __atomic_store_n(&pending->done, false, memory_order_relaxed);
-        __atomic_thread_fence(memory_order_release);
-        pending->status = 0;
-
-        *outpending = pending;
-        return 0;
+        return -1; // No slots available.
     }
 
     // Sleep calling thread until command is complete (used for I/O commands).
@@ -328,25 +363,48 @@ namespace NDev {
         return status ? -1 : 0; // Non-zero status indicates error.
     }
 
+    static constexpr int MAXQUEUEFULLRETRIES = 3;
+    static constexpr int QUEUEFULLSPINDELAY = 100;
+    static constexpr int MAXPENDINGRETRIES = 10;
+    static constexpr int PENDINGSPINDELAY = 50;
+
     int NVMEDriver::iorequest(struct nvmectrl *ctrl, uint16_t id, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size) {
         struct nvmequeue *sq = &ctrl->iosq[id];
+        int queuefullretries = 0;
+        int pendingretries = 0;
 
+retry_submit:
         sq->qlock.acquire(); // Lock the submission queue. This only needs to be done for the scope of submission queue manipulation.
 
-        uint16_t cid = sq->nextcid++;
-
+        uint16_t cid;
         struct nvmepending *pending;
-        if (preparewait(ctrl, id, cid, &pending) != 0) {
+        if (preparewait(ctrl, id, &cid, &pending) != 0) {
             sq->qlock.release();
+            if (pendingretries < MAXPENDINGRETRIES) {
+                pendingretries++;
+                // Yield to allow completion handlers to run.
+                NSched::yield();
+                goto retry_submit;
+            }
+            NUtil::printf("[dev/nvme]: No pending slots available after %d retries.\n", MAXPENDINGRETRIES);
             return -1;
         }
 
         uint32_t tail = sq->tail;
         uint32_t nexttail = (tail + 1) % sq->size;
 
-        // Simple full-queue check
+        // Queue full check with retry
         if (nexttail == sq->head) {
+            __atomic_store_n(&pending->inuse, false, memory_order_release); // Release the pending slot.
             sq->qlock.release();
+            if (queuefullretries < MAXQUEUEFULLRETRIES) {
+                queuefullretries++;
+                // Brief spin delay to let in-flight commands complete.
+                for (volatile int i = 0; i < QUEUEFULLSPINDELAY; i++) {
+                    asm volatile("pause");
+                }
+                goto retry_submit;
+            }
             return -1; // queue full
         }
 
@@ -365,9 +423,12 @@ namespace NDev {
         next->cdw12 |= (0 << 14) | (0 << 15); // FUA and limited retry.
 
         if (setupprps(next, buffer, size) != 0) {
+            __atomic_store_n(&pending->inuse, false, memory_order_release); // Release the pending slot.
             sq->qlock.release();
             return -1;
         }
+
+        uintptr_t prplistaddr = (size > 2 * PAGESIZE) ? next->prp2 : 0;
 
     #ifdef __x86_64__
         asm volatile ("sfence" : : : "memory");
@@ -378,7 +439,13 @@ namespace NDev {
         sq->qlock.release();
 
         // Wait for completion on CQ (extracted to helper for IRQ transition)
-        if (waitio(pending) != 0) {
+        int ioresult = waitio(pending);
+
+        if (prplistaddr) { // Clean up PRP list if we allocated one.
+            freeprplist(prplistaddr, buffer, size);
+        }
+
+        if (ioresult != 0) {
             return -1;
         }
 
@@ -404,8 +471,9 @@ namespace NDev {
                         }
 
                         // Ensure we see the other fields after seeing the phase bit
-                        asm volatile ("" : : : "memory");
+                        __atomic_thread_fence(memory_order_acquire);
 
+                        ctrl->iosq[ns->nsnum + 1].head = cqe->sqhead;
 
                         // Signal waiting thread that this command is complete.
                         uint16_t cid = cqe->cid;

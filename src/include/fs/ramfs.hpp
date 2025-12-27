@@ -71,6 +71,7 @@ namespace NFS {
 
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
                 int unlink(VFS::INode *node, VFS::INode *parent) override;
+                int rename(VFS::INode *oldparent, VFS::INode *node, VFS::INode *newparent, const char *newname, VFS::INode *target) override;
         };
     }
 }

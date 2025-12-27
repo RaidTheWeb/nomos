@@ -1,5 +1,6 @@
 #include <dev/input/input.hpp>
 #include <lib/errno.hpp>
+#include <sys/clock.hpp>
 
 namespace NDev {
     namespace Input {
@@ -41,7 +42,7 @@ namespace NDev {
             NLib::DoubleList<struct eventhandler *>::Iterator it = this->handlers.begin();
 
             while (it.valid()) {
-                (*it.get())->event(ev.type, ev.code, ev.value);
+                (*it.get())->event(ev.tmstmp, ev.type, ev.code, ev.value);
                 it.next();
             }
 
@@ -56,9 +57,13 @@ namespace NDev {
                 return;
             }
 
+            struct NSys::Clock::timespec ts;
+            NSys::Clock::Clock *clk = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+            clk->gettime(&ts);
+
             if (disposition == event::disposition::DIRECT) {
                 struct event ev {
-                    .tmstmp = 0,
+                    .tmstmp = ts.tv_sec * 1000000000ull + ts.tv_nsec,
                     .type = type,
                     .code = code,
                     .value = value
@@ -66,7 +71,7 @@ namespace NDev {
                 this->sendtohandler(ev);
             } else if (disposition == event::disposition::BUFFER) {
                 struct event ev {
-                    .tmstmp = 0, // XXX: Timestamps.
+                    .tmstmp = ts.tv_sec * 1000000000ull + ts.tv_nsec,
                     .type = type,
                     .code = code,
                     .value = value

@@ -846,6 +846,7 @@ namespace NLib {
                     struct node *next = node->next;
                     if (callback(node->data, udata)) {
                         this->unlink(node); // Remove specific node.
+                        delete node; // Free the unlinked node to prevent memory leak.
                         return true;
                     }
                     node = next;

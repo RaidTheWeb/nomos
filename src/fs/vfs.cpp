@@ -4,6 +4,7 @@
 #include <fs/pipefs.hpp>
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
+#include <mm/pagecache.hpp>
 #include <mm/ucopy.hpp>
 #include <sys/clock.hpp>
 #include <sys/syscall.hpp>
@@ -12,7 +13,326 @@ namespace NFS {
     namespace VFS {
         VFS *vfs = NULL;
 
+        NMem::RadixTree *INode::getpagecache(void) {
+            NLib::ScopeSpinlock guard(&this->metalock);
+            if (!this->pagecache) {
+                this->pagecache = new NMem::RadixTree();
+            }
+            return this->pagecache;
+        }
+
+        NMem::CachePage *INode::findcachedpage(off_t offset) {
+            NMem::RadixTree *cache = this->getpagecache();
+            if (!cache) {
+                return NULL;
+            }
+
+            off_t index = offset / NArch::PAGESIZE;
+            NMem::CachePage *page = cache->lookup(index);
+            if (page) {
+                page->pagelock();
+            }
+            return page;
+        }
+
+        NMem::CachePage *INode::getorcacheepage(off_t offset) {
+            NMem::RadixTree *cache = this->getpagecache();
+            if (!cache) {
+                return NULL;
+            }
+
+            off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
+            off_t index = pageoffset / NArch::PAGESIZE;
+
+            // Check if page already exists.
+            NMem::CachePage *page = cache->lookup(index);
+            if (page) {
+                page->pagelock();
+                return page;
+            }
+
+            // Allocate new page.
+            page = new NMem::CachePage();
+            if (!page) {
+                return NULL;
+            }
+
+            // Allocate physical page.
+            void *phys = NArch::PMM::alloc(NArch::PAGESIZE);
+            if (!phys) {
+                delete page;
+                return NULL;
+            }
+
+            page->physaddr = (uintptr_t)phys;
+            page->pagemeta = NArch::PMM::phystometa((uintptr_t)phys);
+            if (page->pagemeta) {
+                page->pagemeta->flags |= NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                page->pagemeta->cacheentry = page;
+                page->pagemeta->ref();
+            }
+
+            page->inode = this;
+            page->offset = pageoffset;
+            page->flags = 0;
+
+            // Try to insert into radix tree.
+            int err = cache->insert(index, page);
+            if (err == -EEXIST) {
+                if (page->pagemeta) {
+                    page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                    page->pagemeta->cacheentry = NULL;
+                    page->pagemeta->unref();
+                }
+                NArch::PMM::free(phys, NArch::PAGESIZE);
+                delete page;
+
+                page = cache->lookup(index);
+                if (page) {
+                    page->pagelock();
+                }
+                return page;
+            } else if (err < 0) {
+                // Allocation failure in radix tree.
+                if (page->pagemeta) {
+                    page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                    page->pagemeta->cacheentry = NULL;
+                    page->pagemeta->unref();
+                }
+                NArch::PMM::free(phys, NArch::PAGESIZE);
+                delete page;
+                return NULL;
+            }
+
+            // Add to global page cache LRU.
+            if (NMem::pagecache) {
+                NMem::pagecache->addpage(page);
+            }
+
+            page->pagelock();
+            return page;
+        }
+
+        void INode::invalidatecache(void) {
+            NMem::RadixTree *cache = this->pagecache;
+            if (!cache) {
+                return;
+            }
+
+            // Iterate and remove all pages associated with this INode.
+            cache->foreach([](NMem::CachePage *page, void *ctx) -> bool {
+                (void)ctx;
+                page->pagelock();
+
+                // Remove from global cache.
+                if (NMem::pagecache) {
+                    NMem::pagecache->removepage(page);
+                }
+
+                // Free physical page.
+                if (page->pagemeta) {
+                    page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                    page->pagemeta->cacheentry = NULL;
+                    page->pagemeta->unref();
+                }
+                if (page->physaddr) {
+                    NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+                }
+
+                page->pageunlock();
+                delete page;
+                return true;
+            }, NULL);
+
+            delete cache;
+            this->pagecache = NULL;
+        }
+
+        int INode::synccache(void) {
+            NMem::RadixTree *cache = this->pagecache;
+            if (!cache) {
+                return 0;
+            }
+
+            int errors = 0;
+            cache->foreach([](NMem::CachePage *page, void *ctx) -> bool {
+                int *errp = (int *)ctx;
+                if (page->testflag(NMem::PAGE_DIRTY)) {
+                    if (page->trypagelock()) {
+                        INode *inode = (INode *)page->inode;
+                        int err = inode->writepage(page); // Write back the page.
+                        page->pageunlock();
+                        if (err < 0) {
+                            (*errp)++;
+                        }
+                    }
+                }
+                return true;
+            }, &errors);
+
+            return errors;
+        }
+
+        ssize_t INode::readcached(void *buf, size_t count, off_t offset) {
+            if (!buf || count == 0) {
+                return -EINVAL;
+            }
+
+            // Check file size and adjust count to not read past EOF.
+            uint64_t filesize;
+            {
+                NLib::ScopeSpinlock guard(&this->metalock);
+                filesize = this->attr.st_size;
+            }
+
+            if ((uint64_t)offset >= filesize) {
+                return 0; // EOF - nothing to read.
+            }
+
+            if ((uint64_t)(offset + count) > filesize) {
+                count = filesize - offset; // Clamp to remaining bytes.
+            }
+
+            ssize_t totalread = 0;
+            uint8_t *dest = (uint8_t *)buf;
+
+            while (count > 0) {
+                off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
+                size_t offwithinpage = offset % NArch::PAGESIZE;
+                size_t toread = NArch::PAGESIZE - offwithinpage;
+                if (toread > count) {
+                    toread = count;
+                }
+
+                // Get or create page.
+                NMem::CachePage *page = this->getorcacheepage(offset);
+                if (!page) {
+                    if (totalread > 0) {
+                        return totalread;
+                    }
+                    return -ENOMEM;
+                }
+
+                // If page not up to date, fill it.
+                if (!page->testflag(NMem::PAGE_UPTODATE)) {
+                    int err = this->readpage(page);
+                    if (err < 0) {
+                        page->pageunlock();
+                        if (totalread > 0) {
+                            return totalread;
+                        }
+                        return err;
+                    }
+                }
+
+                // Copy data to user buffer.
+                NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
+
+                page->setflag(NMem::PAGE_REFERENCED);
+                page->pageunlock();
+
+                dest += toread;
+                offset += toread;
+                count -= toread;
+                totalread += toread;
+            }
+
+            return totalread;
+        }
+
+        ssize_t INode::writecached(const void *buf, size_t count, off_t offset) {
+            if (!buf || count == 0) {
+                return -EINVAL;
+            }
+
+            ssize_t totalwritten = 0;
+            const uint8_t *src = (const uint8_t *)buf;
+
+            while (count > 0) {
+                off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
+                size_t offwithinpage = offset % NArch::PAGESIZE;
+                size_t towrite = NArch::PAGESIZE - offwithinpage;
+                if (towrite > count) {
+                    towrite = count;
+                }
+
+                // Get or create page.
+                NMem::CachePage *page = this->getorcacheepage(offset);
+                if (!page) {
+                    if (totalwritten > 0) {
+                        return totalwritten;
+                    }
+                    return -ENOMEM;
+                }
+
+                // If partial page write and page not up to date, fill it first.
+                if (!page->testflag(NMem::PAGE_UPTODATE) && (offwithinpage != 0 || towrite < NArch::PAGESIZE)) {
+                    int err = this->readpage(page);
+                    if (err < 0 && err != -ENOENT) {
+                        page->pageunlock();
+                        if (totalwritten > 0) {
+                            return totalwritten;
+                        }
+                        return err;
+                    }
+                    if (err == -ENOENT) { // Zero the page if it doesn't exist.
+                        NLib::memset(page->data(), 0, NArch::PAGESIZE);
+                    }
+                }
+
+                // Copy data from user buffer.
+                NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
+
+                page->setflag(NMem::PAGE_UPTODATE);
+                page->markdirty();
+                page->pageunlock();
+
+                src += towrite;
+                offset += towrite;
+                count -= towrite;
+                totalwritten += towrite;
+            }
+
+            return totalwritten;
+        }
+
+        int INode::readpage(NMem::CachePage *page) {
+            ssize_t result = this->read(page->data(), NArch::PAGESIZE, page->offset, 0);
+            if (result < 0) {
+                return (int)result;
+            }
+            // Zero any remaining part of page.
+            if ((size_t)result < NArch::PAGESIZE) {
+                NLib::memset((uint8_t *)page->data() + result, 0, NArch::PAGESIZE - result);
+            }
+            page->setflag(NMem::PAGE_UPTODATE);
+            return 0;
+        }
+
+        int INode::writepage(NMem::CachePage *page) {
+            page->setflag(NMem::PAGE_WRITEBACK);
+            ssize_t result = this->write(page->data(), NArch::PAGESIZE, page->offset, 0);
+            page->clearflag(NMem::PAGE_WRITEBACK);
+
+            if (result < 0) {
+                page->errorcount++;
+                if (page->errorcount >= 10) {
+                    page->setflag(NMem::PAGE_ERROR);
+                }
+                return (int)result;
+            }
+
+            page->markclean();
+            page->errorcount = 0;
+            return 0;
+        }
+
         int VFS::mount(const char *src, const char *path, const char *fs, uint64_t flags, const void *data) {
+
+            if (!NLib::strcmp(fs, "auto")) {
+                return this->identifyfs(src);
+            }
+
             fsfactory_t *factory = NULL;
             {
                 NLib::ScopeSpinlock guard(&this->mountlock);
@@ -469,6 +789,118 @@ namespace NFS {
             return ret;
         }
 
+        int VFS::rename(const char *oldpath, INode *oldrelativeto, const char *newpath, INode *newrelativeto, int uid, int gid) {
+            Path oldpobj = Path(oldpath);
+            Path newpobj = Path(newpath);
+
+            if (!oldpobj.depth()) {
+                return -EINVAL; // Cannot rename root.
+            }
+            if (!newpobj.depth()) {
+                return -EINVAL; // Cannot rename to root.
+            }
+
+            // Resolve the source node (without following final symlink).
+            INode *srcnode = NULL;
+            ssize_t res = this->resolve(oldpath, &srcnode, oldrelativeto, false);
+            if (res < 0) {
+                return res; // Failed to resolve source.
+            }
+
+            // Get source parent directory.
+            INode *srcparent = srcnode->getparent();
+            if (!srcparent) {
+                srcnode->unref();
+                return -EINVAL; // Cannot rename root node.
+            }
+            srcparent->ref();
+
+            // Check write permission on source parent.
+            if (!this->checkaccess(srcparent, O_RDWR | O_EXEC, uid, gid)) {
+                srcparent->unref();
+                srcnode->unref();
+                return -EACCES;
+            }
+
+            // Resolve destination parent directory.
+            const char *dstdirpath = newpobj.dirname();
+            INode *dstparent = NULL;
+            res = this->resolve(dstdirpath, &dstparent, newrelativeto);
+            delete dstdirpath;
+            if (res < 0) {
+                srcparent->unref();
+                srcnode->unref();
+                return res; // Destination parent doesn't exist.
+            }
+
+            if (!S_ISDIR(dstparent->getattr().st_mode)) {
+                dstparent->unref();
+                srcparent->unref();
+                srcnode->unref();
+                return -ENOTDIR; // Destination parent is not a directory.
+            }
+
+            // Check write permission on destination parent.
+            if (!this->checkaccess(dstparent, O_RDWR | O_EXEC, uid, gid)) {
+                dstparent->unref();
+                srcparent->unref();
+                srcnode->unref();
+                return -EACCES;
+            }
+
+            // Check if source and destination are on the same filesystem.
+            if (srcnode->fs != dstparent->fs) {
+                dstparent->unref();
+                srcparent->unref();
+                srcnode->unref();
+                return -EXDEV; // Cross-device rename not supported.
+            }
+
+            // Check if destination already exists.
+            const char *dstname = newpobj.basename();
+            INode *dstnode = dstparent->lookup(dstname);
+
+            // Handle various rename cases.
+            if (dstnode) {
+                struct stat srcst = srcnode->getattr();
+                struct stat dstst = dstnode->getattr();
+
+                // Check if source and destination are the same file.
+                if (srcst.st_ino == dstst.st_ino && srcst.st_dev == dstst.st_dev) {
+                    // Same file, nothing to do.
+                    dstnode->unref();
+                    dstparent->unref();
+                    srcparent->unref();
+                    srcnode->unref();
+                    return 0;
+                }
+
+                if (S_ISDIR(srcst.st_mode)) {
+                    if (!S_ISDIR(dstst.st_mode)) {
+                        // Woah pal, source can't be a directory if destination isn't.
+                        dstnode->unref();
+                        dstparent->unref();
+                        srcparent->unref();
+                        srcnode->unref();
+                        return -ENOTDIR;
+                    }
+                } else {
+                    if (S_ISDIR(dstst.st_mode)) {
+                        // Woah pal, destination can't be a directory if source isn't.
+                        dstnode->unref();
+                        dstparent->unref();
+                        srcparent->unref();
+                        srcnode->unref();
+                        return -EISDIR;
+                    }
+                }
+            }
+
+            // Get the filesystem to handle it.
+            int ret = srcnode->fs->rename(srcparent, srcnode, dstparent, dstname, dstnode);
+            return ret;
+        }
+
         void VFS::syncall(void) {
             NLib::ScopeSpinlock guard(&this->mountlock);
 
@@ -730,8 +1162,13 @@ namespace NFS {
 
             for (size_t i = 0; i < this->closeonexec.getsize(); i++) { // Effectively the same logic as closeall(), but we only close FDs marked as close-on-exec.
                 if (this->closeonexec.test(i)) {
-                    if (this->fds[i]->unref() == 0) {
-                        delete this->fds[i];
+                    FileDescriptor *desc = this->fds[i];
+                    INode *node = desc->getnode();
+                    node->close(desc->getflags());
+                    node->unref();
+
+                    if (desc->unref() == 0) {
+                        delete desc;
                     }
                     this->fds[i] = NULL;
                     this->openfds.clear(i);
@@ -745,8 +1182,13 @@ namespace NFS {
 
             for (size_t i = 0; i < this->openfds.getsize(); i++) {
                 if (this->openfds.test(i)) { // Allocated. Free associated if without reference.
-                    if (this->fds[i]->unref() == 0) {
-                        delete this->fds[i]; // Delete descriptor itself if we ran out of references.
+                    FileDescriptor *desc = this->fds[i];
+                    INode *node = desc->getnode();
+                    node->close(desc->getflags());
+                    node->unref();
+
+                    if (desc->unref() == 0) {
+                        delete desc; // Delete descriptor itself if we ran out of references.
                     }
                     this->fds[i] = NULL;
                     this->openfds.clear(i);
@@ -812,6 +1254,12 @@ namespace NFS {
             }
 
             return true;
+        }
+
+
+        int VFS::identifyfs(const char *src) {
+            // XXX: Implement filesystem auto-detection.
+            return -ENODEV;
         }
 
         extern "C" uint64_t sys_openat(int dirfd, const char *path, int flags, unsigned int mode) {
@@ -1129,7 +1577,7 @@ namespace NFS {
             SYSCALL_RET(0);
         }
 
-        extern "C" uint64_t sys_getcwd(char *buf, size_t size) {
+        extern "C" ssize_t sys_getcwd(char *buf, size_t size) {
             SYSCALL_LOG("sys_getcwd(%p, %lu).\n", buf, size);
 
             if (!buf || size == 0) {
@@ -2556,6 +3004,120 @@ namespace NFS {
             // Perform the unmount operation.
             res = vfs->umount(tgtbuf, flags);
             delete[] tgtbuf;
+            SYSCALL_RET(res);
+        }
+
+        extern "C" ssize_t sys_rename(int oldfd, const char *oldpath, size_t oldlen, int newfd, const char *newpath, size_t newlen) {
+            SYSCALL_LOG("sys_rename(%d, %s, %lu, %d, %s, %lu).\n", oldfd, oldpath, oldlen, newfd, newpath, newlen);
+
+            // Validate and copy old path from userspace.
+            ssize_t oldpathsize = NMem::UserCopy::strnlen(oldpath, oldlen);
+            if (oldpathsize < 0) {
+                SYSCALL_RET(oldpathsize);
+            }
+            char *oldpathbuf = new char[oldpathsize + 1];
+            if (!oldpathbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+            int ret = NMem::UserCopy::strncpyfrom(oldpathbuf, oldpath, oldpathsize);
+            if (ret < 0) {
+                delete[] oldpathbuf;
+                SYSCALL_RET(ret);
+            }
+            oldpathbuf[oldpathsize] = '\0';
+
+            // Validate and copy new path from userspace.
+            ssize_t newpathsize = NMem::UserCopy::strnlen(newpath, newlen);
+            if (newpathsize < 0) {
+                delete[] oldpathbuf;
+                SYSCALL_RET(newpathsize);
+            }
+            char *newpathbuf = new char[newpathsize + 1];
+            if (!newpathbuf) {
+                delete[] oldpathbuf;
+                SYSCALL_RET(-ENOMEM);
+            }
+            ret = NMem::UserCopy::strncpyfrom(newpathbuf, newpath, newpathsize);
+            if (ret < 0) {
+                delete[] oldpathbuf;
+                delete[] newpathbuf;
+                SYSCALL_RET(ret);
+            }
+            newpathbuf[newpathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+
+            // Resolve old directory.
+            INode *olddirnode;
+            if (oldpathbuf[0] == '/') {
+                olddirnode = vfs->getroot();
+            } else if (oldfd == AT_FDCWD) {
+                olddirnode = proc->cwd;
+                if (!olddirnode) {
+                    olddirnode = vfs->getroot();
+                } else {
+                    olddirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(oldfd);
+                if (!desc) {
+                    delete[] oldpathbuf;
+                    delete[] newpathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                olddirnode = desc->getnode();
+                if (!S_ISDIR(olddirnode->getattr().st_mode)) {
+                    olddirnode->unref();
+                    delete[] oldpathbuf;
+                    delete[] newpathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            // Resolve new directory.
+            INode *newdirnode;
+            if (newpathbuf[0] == '/') {
+                newdirnode = vfs->getroot();
+            } else if (newfd == AT_FDCWD) {
+                newdirnode = proc->cwd;
+                if (!newdirnode) {
+                    newdirnode = vfs->getroot();
+                } else {
+                    newdirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(newfd);
+                if (!desc) {
+                    olddirnode->unref();
+                    delete[] oldpathbuf;
+                    delete[] newpathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                newdirnode = desc->getnode();
+                if (!S_ISDIR(newdirnode->getattr().st_mode)) {
+                    newdirnode->unref();
+                    olddirnode->unref();
+                    delete[] oldpathbuf;
+                    delete[] newpathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            int uid = proc->uid;
+            int gid = proc->gid;
+            proc->lock.release();
+
+            // Actual work is done by VFS, of course.
+            ssize_t res = vfs->rename(oldpathbuf, olddirnode, newpathbuf, newdirnode, uid, gid);
+            olddirnode->unref();
+            newdirnode->unref();
+            delete[] oldpathbuf;
+            delete[] newpathbuf;
             SYSCALL_RET(res);
         }
     }

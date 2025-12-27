@@ -3,6 +3,7 @@
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/e9.hpp>
 #include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/stacktrace.hpp>
 #include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/timer.hpp>
 #endif
@@ -35,316 +36,6 @@ namespace NSched {
     // Global zombie list for deferred thread cleanup.
     static NArch::IRQSpinlock zombielock;
     static Thread *zombiehead = NULL;
-
-    void RBTree::_insert(struct node *node, int (*cmp)(struct node *, struct node *)) {
-        struct node *y = NULL;
-        struct node *x = this->root;
-
-        while (x != NULL) {
-            y = x;
-            if (cmp(node, x) < 0) {
-                x = x->left;
-            } else {
-                x = x->right;
-            }
-        }
-
-        node->packparent(y);
-        if (y == NULL) {
-            this->root = node;
-        } else if (cmp(node, y) < 0) {
-            y->left = node;
-        } else {
-            y->right = node;
-        }
-
-        node->left = NULL;
-        node->right = NULL;
-        node->packcolour(colour::RED);
-
-        this->rebalance(node);
-
-        __atomic_add_fetch(&this->nodecount, 1, memory_order_seq_cst);
-    }
-
-    void RBTree::_erase(struct node *z) {
-        struct node *y = z;
-        struct node *x = NULL;
-        struct node *x_parent = NULL;
-        enum colour y_original_colour = y->getcolour();
-
-        if (z->left == NULL) {
-            x = z->right;
-            this->transplant(z, z->right);
-            x_parent = z->getparent();
-        } else if (z->right == NULL) {
-            x = z->left;
-            this->transplant(z, z->left);
-            x_parent = z->getparent();
-        } else {
-            y = this->_next(z);
-            y_original_colour = y->getcolour();
-            x = y->right;
-
-            if (y->getparent() == z) {
-                x_parent = y;
-            } else {
-                x_parent = y->getparent();
-                this->transplant(y, y->right);
-                y->right = z->right;
-                if (y->right) y->right->packparent(y);
-            }
-
-            this->transplant(z, y);
-            y->left = z->left;
-            y->left->packparent(y);
-            y->packcolour(z->getcolour());
-        }
-
-        if (y_original_colour == colour::BLACK) {
-            this->reerase(x, x_parent);
-        }
-
-        __atomic_sub_fetch(&this->nodecount, 1, memory_order_seq_cst);
-    }
-
-    void RBTree::transplant(struct node *u, struct node *v) {
-        if (u->getparent() == NULL) {
-            this->root = v;
-        } else if (u == u->getparent()->left) {
-            u->getparent()->left = v;
-        } else {
-            u->getparent()->right = v;
-        }
-        if (v != NULL) {
-            v->packparent(u->getparent());
-        }
-    }
-
-    void RBTree::rotateleft(struct node *x) {
-        struct node *y = x->right;
-        struct node *t2 = y->left;
-
-        x->right = t2;
-
-        if (y->left) {
-            y->left->packparent(x);
-        }
-
-        y->packparent(x->getparent());
-
-        if (!x->getparent()) {
-            this->root = y; // Has no parent, this will be the top level node.
-        } else if (x == x->getparent()->left) { // We are the left path of the parent.
-            x->getparent()->left = y;
-        } else {
-            x->getparent()->right = y;
-        }
-
-        y->left = x;
-        x->packparent(y); // Y is now the new parent node.
-    }
-
-    void RBTree::rotateright(struct node *y) {
-        struct node *x = y->left;
-        struct node *t2 = x->right;
-
-        y->left = t2;
-
-        if (x->right) {
-            x->right->packparent(y);
-        }
-
-        x->packparent(y->getparent());
-
-        if (!y->getparent()) {
-            this->root = x;
-        } else if (y == y->getparent()->right) { // We are the right path of the parent.
-            y->getparent()->right = x;
-        } else {
-            y->getparent()->left = x;
-        }
-
-        x->right = y;
-        y->packparent(x); // X is now the parent node.
-    }
-
-    struct RBTree::node *RBTree::_first(void) {
-
-        struct node *n = this->root;
-        if (!n) {
-            return NULL; // With no root, there is no node.
-        }
-
-        while (n->left) {
-            n = n->left; // Traverse left branch.
-        }
-        return n;
-    }
-
-    struct RBTree::node *RBTree::_last(void) {
-        // Same as _first(), but we traverse the right branch instead.
-
-        struct node *n = this->root;
-        if (!n) {
-            return NULL; // With no root, there is no node.
-        }
-
-        while (n->right) {
-            n = n->right; // Traverse right branch.
-        }
-        return n;
-    }
-
-    struct RBTree::node *RBTree::_next(struct node *node) {
-
-        if (node->right) {
-            struct node *n = node->right;
-            while (n->left) {
-                n = n->left;
-            }
-            return n;
-        }
-
-        struct node *parent = node->getparent();
-        while (parent && node == parent->right) {
-            node = parent;
-            parent = parent->getparent();
-        }
-        return parent;
-    }
-
-    struct RBTree::node *RBTree::_prev(struct node *node) {
-
-        if (node->left) {
-            struct node *n = node->left;
-            while (n->right) {
-                n = n->right;
-            }
-            return n;
-        }
-
-        struct node *parent = node->getparent();
-        while (parent && node == parent->left) {
-            node = parent;
-            parent = parent->getparent();
-        }
-        return parent;
-    }
-
-    void RBTree::rebalance(struct node *z) {
-        while (z->getparent() && z->getparent()->getcolour() == colour::RED) {
-            if (z->getparent() == z->getparent()->getparent()->left) {
-                struct node *y = z->getparent()->getparent()->right;
-                if (y && y->getcolour() == colour::RED) {
-                    z->getparent()->packcolour(colour::BLACK);
-                    y->packcolour(colour::BLACK);
-                    z->getparent()->getparent()->packcolour(colour::RED);
-                    z = z->getparent()->getparent();
-                } else {
-                    if (z == z->getparent()->right) {
-                        z = z->getparent();
-                        this->rotateleft(z);
-                    }
-                    z->getparent()->packcolour(colour::BLACK);
-                    z->getparent()->getparent()->packcolour(colour::RED);
-                    this->rotateright(z->getparent()->getparent());
-                }
-            } else {
-                struct node *y = z->getparent()->getparent()->left;
-                if (y && y->getcolour() == colour::RED) {
-                    z->getparent()->packcolour(colour::BLACK);
-                    y->packcolour(colour::BLACK);
-                    z->getparent()->getparent()->packcolour(colour::RED);
-                    z = z->getparent()->getparent();
-                } else {
-                    if (z == z->getparent()->left) {
-                        z = z->getparent();
-                        this->rotateright(z);
-                    }
-                    z->getparent()->packcolour(colour::BLACK);
-                    z->getparent()->getparent()->packcolour(colour::RED);
-                    this->rotateleft(z->getparent()->getparent());
-                }
-            }
-        }
-        this->root->packcolour(colour::BLACK);
-    }
-
-    void RBTree::reerase(struct node *x, struct node *x_parent) {
-        struct node *w;
-        while (x != this->root && (x == NULL || x->getcolour() == colour::BLACK)) {
-            if (x == x_parent->left) {
-                w = x_parent->right;
-                if (w->getcolour() == colour::RED) {
-                    w->packcolour(colour::BLACK);
-                    x_parent->packcolour(colour::RED);
-                    this->rotateleft(x_parent);
-                    w = x_parent->right;
-                }
-                if ((w->left == NULL || w->left->getcolour() == colour::BLACK) &&
-                    (w->right == NULL || w->right->getcolour() == colour::BLACK)) {
-                    w->packcolour(colour::RED);
-                    x = x_parent;
-                    x_parent = x->getparent();
-                } else {
-                    if (w->right == NULL || w->right->getcolour() == colour::BLACK) {
-                        if (w->left) {
-                            w->left->packcolour(colour::BLACK);
-                        }
-                        w->packcolour(colour::RED);
-                        this->rotateright(w);
-                        w = x_parent->right;
-                    }
-                    w->packcolour(x_parent->getcolour());
-                    x_parent->packcolour(colour::BLACK);
-                    if (w->right) {
-                        w->right->packcolour(colour::BLACK);
-                    }
-                    this->rotateleft(x_parent);
-                    x = this->root;
-                }
-            } else {
-                w = x_parent->left;
-                if (w->getcolour() == colour::RED) {
-                    w->packcolour(colour::BLACK);
-                    x_parent->packcolour(colour::RED);
-                    this->rotateright(x_parent);
-                    w = x_parent->left;
-                }
-                if ((w->right == NULL || w->right->getcolour() == colour::BLACK) &&
-                    (w->left == NULL || w->left->getcolour() == colour::BLACK)) {
-                    w->packcolour(colour::RED);
-                    x = x_parent;
-                    x_parent = x->getparent();
-                } else {
-                    if (w->left == NULL || w->left->getcolour() == colour::BLACK) {
-                        if (w->right) {
-                            w->right->packcolour(colour::BLACK);
-                        }
-                        w->packcolour(colour::RED);
-                        this->rotateleft(w);
-                        w = x_parent->left;
-                    }
-                    w->packcolour(x_parent->getcolour());
-                    x_parent->packcolour(colour::BLACK);
-                    if (w->left) {
-                        w->left->packcolour(colour::BLACK);
-                    }
-                    this->rotateright(x_parent);
-                    x = this->root;
-                }
-            }
-        }
-        if (x) {
-            x->packcolour(colour::BLACK);
-        }
-    }
-
-    size_t RBTree::count(void) {
-        // Lockless return of cached value.
-        return __atomic_load_n(&this->nodecount, memory_order_seq_cst);
-    }
 
     // Comparison function for insertion logic.
     static int vruntimecmp(struct RBTree::node *a, struct RBTree::node *b) {
@@ -644,6 +335,62 @@ namespace NSched {
         CPU::restorexctx(&thread->xctx); // Restore extra context.
         CPU::ctx_swap(&thread->ctx); // Restore context.
 
+        uint64_t rsp = 0;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(rsp) : : "memory");
+
+
+        Thread *current = CPU::get()->currthread;
+
+        // Swap to thread->stacktop for safe error handling.
+        __asm__ volatile(
+            "mov %0, %%rsp\n"
+            "sub $128, %%rsp\n" // Allocate a bit of stack space to avoid issues with immediate errors.
+            :
+            : "r"(current->stacktop)
+            : "memory"
+        );
+
+        NUtil::printf("Context switch returned unexpectedly!\n");
+
+        if (current != thread) {
+            NUtil::printf("Context switch unreachable reached is to a thread that we did not switch to!.\n");
+        }
+
+        Process *proc = current->process;
+        NUtil::printf("Unreachable reached occurred in thread %u of process %u.\n", current->id, proc->id);
+        NUtil::printf("Printing stack trace of thread that returned:\n");
+        printstacktrace(current->ctx.rbp);
+        NUtil::printf("Register state:\n");
+        NUtil::printf("RIP: 0x%016lx RSP: 0x%016lx RFLAGS: 0x%016lx\n", current->ctx.rip, current->ctx.rsp, current->ctx.rflags);
+        NUtil::printf("RAX: 0x%016lx RBX: 0x%016lx RCX: 0x%016lx RDX: 0x%016lx\n", current->ctx.rax, current->ctx.rbx, current->ctx.rcx, current->ctx.rdx);
+        NUtil::printf("RSI: 0x%016lx RDI: 0x%016lx RBP: 0x%016lx\n", current->ctx.rsi, current->ctx.rdi, current->ctx.rbp);
+        NUtil::printf("R8:  0x%016lx R9:  0x%016lx R10: 0x%016lx R11: 0x%016lx\n", current->ctx.r8, current->ctx.r9, current->ctx.r10, current->ctx.r11);
+        NUtil::printf("R12: 0x%016lx R13: 0x%016lx R14: 0x%016lx R15: 0x%016lx\n", current->ctx.r12, current->ctx.r13, current->ctx.r14, current->ctx.r15);
+
+        NUtil::printf("Current register state:\n");
+        uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rip, rflags;
+        __asm__ volatile(
+            "mov %%rax, %0\n"
+            "mov %%rbx, %1\n"
+            "mov %%rcx, %2\n"
+            "mov %%rdx, %3\n"
+            "mov %%rsi, %4\n"
+            "mov %%rdi, %5\n"
+            "mov %%rbp, %6\n"
+            "leaq (%%rip), %%rax\n"
+            "mov %%rax, %7\n"
+            "pushfq\n"
+            "pop %8\n"
+            : "=r"(rax), "=r"(rbx), "=r"(rcx), "=r"(rdx), "=r"(rsi), "=r"(rdi), "=r"(rbp), "=r"(rip), "=r"(rflags)
+            :
+            : "memory"
+        );
+        NUtil::printf("RIP: 0x%016lx RSP: 0x%016lx RFLAGS: 0x%016lx\n", rip, rsp, rflags);
+        NUtil::printf("RAX: 0x%016lx RBX: 0x%016lx RCX: 0x%016lx RDX: 0x%016lx\n", rax, rbx, rcx, rdx);
+        NUtil::printf("RSI: 0x%016lx RDI: 0x%016lx RBP: 0x%016lx\n", rsi, rdi, rbp);
+        NUtil::printf("R8:  0x%016lx R9:  0x%016lx R10: 0x%016lx R11: 0x%016lx\n", current->ctx.r8, current->ctx.r9, current->ctx.r10, current->ctx.r11);
+        NUtil::printf("R12: 0x%016lx R13: 0x%016lx R14: 0x%016lx R15: 0x%016lx\n", current->ctx.r12, current->ctx.r13, current->ctx.r14, current->ctx.r15);
+
         __builtin_unreachable();
     }
 
@@ -697,7 +444,10 @@ namespace NSched {
         updateload(cpu);
 
         // Periodic zombie cleanup and load balancing.
+        cpu->setint(true); // Enable interrupts for TLB shootdown handling.
         reapzombies();
+        cpu->setint(false);
+
         if ((curintr % 4) == 0) {
             loadbalance(cpu);
         }
@@ -734,26 +484,37 @@ namespace NSched {
 
         // Re-enqueue previous thread if it was running (not idle, not dead, not waiting).
         if (prev != cpu->idlethread) {
-            enum Thread::state prevstate = (enum Thread::state)__atomic_load_n(&prev->tstate, memory_order_acquire);
             enum Thread::pendingwait pendwait = (enum Thread::pendingwait)__atomic_load_n(&prev->pendingwaitstate, memory_order_acquire);
 
-            if (prevstate == Thread::state::DEAD) {
-                queuezombie(prev);
-                prev = NULL; // No previous thread to save context for.
-            } else if (pendwait != Thread::pendingwait::PENDING_NONE) {
-                if (pendwait == Thread::pendingwait::PENDING_WAIT) {
-                    __atomic_store_n(&prev->tstate, Thread::state::WAITING, memory_order_release);
-                } else { // PENDING_WAITINT
-                    __atomic_store_n(&prev->tstate, Thread::state::WAITINGINT, memory_order_release);
+            // Handle pending wait state transitions using CAS to avoid race with markdeadandremove().
+            if (pendwait != Thread::pendingwait::PENDING_NONE) {
+                // Determine target state based on pending wait type.
+                enum Thread::state targetstate = (pendwait == Thread::pendingwait::PENDING_WAIT)
+                    ? Thread::state::WAITING : Thread::state::WAITINGINT;
+
+                // Use CAS to transition RUNNING -> WAITING/WAITINGINT.
+                enum Thread::state expected = Thread::state::RUNNING;
+                if (__atomic_compare_exchange_n(&prev->tstate, &expected, targetstate, false, memory_order_acq_rel, memory_order_acquire)) {
+                    // Successfully transitioned to waiting state.
+                    __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+                } else if (expected == Thread::state::DEAD) {
+                    // Thread was marked dead by another CPU, queue for cleanup.
+                    __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+                    queuezombie(prev);
+                    prev = NULL;
                 }
-                // Clear the pending wait state.
-                __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
-            } else if (prevstate == Thread::state::RUNNING) {
-                __atomic_store_n(&prev->tstate, Thread::state::SUSPENDED, memory_order_release);
-                NArch::CPU::writemb(); // Ensure writes are seen before insertion.
-                cpu->runqueue._insert(&prev->node, vruntimecmp);
+            } else {
+                enum Thread::state expected = Thread::state::RUNNING;
+                if (__atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
+                    // Successfully transitioned to SUSPENDED, enqueue.
+                    NArch::CPU::writemb();
+                    cpu->runqueue._insert(&prev->node, vruntimecmp);
+                } else if (expected == Thread::state::DEAD) {
+                    // Thread was marked dead, queue for cleanup.
+                    queuezombie(prev);
+                    prev = NULL;
+                }
             }
-            // If prevstate is WAITING/WAITINGINT (already transitioned by a previous scheduler run but woken before context switch completed), don't re-enqueue.
         }
 
         // Get next thread from runqueue.
@@ -782,8 +543,8 @@ namespace NSched {
         if (prev != next) {
             bool needswap = !prev || (prev->process->addrspace != next->process->addrspace);
 
-            Timer::rearm();
             cpu->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
+            Timer::rearm();
 
             switchthread(next, needswap); // Swap to context.
         }
@@ -852,9 +613,6 @@ namespace NSched {
         this->pstate = Process::state::ZOMBIE;
 
         Process *parent = this->parent;
-
-        // Save our ID before releasing lock since parent may delete us after wake.
-        size_t myid = this->id;
 
         // Release our lock before waking parent and sending SIGCHLD to avoid deadlock.
         this->lock.release();
@@ -970,16 +728,63 @@ namespace NSched {
     // Voluntarily yield the CPU to another thread.
     // The current thread will be placed back in the runqueue.
     void yield(void) {
-        // Stop the timer to prevent nested interrupts during yield.
+        struct CPU::cpulocal *cpu = CPU::get();
+        Thread *self = cpu->currthread;
+
+        // Safety checks: cannot yield from idle thread or if scheduler not initialized.
+        if (!initialised || self == cpu->idlethread) {
+            return;
+        }
+
+        // Disable interrupts to prevent races during yield setup.
+        // This ensures atomic setup of yield state.
+        bool oldint = cpu->setint(false);
+
+        // Mark that this thread is requesting a reschedule.
+        __atomic_store_n(&self->rescheduling, true, memory_order_release);
+
+        // Memory barrier to ensure rescheduling flag is visible.
+        CPU::writemb();
+
+        // Stop timer to prevent racing timer interrupt during yield.
         APIC::lapicstop();
 
-        // Ensure interrupts are enabled before sending the IPI.
-        CPU::get()->setint(true);
+        enum Thread::state currentstate = (enum Thread::state)__atomic_load_n(&self->tstate, memory_order_acquire);
 
-        // Artificially induce a schedule interrupt, using a "loopback" IPI.
-        APIC::sendipi(CPU::get()->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
+        if (currentstate == Thread::state::DEAD) {
+            for (;;) {
+                asm volatile(
+                    "sti\n\t"          // Enable interrupts (required for int to work properly)
+                    "int $0xfe\n\t"    // Synchronously invoke scheduler
+                    "cli\n\t"          // Should never reach here, but disable if we do
+                    : : : "memory"
+                );
+            }
+            __builtin_unreachable();
+        }
 
-        // At this point, we've either been rescheduled (if we were running) or marked dead.
+        APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
+        //asm volatile("int $0xfe\n\t" : : : "memory");
+
+        // Enable interrupts so the IPI can be delivered.
+        cpu->setint(true);
+
+        // Wait for the scheduler to process our yield request.
+        while (__atomic_load_n(&self->rescheduling, memory_order_acquire)) {
+            asm volatile(
+                "sti\n\t"
+                "hlt\n\t"
+                : : : "memory"
+            );
+        }
+
+        // Restore original interrupt state.
+        cpu->setint(oldint);
+
+        enum Thread::state exitstate = (enum Thread::state)__atomic_load_n(&self->tstate, memory_order_acquire);
+        if (exitstate == Thread::state::DEAD) {
+            panic("yield() returned for dead thread");
+        }
     }
 
     struct sleepstate { // Simple helper struct that avoids UAF.
@@ -1167,8 +972,10 @@ namespace NSched {
         }
 
         __atomic_store_n(&CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release); // Kill ourselves. We will NOT be rescheduled.
+        CPU::writemb();
 
         yield(); // Yield back to scheduler, so the thread never gets rescheduled.
+
         assert(false, "Exiting thread was rescheduled!");
     }
 
@@ -1265,6 +1072,14 @@ namespace NSched {
                 return; // Thread is dead, do not schedule.
             }
 
+            if (expected == Thread::state::SUSPENDED) {
+                return; // Thread is already in a runqueue, do not double-enqueue.
+            }
+
+            if (expected == Thread::state::RUNNING) {
+                return; // Thread is currently running, do not re-enqueue.
+            }
+
             if (__atomic_compare_exchange_n(&thread->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
                 break; // Successfully transitioned to SUSPENDED.
             }
@@ -1343,6 +1158,8 @@ namespace NSched {
         CPU::get()->lastschedts = TSC::query();
 
         Interrupts::regisr(0xfe, schedule, true); // Register the scheduling interrupt. Mark as needing EOI, because it's through the LAPIC.
+
+        initialised = true; // Mark the scheduler as ready.
     }
 
     void await(void) {
@@ -2003,7 +1820,7 @@ namespace NSched {
         struct VMM::addrspace *newspace;
         NArch::VMM::uclonecontext(&NArch::VMM::kspace, &newspace); // Start with a clone of the kernel address space.
 
-        bool isdynamic = false;
+        bool isinterp = false;
 
         void *ent = NULL;
         void *interpent = NULL;
@@ -2011,12 +1828,12 @@ namespace NSched {
         uintptr_t interpbase = 0;
         uintptr_t phdraddr = 0;
 
-        // Static ELF binary.
         if (elfhdr.type == NSys::ELF::ET_DYNAMIC) {
             execbase = 0x400000; // Standard base for PIE.
         } else {
-            execbase = 0;
+            execbase = 0; // Non-PIE executables load at fixed address.
         }
+
         if (!NSys::ELF::loadfile(&elfhdr, inode, newspace, &ent, execbase, &phdraddr)) {
             inode->unref();
             freeargsenvs(aargv, argc);
@@ -2025,16 +1842,10 @@ namespace NSched {
             SYSCALL_RET(-ENOEXEC);
         }
 
-        if (elfhdr.type == NSys::ELF::ET_DYNAMIC) {
-            char *interp = NSys::ELF::getinterpreter(&elfhdr, inode);
-            if (!interp) {
-                inode->unref();
-                freeargsenvs(aargv, argc);
-                freeargsenvs(aenvp, envc);
-                delete newspace;
-                SYSCALL_RET(-ENOEXEC);
-            }
-            isdynamic = true;
+        char *interp = NSys::ELF::getinterpreter(&elfhdr, inode);
+
+        if (interp != NULL) { // Dynamically linked executable.
+            isinterp = true;
 
             // Load interpreter ELF.
             NFS::VFS::INode *interpnode;
@@ -2069,7 +1880,7 @@ namespace NSched {
             }
 
             // Load interpreter at different base address
-            interpbase = 0x40000000;  // Place interpreter at a different address range
+            interpbase = 0x00000beef0000000;  // Place interpreter at a different address range
             if (!NSys::ELF::loadfile(&interpelfhdr, interpnode, newspace, &interpent, interpbase, NULL)) {
                 inode->unref();
                 interpnode->unref();
@@ -2114,7 +1925,7 @@ namespace NSched {
         uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Top of user space, minus a page for safety.
         uintptr_t ustackbottom = ustacktop - (1 << 20); // Virtual address of bottom of user stack (where ustackphy starts).
 
-        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), aargv, aenvp, &elfhdr, ustacktop, execbase, interpbase, phdraddr);
+        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), aargv, aenvp, &elfhdr, ustacktop, (uintptr_t)ent, interpbase, phdraddr);
         freeargsenvs(aargv, argc);
         freeargsenvs(aenvp, envc);
 
@@ -2183,10 +1994,11 @@ namespace NSched {
 #ifdef __x86_64__
         NLib::memset(&NArch::CPU::get()->currthread->xctx, 0, sizeof(NArch::CPU::get()->currthread->xctx));
 
-        sysctx->rip = isdynamic ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
+        sysctx->rip = isinterp ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
         sysctx->rsp = (uint64_t)rsp;
         sysctx->rflags = 0x202; // Enable interrupts.
 
+        NUtil::printf("Execve: Entry point at 0x%lx, stack at 0x%lx\n", sysctx->rip, sysctx->rsp);
 
         NLib::memset(NArch::CPU::get()->currthread->fctx.fpustorage, 0, CPU::get()->fpusize);
         NArch::CPU::get()->currthread->fctx.mathused = false; // Mark as unused.
@@ -2198,12 +2010,17 @@ namespace NSched {
             asm volatile("xsave (%0)" : : "r"(NArch::CPU::get()->currthread->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
             CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
         }
-#endif
 
         NArch::VMM::swapcontext(newspace);
         current->lock.release();
 
-        SYSCALL_RET(sysctx->rax); // Success.
+        SYSCALL_RET(sysctx->rax); // Success. This should usually be the system call number of sys_execve.
+#else
+        // Other architectures not implemented yet.
+        current->lock.release();
+        delete newspace;
+        SYSCALL_RET(-ENOSYS);
+#endif
     }
 
     #define WNOHANG     1 // Don't block.

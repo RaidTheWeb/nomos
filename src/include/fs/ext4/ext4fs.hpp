@@ -5,6 +5,7 @@
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
 #include <lib/string.hpp>
+#include <mm/pagecache.hpp>
 #include <std/stddef.h>
 
 namespace NFS {
@@ -33,7 +34,6 @@ namespace NFS {
                 Ext4Node(Ext4FileSystem *fs, const char *name, struct VFS::stat attr, struct inode *diskino);
 
                 ~Ext4Node(void) {
-                    NUtil::printf("[fs/ext4fs]: Deleting node '%s'\n", this->name);
                     delete this->name;
 
                     // Free all cached child nodes.
@@ -49,8 +49,16 @@ namespace NFS {
                     this->children.insert(child->getname(), child);
                 }
 
+                // Remove a child node from the children cache (does not delete).
+                void _removechild(const char *name) {
+                    this->children.remove(name);
+                }
+
                 // Map a logical file block to a physical disk block.
                 uint64_t getphysblock(uint64_t logicalblk);
+
+                // Read indirect block pointer for legacy (non-extent) inodes.
+                uint64_t getindirectblock(uint64_t logicalblk);
 
                 // Read file data using extent mapping.
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
@@ -63,11 +71,26 @@ namespace NFS {
                 // Allocate a new extent for the file.
                 uint64_t allocextent(uint64_t logicalblk, uint16_t len);
 
+                // Allocate a block via indirect block mapping (legacy inodes).
+                uint64_t allocindirect(uint64_t logicalblk);
+
+                // Grow extent tree from depth 0 to depth 1.
+                bool growextenttree(void);
+
+                // Find the leaf block for a logical block in a deep extent tree.
+                uint64_t findextentleaf(uint64_t logicalblk, uint8_t **leafbufout);
+
+                // Allocate an extent in a deep extent tree (depth >= 1).
+                uint64_t allocextentdeep(uint64_t logicalblk, uint16_t len, uint64_t physblk);
+
                 // Update inode timestamps.
                 void touchtime(bool mtime, bool ctime, bool atime);
 
                 // Write the inode back to disk.
                 int writeback(void);
+
+                // Update timestamps and write inode back. NOTE: Only use when caller doesn't hold metalock.
+                int commitmetadata(bool mtime, bool ctime, bool atime);
 
                 // Read directory entries.
                 ssize_t readdir(void *buf, size_t count, off_t offset) override;
@@ -89,6 +112,38 @@ namespace NFS {
 
                 // Resolve symbolic link to target node.
                 VFS::INode *resolvesymlink(void) override;
+
+                // Poll for events on this node.
+                int poll(short events, short *revents, int fdflags) override {
+                    (void)fdflags;
+                    short mask = 0;
+
+                    // Regular files are always ready for read/write.
+                    if (events & VFS::POLLIN) {
+                        mask |= VFS::POLLIN;
+                    }
+                    if (events & VFS::POLLOUT) {
+                        mask |= VFS::POLLOUT;
+                    }
+                    if (events & VFS::POLLRDNORM) {
+                        mask |= VFS::POLLRDNORM;
+                    }
+                    if (events & VFS::POLLWRNORM) {
+                        mask |= VFS::POLLWRNORM;
+                    }
+
+                    *revents = mask;
+                    return 0;
+                }
+
+                // Sync file data and metadata to disk.
+                int sync(enum VFS::INode::syncmode mode) override;
+
+                // Read a page from disk into the page cache.
+                int readpage(NMem::CachePage *page) override;
+
+                // Write a page from page cache to disk.
+                int writepage(NMem::CachePage *page) override;
         };
 
         class Ext4FileSystem : public VFS::IFileSystem {
@@ -187,6 +242,12 @@ namespace NFS {
                 // Free a previously allocated block.
                 int freeblock(uint64_t blknum);
 
+                // Free all blocks in an extent tree recursively.
+                void freeextentblocks(uint32_t *node, uint64_t blknum);
+
+                // Free all blocks referenced by indirect block pointers.
+                void freeindirectblocks(struct inode *diskino);
+
                 // Allocate an inode from a specific block group.
                 uint32_t allocinode(uint32_t prefgroup = 0, bool isdir = false);
 
@@ -202,6 +263,8 @@ namespace NFS {
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
 
                 int unlink(VFS::INode *node, VFS::INode *parent) override;
+
+                int rename(VFS::INode *oldparent, VFS::INode *node, VFS::INode *newparent, const char *newname, VFS::INode *target) override;
         };
     }
 }

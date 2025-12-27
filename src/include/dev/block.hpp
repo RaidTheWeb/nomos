@@ -2,7 +2,13 @@
 #define _DEV__BLOCK_HPP
 
 #include <dev/dev.hpp>
-#include <dev/blockcache.hpp>
+
+// Forward declaration for page cache support.
+namespace NMem {
+    class PageCache;
+    class RadixTree;
+    class CachePage;
+}
 
 namespace NDev {
 
@@ -55,24 +61,51 @@ namespace NDev {
     };
 
     class BlockDevice : public Device {
+        protected:
+            NMem::RadixTree *pagecache = NULL; // Device-level page cache.
         public:
             size_t blksize = 512;
             uint64_t startlba = 0;
             uint64_t lastlba = 0;
-            BlockCache *cache = NULL;
 
             BlockDevice(uint64_t id, DevDriver *driver) : Device(id, driver) { }
-            ~BlockDevice() = default;
+            ~BlockDevice();
 
             // Read block-wise from device. Must be implemented by driver.
             virtual ssize_t readblock(uint64_t lba, void *buf) = 0;
             // Write block-wise to device. Must be implemented by driver.
             virtual ssize_t writeblock(uint64_t lba, const void *buf) = 0;
 
+            virtual ssize_t readblocks(uint64_t lba, size_t count, void *buf);
+            virtual ssize_t writeblocks(uint64_t lba, size_t count, const void *buf);
+
             // Read raw bytes from block device, goes through cache.
             virtual ssize_t readbytes(void *buf, size_t count, off_t offset, int fdflags);
             // Write raw bytes to block device, goes through cache.
             virtual ssize_t writebytes(const void *buf, size_t count, off_t offset, int fdflags);
+
+            ssize_t readbytespagecache(void *buf, size_t count, off_t offset);
+            ssize_t writebytespagecache(const void *buf, size_t count, off_t offset);
+
+            // Read a page from device into page cache entry.
+            int readpagedata(void *pagebuf, off_t pageoffset);
+            // Write a page from page cache entry to device.
+            int writepagedata(const void *pagebuf, off_t pageoffset);
+
+            // Get or create page cache radix tree.
+            NMem::RadixTree *getpagecache(void);
+
+            // Find cached page by offset.
+            NMem::CachePage *findcachedpage(off_t offset);
+
+            // Find or create cached page.
+            NMem::CachePage *getorcachepage(off_t offset);
+
+            // Sync all cached data to device.
+            int syncdevice(void);
+
+            // Invalidate all cached pages.
+            void invalidatecache(void);
     };
 
     class PartitionBlockDevice : public BlockDevice {
@@ -82,7 +115,6 @@ namespace NDev {
             PartitionBlockDevice(uint64_t id, DevDriver *driver, BlockDevice *parent, uint64_t startlba, uint64_t lastlba) : BlockDevice(id, driver) {
                 this->parent = parent;
                 this->blksize = parent->blksize;
-                this->cache = parent->cache; // Share cache with parent device.
                 this->startlba = startlba;
                 this->lastlba = lastlba;
             }
@@ -95,6 +127,14 @@ namespace NDev {
 
             ssize_t writeblock(uint64_t lba, const void *buffer) override {
                 return this->parent->writeblock(lba + this->startlba, buffer);
+            }
+
+            ssize_t readblocks(uint64_t lba, size_t count, void *buffer) override {
+                return this->parent->readblocks(lba + this->startlba, count, buffer);
+            }
+
+            ssize_t writeblocks(uint64_t lba, size_t count, const void *buffer) override {
+                return this->parent->writeblocks(lba + this->startlba, count, buffer);
             }
     };
 
