@@ -20,9 +20,9 @@ namespace NSys {
         };
 
         enum flag {
-            ELF_EXEC            = (1 << 0),
-            ELF_WRITE           = (1 << 1),
-            ELF_READ            = (1 << 2)
+            EF_EXEC            = (1 << 0),
+            EF_WRITE           = (1 << 1),
+            EF_READ            = (1 << 2)
         };
 
         __attribute__((used))
@@ -77,6 +77,10 @@ namespace NSys {
             PAGESZ      = 6,
             BASE        = 7,
             ENTRY       = 9,
+            UID         = 11,
+            EUID        = 12,
+            GID         = 13,
+            EGID        = 14,
             SECURE      = 23,
             RAND        = 25,
             EXECFN      = 31
@@ -88,7 +92,28 @@ namespace NSys {
         } __attribute__((packed));
 
         bool verifyheader(struct header *hdr);
-        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t entry, uintptr_t lnbase, uintptr_t phdraddr);
+
+
+        struct execinfo {
+            uint64_t random[2]; // Random data for AT_RANDOM.
+            bool secure; // Is this a secure exec?
+
+            int uid; // Real UID.
+            int euid; // Effective UID.
+            int gid; // Real GID.
+            int egid; // Effective GID.
+
+            char **argv; // Argument vector.
+            char **envp; // Environment pointer.
+            const char *execpath; // Resolved absolute path to executable.
+
+            uintptr_t entry; // Program entry point.
+            uintptr_t lnbase; // Load base for interpreter.
+            uintptr_t phdraddr; // Program header address.
+        };
+
+        // Prepare userspace stack for ELF executable. stacktop is the HHDM mapped top, while virttop is the virtual mapped top.
+        void *preparestack(uintptr_t stacktop, struct header *elfhdr, uintptr_t virttop, struct execinfo *info);
         char *getinterpreter(struct header *hdr, NFS::VFS::INode *node);
         bool loadfile(struct header *hdr, NFS::VFS::INode *node, struct NArch::VMM::addrspace *space, void **entry, uintptr_t base, uintptr_t *phdraddr);
     }

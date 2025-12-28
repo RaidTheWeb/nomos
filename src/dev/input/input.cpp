@@ -112,6 +112,8 @@ namespace NDev {
         int registerdevice(Device *dev) {
             devlock.acquire();
 
+            devices.push(dev); // Register device, so handlers can find it later, if needed.
+
             dev->evsupported |= event::type::SYN; // All devices should accept basic synchronisation events.
 
             NLib::DoubleList<struct eventhandler *>::Iterator it = handlers.begin();
@@ -133,7 +135,7 @@ namespace NDev {
             size_t count = 0;
             while (it.valid()) {
 
-                if (attachhandler(*it.get(), handler)) { // Attempt to add
+                if (attachhandler(*it.get(), handler)) { // Attempt to add.
                     count++;
                 }
 
@@ -143,7 +145,7 @@ namespace NDev {
             handlers.push(handler);
 
             devlock.release();
-            return count > 0 ? 0 : -ENODEV; // ENODEV is non-fatal.
+            return count > 0 ? 0 : -ENODEV; // ENODEV is non-fatal, the device may be added later.
         }
     }
 }

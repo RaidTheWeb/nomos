@@ -967,7 +967,10 @@ namespace NSched {
                 } else { // Normal exit.
                     proc->exitstatus = (status & 0xff) << 8;
                 }
+            }
 
+            if (proc->fdtable) {
+                proc->fdtable->closeall(); // Close so we can be done with files asap.
             }
         }
 
@@ -1769,13 +1772,13 @@ namespace NSched {
             delete[] pathbuf;
             SYSCALL_RET(ret);
         }
-        delete[] pathbuf;
 
         // Check permission against EUID/EGID.
         if (!NFS::VFS::vfs->checkaccess(inode, NFS::VFS::O_EXEC, euid, egid)) {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             SYSCALL_RET(-EACCES);
         }
 
@@ -1787,6 +1790,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             SYSCALL_RET(-ENOEXEC);
         }
 
@@ -1800,6 +1804,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             SYSCALL_RET(-ENOEXEC);
         }
 
@@ -1807,6 +1812,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             SYSCALL_RET(-ENOEXEC);
         }
 
@@ -1814,6 +1820,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             SYSCALL_RET(-ENOEXEC);
         }
 
@@ -1838,6 +1845,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             delete newspace;
             SYSCALL_RET(-ENOEXEC);
         }
@@ -1855,6 +1863,7 @@ namespace NSched {
                 inode->unref();
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
+                delete[] pathbuf;
                 delete newspace;
                 SYSCALL_RET(r);
             }
@@ -1866,6 +1875,7 @@ namespace NSched {
                 interpnode->unref();
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
+                delete[] pathbuf;
                 delete newspace;
                 SYSCALL_RET(-ENOEXEC);
             }
@@ -1875,6 +1885,7 @@ namespace NSched {
                 interpnode->unref();
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
+                delete[] pathbuf;
                 delete newspace;
                 SYSCALL_RET(-ENOEXEC);
             }
@@ -1886,6 +1897,7 @@ namespace NSched {
                 interpnode->unref();
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
+                delete[] pathbuf;
                 delete newspace;
                 SYSCALL_RET(-ENOEXEC);
             }
@@ -1896,6 +1908,7 @@ namespace NSched {
                 inode->unref();
                 freeargsenvs(aargv, argc);
                 freeargsenvs(aenvp, envc);
+                delete[] pathbuf;
                 delete newspace;
                 SYSCALL_RET(-ENOEXEC);
             }
@@ -1905,6 +1918,7 @@ namespace NSched {
             inode->unref();
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             delete newspace;
             SYSCALL_RET(-ENOEXEC);
         }
@@ -1918,6 +1932,7 @@ namespace NSched {
         if (!ustackphy) {
             freeargsenvs(aargv, argc);
             freeargsenvs(aenvp, envc);
+            delete[] pathbuf;
             delete newspace;
             SYSCALL_RET(-ENOMEM);
         }
@@ -1925,9 +1940,44 @@ namespace NSched {
         uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Top of user space, minus a page for safety.
         uintptr_t ustackbottom = ustacktop - (1 << 20); // Virtual address of bottom of user stack (where ustackphy starts).
 
-        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), aargv, aenvp, &elfhdr, ustacktop, (uintptr_t)ent, interpbase, phdraddr);
+        struct NSys::ELF::execinfo einfo;
+        NLib::memset(&einfo, 0, sizeof(einfo));
+        einfo.argv = aargv;
+        einfo.envp = aenvp;
+        einfo.execpath = pathbuf;
+        einfo.entry = (uintptr_t)ent; // Executable's entry point. NOT interpreter entry point, EVER.
+        einfo.lnbase = interpbase;
+        einfo.phdraddr = phdraddr;
+
+        NSys::Random::EntropyPool *pool = CPU::get()->entropypool;
+        uint8_t randbuf[16];
+        pool->getrandom(randbuf, sizeof(randbuf), false, false); // Non-blocking, urandom source.
+        NLib::memcpy(einfo.random, randbuf, sizeof(randbuf));
+
+        current->lock.acquire();
+
+        einfo.uid = current->uid;
+        einfo.gid = current->gid;
+
+        if (NFS::VFS::S_ISSUID(attr.st_mode)) {
+            current->euid = attr.st_uid; // Run as owner of file.
+            einfo.secure = true; // SUID programs are "secure" executables.
+        }
+
+        if (NFS::VFS::S_ISSGID(attr.st_mode)) {
+            current->egid = attr.st_gid; // Run as owner of file.
+            einfo.secure = true; // SGID programs are "secure" executables.
+        }
+
+        einfo.euid = current->euid;
+        einfo.egid = current->egid;
+
+        current->lock.release();
+
+        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), &elfhdr, ustacktop, &einfo);
         freeargsenvs(aargv, argc);
         freeargsenvs(aenvp, envc);
+        delete[] pathbuf; // Clean up path after preparestack copies it.
 
         if (!rsp) {
             PMM::free((void *)ustackphy, 1 << 20);
@@ -1949,14 +1999,6 @@ namespace NSched {
 
         // Mark that this process has called execve.
         current->hasexeced = true;
-
-        if (NFS::VFS::S_ISSUID(attr.st_mode)) {
-            current->euid = attr.st_uid; // Run as owner of file.
-        }
-
-        if (NFS::VFS::S_ISSGID(attr.st_mode)) {
-            current->egid = attr.st_gid; // Run as owner of file.
-        }
 
         // "The effective UID of the process is copied to the saved set-user-ID"
         current->suid = current->euid;
@@ -2324,13 +2366,201 @@ namespace NSched {
         long tv_nsec;
     };
 
-    #define FUTEX_WAIT      0
-    #define FUTEX_WAKE      1
+    #define FUTEX_WAIT          0
+    #define FUTEX_WAKE          1
+    #define FUTEX_PRIVATE_FLAG  128
+    #define FUTEX_CMD_MASK      (~FUTEX_PRIVATE_FLAG)
+
+    struct futexentry {
+        WaitQueue wq;
+        size_t waiters; // Number of threads waiting on this futex.
+    };
+
+    // Key is physical address of futex! Pretty neat, actually, since shared memory works correctly.
+    static NLib::KVHashMap<uintptr_t, struct futexentry *> *futextable = NULL;
+    static NArch::IRQSpinlock futexlock;
+
+    // Get or create a futex entry for a given physical address.
+    static struct futexentry *futexget(uintptr_t phys) {
+        struct futexentry **entry = futextable->find(phys);
+        if (entry) {
+            return *entry;
+        }
+
+        // Create a new futex entry.
+        struct futexentry *newentry = new struct futexentry;
+        newentry->waiters = 0;
+        futextable->insert(phys, newentry);
+        return newentry;
+    }
+
+    // Remove futex entry if no more waiters.
+    static void futexput(uintptr_t phys, struct futexentry *entry) {
+        if (entry->waiters == 0) {
+            futextable->remove(phys);
+            delete entry;
+        }
+    }
+
+    // Wait state for sleep()-like interruptible wake with timeout.
+    struct futexwaitstate {
+        WaitQueue *wq;
+        bool completed;
+        NArch::Spinlock lock;
+    };
+
+    // Timer callback for futex timeout.
+    static void futextimeoutwork(void *arg) {
+        struct futexwaitstate *state = (struct futexwaitstate *)arg;
+
+        state->lock.acquire();
+        if (!state->completed) {
+            state->completed = true;
+            state->lock.release();
+            state->wq->wakeone(); // Wake the sleeping thread.
+        } else {
+            // Thread was already woken. Cleanup.
+            state->lock.release();
+            delete state;
+        }
+    }
 
     extern "C" ssize_t sys_futex(int *ptr, int op, int expected, struct timespec *timeout) {
-        SYSCALL_LOG("sys_futex(%p, %d, %u, %p).\n", ptr, op, expected, timeout);
+        SYSCALL_LOG("sys_futex(%p, %d, %d, %p).\n", ptr, op, expected, timeout);
 
-        SYSCALL_RET(0); // TODO: Implement futexes.
+        // Lazily initialize the futex table.
+        if (!futextable) {
+            futexlock.acquire();
+            if (!futextable) {
+                futextable = new NLib::KVHashMap<uintptr_t, struct futexentry *>();
+            }
+            futexlock.release();
+        }
+
+        // Validate pointer.
+        if (!ptr || !NMem::UserCopy::valid(ptr, sizeof(int))) {
+            SYSCALL_RET(-EFAULT);
+        }
+
+        // Get physical address for futex key (shared memory works correctly).
+        Process *proc = NArch::CPU::get()->currthread->process;
+        uintptr_t phys = NArch::VMM::virt2phys(proc->addrspace, (uintptr_t)ptr);
+        if (phys == 0) {
+            SYSCALL_RET(-EFAULT);
+        }
+
+        int cmd = op & FUTEX_CMD_MASK;
+
+        switch (cmd) {
+            case FUTEX_WAIT: {
+                // Copy timeout from userspace if provided.
+                uint64_t timeoutms = 0;
+                bool hastimeout = false;
+                if (timeout) {
+                    struct timespec ktimeout;
+                    if (NMem::UserCopy::copyfrom(&ktimeout, timeout, sizeof(struct timespec)) < 0) {
+                        SYSCALL_RET(-EFAULT);
+                    }
+                    if (ktimeout.tv_sec < 0 || ktimeout.tv_nsec < 0 || ktimeout.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
+                        SYSCALL_RET(-EINVAL);
+                    }
+                    // Convert to milliseconds, rounding up.
+                    timeoutms = (uint64_t)ktimeout.tv_sec * NSys::Clock::MSEC_PER_SEC;
+                    timeoutms += (ktimeout.tv_nsec + 999999) / 1000000;
+                    hastimeout = true;
+                }
+
+                futexlock.acquire();
+                struct futexentry *entry = futexget(phys);
+
+                // Atomically check the futex value.
+                int currentval;
+                if (NMem::UserCopy::copyfrom(&currentval, ptr, sizeof(int)) < 0) {
+                    futexput(phys, entry);
+                    futexlock.release();
+                    SYSCALL_RET(-EFAULT);
+                }
+
+                if (currentval != expected) {
+                    futexput(phys, entry);
+                    futexlock.release();
+                    SYSCALL_RET(-EAGAIN);
+                }
+
+                entry->waiters++;
+                futexlock.release();
+
+                int ret = 0;
+
+                if (hastimeout && timeoutms > 0) {
+                    // Wait with timeout.
+                    struct futexwaitstate *state = new struct futexwaitstate;
+                    state->wq = &entry->wq;
+                    state->completed = false;
+
+                    NSys::Timer::timerlock();
+                    NSys::Timer::create(futextimeoutwork, state, timeoutms);
+                    NSys::Timer::timerunlock();
+
+                    ret = entry->wq.waitinterruptible();
+
+                    // Check if we timed out or were woken.
+                    state->lock.acquire();
+                    if (!state->completed) {
+                        // We were woken (by wake or signal), mark completed so timer cleans up.
+                        state->completed = true;
+                        state->lock.release();
+                    } else {
+                        // Timer expired and woke us. This is a timeout.
+                        state->lock.release();
+                        delete state;
+                        if (ret == 0) {
+                            ret = -ETIMEDOUT;
+                        }
+                    }
+                } else if (hastimeout && timeoutms == 0) {
+                    // Zero timeout means don't wait at all.
+                    ret = -ETIMEDOUT;
+                } else {
+                    // Wait without timeout.
+                    ret = entry->wq.waitinterruptible();
+                }
+
+                futexlock.acquire();
+                entry->waiters--;
+                futexput(phys, entry);
+                futexlock.release();
+
+                SYSCALL_RET(ret);
+            }
+
+            case FUTEX_WAKE: {
+                futexlock.acquire();
+                struct futexentry **entryptr = futextable->find(phys);
+                if (!entryptr) {
+                    futexlock.release();
+                    SYSCALL_RET(0); // No waiters.
+                }
+
+                struct futexentry *entry = *entryptr;
+                int woken = 0;
+                int towake = expected; // 'expected' is actually the count for FUTEX_WAKE.
+
+                size_t actualwaiters = entry->waiters;
+                while (towake > 0 && actualwaiters > 0) {
+                    entry->wq.wakeone(); // Wake up whatever we can.
+                    woken++;
+                    towake--;
+                    actualwaiters--;
+                }
+
+                futexlock.release();
+                SYSCALL_RET(woken);
+            }
+
+            default:
+                SYSCALL_RET(-ENOSYS);
+        }
     }
 
     extern "C" ssize_t sys_newthread(void *entry, void *stack) {

@@ -5,6 +5,7 @@
 #include <arch/x86_64/panic.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/stacktrace.hpp>
+#include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <fs/vfs.hpp>
 #include <lib/align.hpp>
@@ -90,6 +91,16 @@ namespace NArch {
         extern "C" void isr_handle(uint64_t vec, struct CPU::context *ctx) {
             struct isr *isr = &CPU::get()->isrtable[vec];
             CPU::get()->intstatus = false;
+
+            if (NArch::CPU::get()->intcntr == __SIZE_MAX__) {
+                NArch::CPU::get()->intcntr = 0; // Handle wraparound. We do not care about intcntr for statistics purposes, only for ratelimiting.
+            }
+
+            if (NArch::CPU::get()->entropypool != NULL && (++NArch::CPU::get()->intcntr % 100) == 0) {
+                uint64_t tsc = TSC::query();
+                uint64_t seed = vec ^ tsc ^ (tsc >> 32); // Combine vector and TSC for some entropy.
+                NArch::CPU::get()->entropypool->addentropy((uint8_t *)&seed, sizeof(seed), 1);
+            }
 
             if (isr->func != NULL) { // If this ISR has been allocated.
 

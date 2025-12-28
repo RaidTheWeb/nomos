@@ -247,6 +247,7 @@ namespace NDev {
                 writecmd(0xad); // Disable PS/2 port 1.
                 writecmd(0xa7); // Disable PS/2 port 2.
 
+                // Pull out any pending data.
                 while (NArch::inb(CMDPORT) & (1 << 0)) {
                     NArch::inb(DATAPORT);
                 }

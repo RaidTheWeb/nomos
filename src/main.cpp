@@ -4,6 +4,7 @@
 #include <arch/limine/module.hpp>
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/arch.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/serial.hpp>
 #include <backends/fb.h>
 #include <flanterm.h>
@@ -100,7 +101,6 @@ void kpostarch(void) {
 
     NFS::VFS::vfs->mount(NULL, "/dev", "devfs", 0, NULL); // Mount devfs at /dev.
 
-
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE1) {
             NUtil::printf("[nomos]: Discovered stage 1 driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
@@ -108,6 +108,8 @@ void kpostarch(void) {
             entry->instance = entry->create();
         }
     }
+
+    NSys::Random::init(); // Initialise system random number generator.
 
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE2) {
@@ -172,9 +174,29 @@ void kpostarch(void) {
 
     char *argv[] = { (char *)"/bin/init", NULL };
 
+    struct NSys::ELF::execinfo einfo;
+    NLib::memset(&einfo, 0, sizeof(einfo));
+    einfo.argv = argv;
+    einfo.envp = NULL;
+    einfo.entry = (uintptr_t)ent;
+    einfo.lnbase = 0;
+    einfo.phdraddr = phdr;
+
+    einfo.secure = true; // Init process is secure.
+    einfo.uid = 0;
+    einfo.euid = 0;
+    einfo.gid = 0;
+    einfo.egid = 0;
+
+    NSys::Random::EntropyPool *pool = NArch::CPU::get()->entropypool;
+    assert(pool, "CPU entropy pool is NULL.\n");
+    uint8_t randbuf[16];
+    pool->getrandom(randbuf, sizeof(randbuf), false, false); // Non-blocking, urandom source.
+    NLib::memcpy(einfo.random, randbuf, sizeof(randbuf));
+
     // We pass in the hhdm-offset physical stack top. The user will be given the mapped version.
     //void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
-    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), argv, NULL, &elfhdr, ustacktop, (uintptr_t)ent, 0, phdr);
+    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), &elfhdr, ustacktop, &einfo);
     assert(rsp, "Stack alignment failed.\n");
 
     // Reserve stack location. We don't want to end up allocating into the stack region on requests for virtual memory.

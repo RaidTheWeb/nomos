@@ -568,6 +568,40 @@ namespace NFS {
             return node;
         }
 
+        ssize_t Ext4Node::setsymlinkdata(const char *target, size_t len) {
+            if (!VFS::S_ISLNK(this->attr.st_mode)) {
+                return -EINVAL;
+            }
+
+            if (len < sizeof(this->diskino.block)) { // Short symlinks can be stored inline.
+                NLib::ScopeSpinlock guard(&this->metalock);
+
+                // Clear the extent flag since we're using inline storage.
+                this->diskino.flags &= ~EXT4_EXTENTSFL;
+
+                // Clear the block array and copy target.
+                NLib::memset(this->diskino.block, 0, sizeof(this->diskino.block));
+                NLib::memcpy(this->diskino.block, (void *)target, len);
+
+                // Set size.
+                this->diskino.sizelo = len;
+                this->diskino.sizethi = 0;
+                this->attr.st_size = len;
+                this->attr.st_blocks = 0;
+
+                // Write the inode back to disk.
+                this->touchtime(true, true, false);
+                int res = this->writeback();
+                if (res < 0) {
+                    return res;
+                }
+                return len;
+            }
+
+            // For longer symlinks, use the regular write path (extent-based).
+            return this->write(target, len, 0, 0);
+        }
+
         int Ext4Node::readpage(NMem::CachePage *page) {
             if (!VFS::S_ISREG(this->attr.st_mode)) {
                 return -EINVAL; // Only regular files use page cache.

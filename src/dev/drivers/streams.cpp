@@ -1,3 +1,8 @@
+
+#ifdef __x86_64__
+#include <arch/x86_64/cpu.hpp>
+#endif
+
 #include <dev/dev.hpp>
 #include <dev/input/input.hpp>
 #include <fs/devfs.hpp>
@@ -5,13 +10,11 @@
 #include <sched/sched.hpp>
 #include <std/stddef.h>
 #include <sys/clock.hpp>
+#include <sys/random.hpp>
 
 namespace NDev {
 
     using namespace NFS;
-
-    static struct Input::eventhandler handler;
-    static uint64_t entropy = 0;
 
     class StreamDriver : public DevDriver {
         private:
@@ -59,25 +62,6 @@ namespace NDev {
                 st.st_rdev = DEVFS::makedev(MAJOR, URANDOMMINOR);
                 VFS::vfs->create("/dev/urandom", &devnode, st);
                 devnode->unref();
-
-                handler.connect = NULL;
-                handler.disconnect = NULL;
-                handler.evsubscription = Input::event::KEY; // XXX: As we get new events, they should be crammed into entropy.
-                handler.event = event;
-                Input::registerhandler(&handler);
-            }
-
-            static void event(uint64_t tmstmp, uint16_t type, uint16_t code, int32_t value) {
-                (void)type;
-                (void)code;
-                (void)value;
-                // XXX: This is abysmal.
-
-                entropy ^= tmstmp;
-                struct NSys::Clock::timespec ts;
-                NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC)->gettime(&ts);
-                entropy ^= ts.tv_nsec;
-                entropy ^= (entropy << 5) | (entropy >> 7);
             }
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {
@@ -94,18 +78,18 @@ namespace NDev {
                         NLib::memset(buf, 0, count); // Reading device simply wants us to fill the buffer with zeroes.
                         return count;
                     }
-                    case RANDOMMINOR: // XXX: /dev/random is supposed to use an "entropy pool". How fancy.
-                    case URANDOMMINOR: {
-                        uint8_t *cbuf = (uint8_t *)buf;
-                        for (size_t i = 0; i < count; i++) {
-                            // XXX: By no means even remotely secure.
-                            // It's just a random number seeded by input events, and that's all I need it to be.
-                            entropy ^= (entropy << 13);
-                            entropy ^= (entropy >> 7);
-                            entropy ^= (entropy << 17);
-                            cbuf[i] = (uint8_t)(entropy & 0xff);
+                    case RANDOMMINOR: // /dev/random uses blocking and limited by entropy.
+                    case URANDOMMINOR: { // /dev/urandom is non-blocking and not limited by entropy.
+                        bool blocking = (minor == RANDOMMINOR); // /dev/random is blocking, /dev/urandom is non-blocking.
+                        bool randomsource = (minor == RANDOMMINOR); // /dev/random limits by available entropy.
+
+                        if (!NMem::UserCopy::valid(buf, count)) {
+                            return -EFAULT;
                         }
-                        return count;
+
+                        NSys::Random::EntropyPool *pool = NArch::CPU::get()->entropypool;
+                        ssize_t ret = pool->getrandom((uint8_t *)buf, count, blocking, randomsource);
+                        return ret; // Return actual bytes read (may be less than count for /dev/random).
                     }
 
                     default:

@@ -193,6 +193,19 @@ namespace NArch {
                 }
             }
 
+            if (ecx & (1 << 30)) {
+                CPU::get()->hasrdrand = true;
+            }
+
+            asm volatile(
+                "cpuid"
+                : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                : "a"(7), "c"(0)
+            );
+            if (ebx & (1 << 18)) {
+                CPU::get()->hasrdseed = true;
+            }
+
             struct cpulocal *local = CPU::get();
 
             __atomic_store_n(&local->tlblocal.pending, false, memory_order_seq_cst);

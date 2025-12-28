@@ -346,7 +346,7 @@ namespace NSched {
             while (it.valid()) {
                 Process *proc = *it.get();
                 proc->lock.acquire();
-                if (uid != 0 && (uid != proc->uid || uid != proc->suid || gid != proc->gid || gid != proc->sgid)) {
+                if (uid != 0 && uid != proc->uid && uid != proc->suid) {
                     proc->lock.release();
                     it.next();
                     continue;
@@ -383,7 +383,7 @@ namespace NSched {
             while (it.valid()) {
                 Process *proc = *it.get();
                 proc->lock.acquire();
-                if (uid != 0 && (uid != proc->uid || uid != proc->suid || gid != proc->gid || gid != proc->sgid)) {
+                if (uid != 0 && uid != proc->uid && uid != proc->suid) {
                     proc->lock.release();
                     it.next();
                     continue;
@@ -516,6 +516,10 @@ namespace NSched {
     extern "C" int sys_sigpending(NLib::sigset_t *set) {
         SYSCALL_LOG("sys_sigpending(%p).\n", set);
 
+        if (!set) {
+            SYSCALL_RET(-EFAULT);
+        }
+
         Thread *thread = NArch::CPU::get()->currthread;
         if (!thread) {
             SYSCALL_RET(-EINVAL);
@@ -572,6 +576,10 @@ namespace NSched {
             int ret = NMem::UserCopy::copyfrom(&newstack, ss, sizeof(struct stack_t));
             if (ret < 0) {
                 SYSCALL_RET(ret);
+            }
+
+            if (newstack.ss_flags & ~(SS_DISABLE)) {
+                SYSCALL_RET(-EINVAL);
             }
 
             // Check for SS_DISABLE flag.

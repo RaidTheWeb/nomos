@@ -113,6 +113,9 @@ namespace NFS {
                 // Resolve symbolic link to target node.
                 VFS::INode *resolvesymlink(void) override;
 
+                // Set symlink target data with inline symlink support.
+                ssize_t setsymlinkdata(const char *target, size_t len) override;
+
                 // Poll for events on this node.
                 int poll(short events, short *revents, int fdflags) override {
                     (void)fdflags;

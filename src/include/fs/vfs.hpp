@@ -483,6 +483,10 @@ namespace NFS {
                 virtual INode *resolvesymlink(void) = 0;
                 virtual ssize_t readlink(char *buf, size_t bufsize) = 0;
 
+                virtual ssize_t setsymlinkdata(const char *target, size_t len) {
+                    return this->write(target, len, 0, 0);
+                }
+
                 struct stat getattr(void) {
                     struct stat st;
                     this->stat(&st);
@@ -747,7 +751,7 @@ namespace NFS {
                 void reserve(int fd, INode *node, int flags);
 
                 int open(INode *node, int flags);
-                int close(int fd);
+                int close(int fd); // Close fd and call INode::close() if last reference.
 
                 int dup(int oldfd);
                 int dup2(int oldfd, int newfd, bool fcntl = false);

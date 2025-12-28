@@ -45,11 +45,24 @@ namespace NSys {
             return true;
         }
 
-        void *preparestack(uintptr_t stacktop, char **argv, char **envp, struct header *elfhdr, uintptr_t virttop, uintptr_t entry, uintptr_t lnbase, uintptr_t phdraddr) {
+        void *preparestack(uintptr_t stacktop, struct header *elfhdr, uintptr_t virttop, struct execinfo *info) {
+
+            char **argv = info->argv;
+            char **envp = info->envp;
+            const char *execpath = info->execpath;
+
+            uintptr_t entry = info->entry;
+            uintptr_t lnbase = info->lnbase;
+            uintptr_t phdraddr = info->phdraddr;
+
+            bool secure = info->secure;
+            uint64_t *random = info->random;
+
             size_t argc = 0;
             size_t argvsize = 0;
             size_t envc = 0;
             size_t envpsize = 0;
+            size_t execpathsize = 0;
 
             while (argv[argc]) { // Read until NULL is reached in argv.
                 argvsize += NLib::strlen(argv[argc++]) + 1;
@@ -61,12 +74,9 @@ namespace NSys {
                 }
             }
 
-            static uint64_t rngseed = 0x5deece66d;
-            uint64_t randdata[2];
-            rngseed = (rngseed * 0x5deece66dULL + 0xbULL) & ((1ULL << 48) - 1);
-            randdata[0] = rngseed ^ (uintptr_t)argv ^ (uintptr_t)envp;
-            rngseed = (rngseed * 0x5deece66dULL + 0xbULL) & ((1ULL << 48) - 1);
-            randdata[1] = rngseed ^ entry ^ phdraddr;
+            if (execpath) {
+                execpathsize = NLib::strlen(execpath) + 1;
+            }
 
             // XXX: Integrate with /dev/random entropy "pool" at some point.
 
@@ -79,7 +89,11 @@ namespace NSys {
                 { auxvtype::RAND, 0 }, // Placeholder, will be set to point to random data on stack.
                 { auxvtype::EXECFN, 0 }, // Placeholder, will set below.
                 { auxvtype::ENTRY, entry },
-                { auxvtype::SECURE, 0 },
+                { auxvtype::SECURE, secure ? 1 : 0 },
+                { auxvtype::UID, info->uid },
+                { auxvtype::EUID, info->euid },
+                { auxvtype::GID, info->gid },
+                { auxvtype::EGID, info->egid },
                 { 0, 0 } // NULL entry terminator - MUST BE LAST
             };
             size_t auxvsize = sizeof(auxv);
@@ -91,6 +105,7 @@ namespace NSys {
 
             totalsize += argvsize;
             totalsize += envpsize;
+            totalsize += execpathsize;
             totalsize += auxvsize;
             totalsize += 16; // 16 bytes for AT_RANDOM data.
 
@@ -114,7 +129,7 @@ namespace NSys {
 
             // Place random data on stack for AT_RANDOM.
             uintptr_t randoff = stackptr;
-            NLib::memcpy((void *)randoff, randdata, 16);
+            NLib::memcpy((void *)randoff, random, 16); // Copy 16 bytes of random data.
             stackptr += 16;
 
             for (size_t i = 0; i < argc; i++) {
@@ -126,10 +141,22 @@ namespace NSys {
             }
             ((uint64_t *)argvptrs)[argc] = NULL; // NULL terminator.
 
+            // Place execpath on stack for AT_EXECFN.
+            uintptr_t execpathoff = stackptr;
+            if (execpath && execpathsize > 0) {
+                NLib::memcpy((void *)stackptr, (void *)execpath, execpathsize);
+                stackptr += execpathsize;
+            }
+
             // Point AT_RAND to the random data on stack (virtual address).
             auxv[5].value = virttop - (stacktop - randoff);
-            // Point AT_EXECFN to argv[0] location.
-            auxv[6].value = ((uint64_t *)argvptrs)[0];
+            // Point AT_EXECFN to the resolved executable path on stack.
+            if (execpath && execpathsize > 0) {
+                auxv[6].value = virttop - (stacktop - execpathoff);
+            } else {
+                // Fallback to argv[0] if no execpath provided.
+                auxv[6].value = ((uint64_t *)argvptrs)[0];
+            }
 
             NLib::memcpy((void *)auxvoff, auxv, auxvsize); // Copy auxiliary vector.
 
@@ -291,14 +318,14 @@ namespace NSys {
                         NLib::aligndown(vaddr, NArch::PAGESIZE),
                         NLib::alignup(vaddr + phdrs[i].msize, NArch::PAGESIZE),
                         NMem::Virt::VIRT_USER |
-                        (phdrs[i].flags & flag::ELF_EXEC ? 0 : NMem::Virt::VIRT_NX) |
-                        (phdrs[i].flags & flag::ELF_WRITE ? NMem::Virt::VIRT_RW : 0)
+                        (phdrs[i].flags & flag::EF_EXEC ? 0 : NMem::Virt::VIRT_NX) |
+                        (phdrs[i].flags & flag::EF_WRITE ? NMem::Virt::VIRT_RW : 0)
                     );
 
                     if(!NArch::VMM::maprange(space, vaddr, (uintptr_t)phys,
                         NArch::VMM::PRESENT | NArch::VMM::USER |
-                        (phdrs[i].flags & flag::ELF_EXEC ? 0 : NArch::VMM::NOEXEC) |
-                        (phdrs[i].flags & flag::ELF_WRITE ? NArch::VMM::WRITEABLE : 0),
+                        (phdrs[i].flags & flag::EF_EXEC ? 0 : NArch::VMM::NOEXEC) |
+                        (phdrs[i].flags & flag::EF_WRITE ? NArch::VMM::WRITEABLE : 0),
                         phdrs[i].msize
                     )) {
                         // Failed to map. Free physical memory.

@@ -199,7 +199,7 @@ namespace NFS {
             }
             VFS::VFS *vfs = this->fs->getvfs();
             VFS::INode *node;
-            ssize_t res = vfs->resolve(this->symlinktarget, &node, this, false);
+            ssize_t res = vfs->resolve(this->symlinktarget, &node, this->getparent(), false);
             if (res < 0) {
                 return NULL;
             }

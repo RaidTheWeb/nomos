@@ -67,6 +67,8 @@ extern sys_msync
 extern sys_mount
 extern sys_umount
 extern sys_rename
+extern sys_symlink
+extern sys_getrandom
 
 MAXSYSCALLS equ 256
 
@@ -137,6 +139,8 @@ syscall_table:
     dq sys_mount
     dq sys_umount
     dq sys_rename
+    dq sys_symlink
+    dq sys_getrandom
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

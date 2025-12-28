@@ -205,19 +205,32 @@ namespace NFS {
             this->datalock.acquire();
 
             if (!VFS::S_ISLNK(this->attr.st_mode)) {
+                this->datalock.release();
                 return NULL; // Non-symbolic links cannot resolve to node.
             }
 
             if (!this->attr.st_size) {
+                this->datalock.release();
                 return NULL; // Resolving empty symbolic link.
             }
+
+            // Create a null-terminated copy of the symlink target.
+            size_t linklen = this->attr.st_size;
+            char *linktarget = new char[linklen + 1];
+            if (!linktarget) {
+                this->datalock.release();
+                return NULL;
+            }
+            NLib::memcpy(linktarget, this->data, linklen);
+            linktarget[linklen] = '\0';
 
             VFS::VFS *vfs = this->fs->getvfs();
 
             // Attempt to resolve the node our data points to. Uses normal resolution function, but it doesn't attempt to resolve symbolic links (we don't want any crazy recursion).
             VFS::INode *node = NULL;
-            ssize_t res = vfs->resolve((const char *)this->data, &node, this->getparent(), false);
+            ssize_t res = vfs->resolve(linktarget, &node, this->getparent(), false);
             this->datalock.release();
+            delete[] linktarget;
             if (res < 0) {
                 return NULL;
             }

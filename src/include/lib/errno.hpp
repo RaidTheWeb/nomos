@@ -44,6 +44,7 @@
 #define ENOMSG          42
 #define EIDRM           43
 #define EOVERFLOW       75
+#define ETIMEDOUT       110
 
 constexpr const char *strerror(int errnum) {
     switch (errnum) {
@@ -91,6 +92,7 @@ constexpr const char *strerror(int errnum) {
         case ENOMSG: return "No message of desired type";
         case EIDRM: return "Identifier removed";
         case EOVERFLOW: return "Value too large for defined data type";
+        case ETIMEDOUT: return "Connection timed out";
         default: return "Unknown error";
     }
 }

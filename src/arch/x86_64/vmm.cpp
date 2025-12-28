@@ -595,6 +595,11 @@ namespace NArch {
                     SYSCALL_RET(-EBADF);
                 }
 
+                // POSIX: offset must be page-aligned for file-backed mappings.
+                if ((uintptr_t)off % PAGESIZE != 0) {
+                    SYSCALL_RET(-EINVAL);
+                }
+
                 filedesc = proc->fdtable->get(fd);
                 if (!filedesc) {
                     SYSCALL_RET(-EBADF);

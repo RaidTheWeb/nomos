@@ -7,6 +7,7 @@
 #include <lib/string.hpp>
 #include <sched/sched.hpp>
 #include <stdint.h>
+#include <sys/random.hpp>
 
 
 namespace NArch {
@@ -61,6 +62,19 @@ namespace NArch {
 
         static inline void wrcr4(uint64_t val) {
             asm volatile("mov %0, %%cr4" : : "r"(val) : "memory");
+        }
+
+        // Read from RDRAND. Returns true on success, false on failure.
+        static inline bool rdrand(uint64_t *out) {
+            uint8_t ok;
+            asm volatile("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok));
+            return ok;
+        }
+
+        static inline bool rdseed(uint64_t *out) {
+            uint8_t ok;
+            asm volatile("rdseed %0; setc %1" : "=r"(*out), "=qm"(ok));
+            return ok;
         }
 
         static const uint32_t MSRAPICBASE   = 0x0000001b;
@@ -138,6 +152,11 @@ namespace NArch {
             size_t fpusize = 0; // Size of FPU storage. Determines how FPU storage will be allocated when needed.
             bool hasxsave = false; // Does this CPU support XSAVE? (AVX-* systems).
             uint64_t xsavemask = 0;
+
+            bool hasrdrand = false; // Does this CPU support RDRAND?
+            bool hasrdseed = false; // Does this CPU support RDSEED?
+            NSys::Random::EntropyPool *entropypool = NULL; // Per-CPU entropy pool.
+            size_t intcntr = 0; // Count of interrupts handled, for random seeding rate limiting.
 
             bool preemptdisabled = true; // Is preemption disabled on this CPU?
 

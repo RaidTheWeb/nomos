@@ -2,6 +2,7 @@
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/e9.hpp>
+#include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
 
@@ -440,6 +441,12 @@ retry_submit:
 
         // Wait for completion on CQ (extracted to helper for IRQ transition)
         int ioresult = waitio(pending);
+
+        // Seed random from timestamp.
+    #ifdef __x86_64__
+        uint64_t tsc = NArch::TSC::query();
+        NArch::CPU::get()->entropypool->addentropy((uint8_t *)&tsc, sizeof(tsc), 1);
+     #endif
 
         if (prplistaddr) { // Clean up PRP list if we allocated one.
             freeprplist(prplistaddr, buffer, size);

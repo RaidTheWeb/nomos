@@ -258,40 +258,44 @@ namespace NSys {
 
         extern "C" int sys_clock(int clockop, enum id id, struct timespec *ts) {
             SYSCALL_LOG("sys_clock(%d, %d, %p).\n", clockop, id, ts);
+
+            if (!ts) {
+                SYSCALL_RET(-EFAULT);
+            }
+
             Clock *clk = getclock(id);
             if (!clk) {
                 SYSCALL_RET(-EINVAL);
             }
 
-            struct timespec kts;
-            ssize_t res = NMem::UserCopy::copyfrom(&kts, ts, sizeof(struct timespec));
-            if (res < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
+            struct timespec kts = {};
+            ssize_t res;
 
             switch (clockop) {
                 case CLOCK_GETRES:
                     res = clk->getres(&kts);
-                    break;
+                    if (res < 0) {
+                        SYSCALL_RET(res);
+                    }
+                    res = NMem::UserCopy::copyto(ts, &kts, sizeof(struct timespec));
+                    SYSCALL_RET(res < 0 ? -EFAULT : 0);
                 case CLOCK_GET:
                     res = clk->gettime(&kts);
-                    break;
+                    if (res < 0) {
+                        SYSCALL_RET(res);
+                    }
+                    res = NMem::UserCopy::copyto(ts, &kts, sizeof(struct timespec));
+                    SYSCALL_RET(res < 0 ? -EFAULT : 0);
                 case CLOCK_SET:
+                    res = NMem::UserCopy::copyfrom(&kts, ts, sizeof(struct timespec));
+                    if (res < 0) {
+                        SYSCALL_RET(-EFAULT);
+                    }
                     res = clk->settime(&kts);
-                    break;
+                    SYSCALL_RET(res);
                 default:
-                    res = -EINVAL;
-                    break;
+                    SYSCALL_RET(-EINVAL);
             }
-
-
-            if (res < 0) {
-                SYSCALL_RET(res);
-            }
-
-            res = NMem::UserCopy::copyto(ts, &kts, sizeof(struct timespec));
-
-            SYSCALL_RET(res);
         }
     }
 }

@@ -964,13 +964,18 @@ namespace NFS {
                 return -EBADF;
             }
 
-            if (this->fds[fd]->unref() == 0) {
-                delete this->fds[fd];
+            FileDescriptor *desc = this->fds[fd];
+            int res = 0;
+            if (desc->unref() == 0) {
+                INode *node = desc->getnode();
+                res = node->close(desc->getflags());
+                node->unref();
+                delete desc;
             }
             this->fds[fd] = NULL;
             this->openfds.clear(fd); // Mark as unallocated.
-            this->closeonexec.clear(fd); // Mark as unallocated. If this was never set in the first place, nothing changes.
-            return 0; // All went well.
+            this->closeonexec.clear(fd); // Mark as unallocated.
+            return res;
         }
 
         int FileDescriptorTable::dup(int oldfd) {
@@ -1074,17 +1079,20 @@ namespace NFS {
                 }
             }
 
-            bool stdstream = (newfd == NSched::STDIN_FILENO) || (newfd == NSched::STDOUT_FILENO) || (newfd == NSched::STDERR_FILENO);
-
-            if (this->openfds.test(newfd) && !stdstream) { // Don't bother closing original file descriptor if its a standard stream.
-                if (this->fds[newfd]->unref() == 0) { // Decrement reference within our table.
-                    delete fds[newfd];
+            if (this->openfds.test(newfd)) { // Close the existing descriptor if open.
+                FileDescriptor *olddesc = this->fds[newfd];
+                if (olddesc->unref() == 0) { // Decrement reference within our table.
+                    INode *node = olddesc->getnode();
+                    node->close(olddesc->getflags());
+                    node->unref();
+                    delete olddesc;
                 }
             }
 
             this->fds[newfd] = this->fds[oldfd];
             this->fds[newfd]->ref();
             this->openfds.set(newfd); // Occupy new FD.
+            this->closeonexec.clear(newfd); // dup2 clears close-on-exec per POSIX.
             return newfd;
         }
 
@@ -1110,16 +1118,10 @@ namespace NFS {
 
             for (size_t i = 0; i < this->fds.getsize(); i++) {
                 if (this->openfds.test(i)) { // There is an open FD, copy it.
-                    newtable->fds[i] = this->fds[i]; // Copy reference.
+                    newtable->fds[i] = this->fds[i]; // Copy reference to same FileDescriptor.
                     newtable->fds[i]->ref(); // Increase refcount.
                     newtable->openfds.set(i); // Mark as allocated.
 
-                    INode *node = newtable->fds[i]->getnode();
-                    if (S_ISFIFO(node->getattr().st_mode)) {
-                        // Pipes get special treatment, and need to have open called on them again to update reader/writer counts.
-                        node->open(newtable->fds[i]->getflags());
-                    }
-                    node->unref();
 
                     if (this->closeonexec.test(i)) { // If this is also marked as close on exec.
                         newtable->closeonexec.set(i); // Mark as allocated.
@@ -1163,11 +1165,10 @@ namespace NFS {
             for (size_t i = 0; i < this->closeonexec.getsize(); i++) { // Effectively the same logic as closeall(), but we only close FDs marked as close-on-exec.
                 if (this->closeonexec.test(i)) {
                     FileDescriptor *desc = this->fds[i];
-                    INode *node = desc->getnode();
-                    node->close(desc->getflags());
-                    node->unref();
-
                     if (desc->unref() == 0) {
+                        INode *node = desc->getnode();
+                        node->close(desc->getflags());
+                        node->unref();
                         delete desc;
                     }
                     this->fds[i] = NULL;
@@ -1183,11 +1184,10 @@ namespace NFS {
             for (size_t i = 0; i < this->openfds.getsize(); i++) {
                 if (this->openfds.test(i)) { // Allocated. Free associated if without reference.
                     FileDescriptor *desc = this->fds[i];
-                    INode *node = desc->getnode();
-                    node->close(desc->getflags());
-                    node->unref();
-
                     if (desc->unref() == 0) {
+                        INode *node = desc->getnode();
+                        node->close(desc->getflags());
+                        node->unref();
                         delete desc; // Delete descriptor itself if we ran out of references.
                     }
                     this->fds[i] = NULL;
@@ -1392,7 +1392,7 @@ namespace NFS {
 
             res = node->open(flags); // Trigger open hook.
             if (res < 0) {
-                proc->fdtable->close(fd); // Clean up FD table entry.
+                proc->fdtable->close(fd); // Clean up FD table entry and call INode::close().
                 node->unref();
                 SYSCALL_RET(res); // Open failed.
             }
@@ -1425,30 +1425,10 @@ namespace NFS {
                 SYSCALL_RET(-EBADF);
             }
 
-            if (fd == NSched::STDIN_FILENO || fd == NSched::STDOUT_FILENO || fd == NSched::STDERR_FILENO) {
-                SYSCALL_RET(0); // Refuse to close standard streams.
-            }
-
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
-            FileDescriptor *desc = proc->fdtable->get(fd);
-            if (!desc) {
-                SYSCALL_RET(-EBADF);
-            }
-
-            INode *node = desc->getnode();
-            int res = node->close(desc->getflags()); // Trigger close hook.
-            node->unref();
-            if (res < 0) {
-                SYSCALL_RET(res);
-            }
-
-            res = proc->fdtable->close(fd);
-            if (res < 0) {
-                SYSCALL_RET(res);
-            }
-
-            SYSCALL_RET(0);
+            int res = proc->fdtable->close(fd);
+            SYSCALL_RET(res);
         }
 
         extern "C" uint64_t sys_getdents(int fd, void *buf, size_t count) {
@@ -1514,12 +1494,25 @@ namespace NFS {
                 SYSCALL_RET(-ENOTDIR);
             }
 
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
+            // POSIX requires search (execute) permission on the directory.
+            proc->lock.acquire();
+            int uid = proc->euid;
+            int gid = proc->egid;
+            proc->lock.release();
 
-            if (proc->cwd) {
-                proc->cwd->unref(); // Unreference old CWD.
+            if (!vfs->checkaccess(node, O_EXEC, uid, gid)) {
+                node->unref();
+                SYSCALL_RET(-EACCES);
             }
+
+            proc->lock.acquire();
+            INode *oldcwd = proc->cwd;
             proc->cwd = node; // Set new CWD.
+            proc->lock.release();
+
+            if (oldcwd) {
+                oldcwd->unref(); // Unreference old CWD.
+            }
             SYSCALL_RET(0);
         }
 
@@ -1558,6 +1551,9 @@ namespace NFS {
             ssize_t res = vfs->resolve(pathbuf, &node, cwd, true);
             delete[] pathbuf;
 
+            if (cwd) {
+                cwd->unref(); // Unreference old CWD reference.
+            }
 
             if (res < 0) {
                 SYSCALL_RET(res);
@@ -1569,11 +1565,20 @@ namespace NFS {
                 SYSCALL_RET(-ENOTDIR);
             }
 
-            if (cwd) {
-                cwd->unref(); // Unreference old CWD.
+            // POSIX requires search (execute) permission on the directory.
+            if (!vfs->checkaccess(node, O_EXEC, uid, gid)) {
+                node->unref();
+                SYSCALL_RET(-EACCES);
             }
-            NLib::ScopeIRQSpinlock guard(&proc->lock);
+
+            proc->lock.acquire();
+            INode *oldcwd = proc->cwd;
             proc->cwd = node; // Set new CWD.
+            proc->lock.release();
+
+            if (oldcwd) {
+                oldcwd->unref(); // Unreference old CWD.
+            }
             SYSCALL_RET(0);
         }
 
@@ -1650,7 +1655,7 @@ namespace NFS {
                 SYSCALL_RET(ret);
             }
 
-            SYSCALL_RET((uint64_t)buf); // Return the buffer pointer on success.
+            SYSCALL_RET(pathlen + 1); // Return the length including null terminator on success.
         }
 
         extern "C" uint64_t sys_read(int fd, void *buf, size_t count) {
@@ -1825,7 +1830,7 @@ namespace NFS {
                     newoff = st.st_size + off; // Relative from end of file.
                     break;
                 default:
-                    return -EINVAL;
+                    SYSCALL_RET(-EINVAL);
             }
 
             if (newoff < 0) {
@@ -2085,13 +2090,14 @@ namespace NFS {
             SYSCALL_RET(-EBADF); // Invalid FD.
         }
 
-        extern "C" uint64_t sys_access(int fd, const char *path, size_t len, int mode) {
-            SYSCALL_LOG("sys_access(%d, %s, %lu, %d).\n", fd, path, len, mode);
+        extern "C" uint64_t sys_access(int fd, const char *path, size_t len, int mode, int flags) {
+            SYSCALL_LOG("sys_access(%d, %s, %lu, %d, %d).\n", fd, path, len, mode, flags);
 
             ssize_t pathsize = NMem::UserCopy::strnlen(path, len);
             if (pathsize < 0) {
                 SYSCALL_RET(pathsize); // Contains errno.
             }
+
             char *pathbuf = new char[pathsize + 1];
             if (!pathbuf) {
                 SYSCALL_RET(-ENOMEM);
@@ -2108,65 +2114,117 @@ namespace NFS {
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
             proc->lock.acquire();
 
-            INode *dirnode;
-            if (fd == AT_FDCWD) {
-                dirnode = proc->cwd;
-                if (!dirnode) {
-                    dirnode = vfs->getroot();
-                } else {
-                    dirnode->ref();
-                }
+            INode *dirnode = NULL;
+            if (pathbuf[0] == '/') { // Absolute path invalidates dirfd.
+                dirnode = vfs->getroot();
             } else {
-                FileDescriptor *desc = proc->fdtable->get(fd);
-                if (!desc) {
-                    delete[] pathbuf;
-                    proc->lock.release();
-                    SYSCALL_RET(-EBADF);
-                }
+                if (fd == AT_FDCWD) { // Special case: FD is CWD.
+                    dirnode = proc->cwd;
+                    if (!dirnode) { // If the process has no CWD, we use root.
+                        dirnode = vfs->getroot();
+                    } else {
+                        dirnode->ref(); // Increase reference.
+                    }
+                } else {
+                    FileDescriptor *desc = proc->fdtable->get(fd);
+                    if (!desc) {
+                        delete[] pathbuf;
+                        proc->lock.release();
+                        SYSCALL_RET(-EBADF);
+                    }
 
-                dirnode = desc->getnode();
-                if (!S_ISDIR(dirnode->getattr().st_mode)) {
-                    dirnode->unref();
-                    delete[] pathbuf;
-                    proc->lock.release();
-                    SYSCALL_RET(-ENOTDIR);
+                    dirnode = desc->getnode();
+                    if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                        dirnode->unref();
+                        delete[] pathbuf;
+                        proc->lock.release();
+                        SYSCALL_RET(-ENOTDIR);
+                    }
                 }
             }
+
+            // Use real UID/GID unless AT_EACCESS is set.
+            int uid = (flags & AT_EACCESS) ? proc->euid : proc->uid;
+            int gid = (flags & AT_EACCESS) ? proc->egid : proc->gid;
             proc->lock.release();
 
             INode *node;
-            ssize_t res = vfs->resolve(pathbuf, &node, dirnode, true);
+            ssize_t res = vfs->resolve(pathbuf, &node, dirnode, !(flags & AT_SYMLINK_NOFOLLOW));
             dirnode->unref();
             delete[] pathbuf;
+
             if (res < 0) {
-                SYSCALL_RET(res);
+                SYSCALL_RET(res); // File not found or other resolution error.
             }
 
-            int accflags = 0;
-            if (mode & F_OK) {
-                accflags = 0; // Just checking for existence.
-            } else {
-                if (mode & R_OK) {
-                    accflags |= O_RDONLY;
-                }
-                if (mode & W_OK) {
-                    accflags |= O_WRONLY;
-                }
-                if (mode & X_OK) {
-                    accflags |= O_EXEC;
-                }
-            }
-
-            proc->lock.acquire();
-            // Compare against real UID/GID.
-            bool ok = vfs->checkaccess(node, accflags, proc->uid, proc->gid);
-            proc->lock.release();
-            node->unref();
-            if (ok) {
+            // F_OK just checks for existence, which we've already verified.
+            if (mode == F_OK) {
+                node->unref();
                 SYSCALL_RET(0);
-            } else {
-                SYSCALL_RET(-EACCES);
             }
+
+            struct stat st = node->getattr();
+            node->unref();
+
+            // Root always has access (except for execute on non-executable files).
+            if (uid == 0) {
+                // Root can read/write anything, but execute only if at least one execute bit is set.
+                if ((mode & X_OK) && !S_ISDIR(st.st_mode) && !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+                    SYSCALL_RET(-EACCES);
+                }
+                SYSCALL_RET(0);
+            }
+
+            // Check each requested permission.
+            if (mode & R_OK) {
+                if (uid == (int)st.st_uid) {
+                    if (!(st.st_mode & S_IRUSR)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                } else if (gid == (int)st.st_gid) {
+                    if (!(st.st_mode & S_IRGRP)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                } else {
+                    if (!(st.st_mode & S_IROTH)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                }
+            }
+
+            if (mode & W_OK) {
+                if (uid == (int)st.st_uid) {
+                    if (!(st.st_mode & S_IWUSR)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                } else if (gid == (int)st.st_gid) {
+                    if (!(st.st_mode & S_IWGRP)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                } else {
+                    if (!(st.st_mode & S_IWOTH)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                }
+            }
+
+            if (mode & X_OK) {
+                if (uid == (int)st.st_uid) {
+                    if (!(st.st_mode & S_IXUSR)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                } else if (gid == (int)st.st_gid) {
+                    if (!(st.st_mode & S_IXGRP)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                } else {
+                    if (!(st.st_mode & S_IXOTH)) {
+                        SYSCALL_RET(-EACCES);
+                    }
+                }
+            }
+
+            SYSCALL_RET(0);
         }
 
         extern "C" uint64_t sys_pipe(int pipefd[2], int flags) {
@@ -2180,7 +2238,8 @@ namespace NFS {
                 SYSCALL_RET(-EFAULT);
             }
 
-            if (!(flags & O_CLOEXEC || flags & O_NONBLOCK || flags == 0)) {
+            // Only O_CLOEXEC and O_NONBLOCK are valid flags for pipe2.
+            if (flags & ~(O_CLOEXEC | O_NONBLOCK)) {
                 SYSCALL_RET(-EINVAL);
             }
 
@@ -2209,7 +2268,7 @@ namespace NFS {
             // Open write end.
             int writefd = proc->fdtable->open(pipe, O_WRONLY | (flags & (O_CLOEXEC | O_NONBLOCK)));
             if (writefd < 0) {
-                proc->fdtable->close(readfd);
+                proc->fdtable->close(readfd); // Close and undo pipe->open(O_RDONLY).
                 pipe->unref();
                 SYSCALL_RET(writefd);
             }
@@ -2873,6 +2932,14 @@ namespace NFS {
         extern "C" ssize_t sys_ftruncate(int fd, off_t len) {
             SYSCALL_LOG("sys_ftruncate(%d, %ld).\n", fd, len);
 
+            if (fd < 0) {
+                SYSCALL_RET(-EBADF);
+            }
+
+            if (len < 0) {
+                SYSCALL_RET(-EINVAL);
+            }
+
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
             FileDescriptor *desc = proc->fdtable->get(fd);
@@ -2880,7 +2947,19 @@ namespace NFS {
                 SYSCALL_RET(-EBADF);
             }
 
+            int accmode = desc->getflags() & O_ACCMODE;
+            if (accmode != O_WRONLY && accmode != O_RDWR) {
+                SYSCALL_RET(-EINVAL); // POSIX: must be open for writing.
+            }
+
             INode *node = desc->getnode();
+
+            struct stat st = node->getattr();
+            if (!S_ISREG(st.st_mode)) {
+                node->unref();
+                SYSCALL_RET(-EINVAL); // Can only truncate regular files.
+            }
+
             int res = node->truncate(len);
             node->unref();
             SYSCALL_RET(res);
@@ -3119,6 +3198,136 @@ namespace NFS {
             delete[] oldpathbuf;
             delete[] newpathbuf;
             SYSCALL_RET(res);
+        }
+
+        extern "C" ssize_t sys_symlink(int dirfd, const char *target, size_t targetlen, const char *linkpath, size_t linklen) {
+            SYSCALL_LOG("sys_symlink(%d, %s, %lu, %s, %lu).\n", dirfd, target, targetlen, linkpath, linklen);
+
+            // Validate and copy target path from userspace.
+            ssize_t targetsize = NMem::UserCopy::strnlen(target, targetlen);
+            if (targetsize < 0) {
+                SYSCALL_RET(targetsize);
+            }
+            if (targetsize == 0) {
+                SYSCALL_RET(-ENOENT); // Empty target is invalid.
+            }
+            char *targetbuf = new char[targetsize + 1];
+            if (!targetbuf) {
+                SYSCALL_RET(-ENOMEM);
+            }
+            int ret = NMem::UserCopy::strncpyfrom(targetbuf, target, targetsize);
+            if (ret < 0) {
+                delete[] targetbuf;
+                SYSCALL_RET(ret);
+            }
+            targetbuf[targetsize] = '\0';
+
+            // Validate and copy link path from userspace.
+            ssize_t linkpathsize = NMem::UserCopy::strnlen(linkpath, linklen);
+            if (linkpathsize < 0) {
+                delete[] targetbuf;
+                SYSCALL_RET(linkpathsize);
+            }
+            char *linkpathbuf = new char[linkpathsize + 1];
+            if (!linkpathbuf) {
+                delete[] targetbuf;
+                SYSCALL_RET(-ENOMEM);
+            }
+            ret = NMem::UserCopy::strncpyfrom(linkpathbuf, linkpath, linkpathsize);
+            if (ret < 0) {
+                delete[] targetbuf;
+                delete[] linkpathbuf;
+                SYSCALL_RET(ret);
+            }
+            linkpathbuf[linkpathsize] = '\0';
+
+            NSched::Process *proc = NArch::CPU::get()->currthread->process;
+            proc->lock.acquire();
+
+            // Resolve directory for symlink creation.
+            INode *dirnode;
+            if (linkpathbuf[0] == '/') {
+                dirnode = vfs->getroot();
+            } else if (dirfd == AT_FDCWD) {
+                dirnode = proc->cwd;
+                if (!dirnode) {
+                    dirnode = vfs->getroot();
+                } else {
+                    dirnode->ref();
+                }
+            } else {
+                FileDescriptor *desc = proc->fdtable->get(dirfd);
+                if (!desc) {
+                    delete[] targetbuf;
+                    delete[] linkpathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-EBADF);
+                }
+                dirnode = desc->getnode();
+                if (!S_ISDIR(dirnode->getattr().st_mode)) {
+                    dirnode->unref();
+                    delete[] targetbuf;
+                    delete[] linkpathbuf;
+                    proc->lock.release();
+                    SYSCALL_RET(-ENOTDIR);
+                }
+            }
+
+            // Get parent directory path of the symlink to check write permission.
+            Path linkpobj = Path(linkpathbuf);
+            const char *parentpath = linkpobj.dirname();
+            INode *parent = NULL;
+            ssize_t res = vfs->resolve(parentpath, &parent, dirnode);
+            delete parentpath;
+            if (res < 0) {
+                dirnode->unref();
+                delete[] targetbuf;
+                delete[] linkpathbuf;
+                proc->lock.release();
+                SYSCALL_RET(res);
+            }
+
+            // Check write permission on parent directory.
+            bool ok = vfs->checkaccess(parent, O_WRONLY | O_EXEC, proc->euid, proc->egid);
+            if (!ok) {
+                parent->unref();
+                dirnode->unref();
+                delete[] targetbuf;
+                delete[] linkpathbuf;
+                proc->lock.release();
+                SYSCALL_RET(-EACCES);
+            }
+            parent->unref();
+
+            // Setup symlink attributes.
+            struct stat attr {
+                .st_mode = static_cast<uint32_t>(S_IFLNK | 0777), // Symlinks typically have 0777 permissions (actual permission determined by target).
+                .st_uid = proc->euid,
+                .st_gid = proc->egid
+            };
+
+            proc->lock.release();
+
+            // Create the symlink node.
+            INode *nodeout = NULL;
+            res = vfs->create(linkpathbuf, &nodeout, attr, dirnode);
+            dirnode->unref();
+            delete[] linkpathbuf;
+            if (res < 0) {
+                delete[] targetbuf;
+                SYSCALL_RET(res);
+            }
+
+            ssize_t written = nodeout->setsymlinkdata(targetbuf, targetsize);
+            delete[] targetbuf;
+
+            if (written < 0) {
+                nodeout->unref();
+                SYSCALL_RET(written);
+            }
+
+            nodeout->unref();
+            SYSCALL_RET(0);
         }
     }
 }
