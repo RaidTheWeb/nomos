@@ -106,6 +106,12 @@ namespace NSys {
                 if (!this->initialised && newbits >= 256) {
                     this->initialised = true;
                     shouldwake = true;
+                } else if (this->initialised && oldbits < 128 && newbits >= 128) {
+                    // Wake waiters if we crossed the threshold they're waiting for.
+                    shouldwake = true;
+                } else if (this->initialised && oldbits < 8 && newbits >= 8) {
+                    // Wake /dev/random waiters waiting for at least 8 bits.
+                    shouldwake = true;
                 }
             }
 

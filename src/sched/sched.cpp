@@ -72,7 +72,19 @@ namespace NSched {
     }
 
     // Process any dead threads in the zombie list.
+    // Two-phase zombie collection for safe deferred deletion.
+    static Thread *oldzombies = NULL;
+
     static void reapzombies(void) {
+        Thread *todelete = __atomic_exchange_n(&oldzombies, NULL, memory_order_acq_rel);
+        while (todelete) {
+            Thread *next = todelete->nextzombie;
+            todelete->nextzombie = NULL;
+            delete todelete;
+            todelete = next;
+        }
+
+        // Then, move current zombies to oldzombies for next cycle.
         if (!__atomic_load_n(&zombiehead, memory_order_acquire)) {
             return; // What? No head?
         }
@@ -82,21 +94,37 @@ namespace NSched {
         zombiehead = NULL;
         zombielock.release();
 
-        while (zombie) {
-            Thread *next = zombie->nextzombie;
-            zombie->nextzombie = NULL;
-            delete zombie;
-            zombie = next;
+        if (zombie) {
+            // Find end of zombie chain.
+            Thread *tail = zombie;
+            while (tail->nextzombie) {
+                tail = tail->nextzombie;
+            }
+
+            // Atomically prepend to oldzombies.
+            Thread *expected = __atomic_load_n(&oldzombies, memory_order_acquire);
+            do {
+                tail->nextzombie = expected;
+            } while (!__atomic_compare_exchange_n(&oldzombies, &expected, zombie,
+                                                   false, memory_order_acq_rel, memory_order_acquire));
         }
     }
 
     // Queue a thread for deferred deletion.
-    static void queuezombie(Thread *thread) {
+    static bool queuezombie(Thread *thread) {
+        // Use CAS to ensure only one caller can queue this thread.
+        bool expected = false;
+        if (!__atomic_compare_exchange_n(&thread->zombiequeued, &expected, true, false, memory_order_acq_rel, memory_order_acquire)) {
+            return false; // Already queued by another path.
+        }
+
         zombielock.acquire();
         thread->nextzombie = zombiehead;
         zombiehead = thread;
         zombielock.release();
+        return true;
     }
+
 
     // Attempts to locate a busier CPU (considering STEALTHRESHOLD) to steal tasks from. This is used for load balancing.
     static struct CPU::cpulocal *getstealbusiest(void) {
@@ -179,34 +207,33 @@ namespace NSched {
         }
 
         // Lock ordering to prevent cyclic deadlocks.
-        if (cpu->id < target->id) {
-            cpu->runqueue.lock.acquire();
-            target->runqueue.lock.acquire();
-        } else {
-            target->runqueue.lock.acquire();
-            cpu->runqueue.lock.acquire();
-        }
+        // Always acquire locks in ascending CPU ID order.
+        struct CPU::cpulocal *first = (cpu->id < target->id) ? cpu : target;
+        struct CPU::cpulocal *second = (cpu->id < target->id) ? target : cpu;
+
+        first->runqueue.lock.acquire();
+        second->runqueue.lock.acquire();
 
         struct RBTree::node *node = cpu->runqueue._last();
         size_t migrated = 0;
-        while (node && migrated < quota) { // If we have work to migrate, and a quota to fulfill, keep working.
+        while (node && migrated < quota) {
             Thread *candidate = RBTree::getentry<Thread>(node);
             struct RBTree::node *prev = cpu->runqueue._prev(node);
 
-            // Check if thread is eligible for migration and must not have unsaved FPU context (mathused indicates pending save).
+            // Check if thread is eligible for migration.
             enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
             if (tstate != Thread::state::SUSPENDED ||
                 __atomic_load_n(&candidate->locksheld, memory_order_acquire) > 0 ||
-                candidate->migratedisabled ||
-                candidate->fctx.mathused) { // Don't migrate threads with potentially unsaved FPU state.
-                node = prev; // Skip nodes we can't migrate.
+                __atomic_load_n(&candidate->migratedisabled, memory_order_acquire) ||
+                candidate->fctx.mathused) {
+                node = prev;
                 continue;
             }
 
             cpu->runqueue._erase(node);
-            candidate->lastcid = candidate->cid;
-            candidate->cid = target->id;
-            NArch::CPU::writemb(); // Ensure writes are seen before insertion.
+            __atomic_store_n(&candidate->lastcid, __atomic_load_n(&candidate->cid, memory_order_acquire), memory_order_release);
+            __atomic_store_n(&candidate->cid, target->id, memory_order_release);
+            NArch::CPU::writemb();
             target->runqueue._insert(node, vruntimecmp);
             migrated++;
 
@@ -214,13 +241,8 @@ namespace NSched {
         }
 
         // Release locks in reverse order of acquisition.
-        if (cpu->id < target->id) {
-            target->runqueue.lock.release();
-            cpu->runqueue.lock.release();
-        } else {
-            cpu->runqueue.lock.release();
-            target->runqueue.lock.release();
-        }
+        second->runqueue.lock.release();
+        first->runqueue.lock.release();
 
         if (migrated > 0) { // Only bother updating load if we actually did anything.
             updateload(target);
@@ -243,27 +265,32 @@ namespace NSched {
         struct RBTree::node *node = busiest->runqueue._last();
         while (node) {
             Thread *candidate = RBTree::getentry<Thread>(node);
+            struct RBTree::node *prev = busiest->runqueue._prev(node);
+
             enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
 
             // Only steal threads that are actually waiting to run and can be migrated.
             // Also check mathused to avoid stealing threads with potentially unsaved FPU state.
             if (tstate == Thread::state::SUSPENDED &&
                 __atomic_load_n(&candidate->locksheld, memory_order_acquire) == 0 &&
-                !candidate->migratedisabled &&
-                !candidate->fctx.mathused) { // Don't steal threads with potentially unsaved FPU state.
+                !__atomic_load_n(&candidate->migratedisabled, memory_order_acquire) &&
+                !candidate->fctx.mathused) {
                 busiest->runqueue._erase(node);
                 stolen = candidate;
                 break;
             }
-            node = busiest->runqueue._prev(node);
+            node = prev;
         }
 
         busiest->runqueue.lock.release();
 
         if (stolen) {
             updateload(busiest);
-            stolen->lastcid = stolen->cid;
-            stolen->cid = CPU::get()->id;
+            // Atomically update lastcid and cid to prevent data races.
+            __atomic_store_n(&stolen->lastcid, __atomic_load_n(&stolen->cid, memory_order_acquire), memory_order_release);
+            __atomic_store_n(&stolen->cid, CPU::get()->id, memory_order_release);
+            // Memory barrier to ensure cid update is visible.
+            NArch::CPU::writemb();
         }
 
         return stolen;
@@ -292,7 +319,7 @@ namespace NSched {
                 return candidate;
             }
 
-            // Thread is in unexpected state, skip it.
+            cpu->runqueue._erase(node);
             node = next;
         }
         return NULL;
@@ -317,6 +344,8 @@ namespace NSched {
 
         assert(prev, "Previous thread before context switch should *never* be NULL.\n");
 
+        NArch::CPU::mb();
+
         if (needswap) {
             swaptopml4(thread->process->addrspace->pml4phy);
         }
@@ -333,64 +362,8 @@ namespace NSched {
         __atomic_store_n(&thread->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
 
         CPU::restorexctx(&thread->xctx); // Restore extra context.
+
         CPU::ctx_swap(&thread->ctx); // Restore context.
-
-        uint64_t rsp = 0;
-        __asm__ volatile("mov %%rsp, %0" : "=r"(rsp) : : "memory");
-
-
-        Thread *current = CPU::get()->currthread;
-
-        // Swap to thread->stacktop for safe error handling.
-        __asm__ volatile(
-            "mov %0, %%rsp\n"
-            "sub $128, %%rsp\n" // Allocate a bit of stack space to avoid issues with immediate errors.
-            :
-            : "r"(current->stacktop)
-            : "memory"
-        );
-
-        NUtil::printf("Context switch returned unexpectedly!\n");
-
-        if (current != thread) {
-            NUtil::printf("Context switch unreachable reached is to a thread that we did not switch to!.\n");
-        }
-
-        Process *proc = current->process;
-        NUtil::printf("Unreachable reached occurred in thread %u of process %u.\n", current->id, proc->id);
-        NUtil::printf("Printing stack trace of thread that returned:\n");
-        printstacktrace(current->ctx.rbp);
-        NUtil::printf("Register state:\n");
-        NUtil::printf("RIP: 0x%016lx RSP: 0x%016lx RFLAGS: 0x%016lx\n", current->ctx.rip, current->ctx.rsp, current->ctx.rflags);
-        NUtil::printf("RAX: 0x%016lx RBX: 0x%016lx RCX: 0x%016lx RDX: 0x%016lx\n", current->ctx.rax, current->ctx.rbx, current->ctx.rcx, current->ctx.rdx);
-        NUtil::printf("RSI: 0x%016lx RDI: 0x%016lx RBP: 0x%016lx\n", current->ctx.rsi, current->ctx.rdi, current->ctx.rbp);
-        NUtil::printf("R8:  0x%016lx R9:  0x%016lx R10: 0x%016lx R11: 0x%016lx\n", current->ctx.r8, current->ctx.r9, current->ctx.r10, current->ctx.r11);
-        NUtil::printf("R12: 0x%016lx R13: 0x%016lx R14: 0x%016lx R15: 0x%016lx\n", current->ctx.r12, current->ctx.r13, current->ctx.r14, current->ctx.r15);
-
-        NUtil::printf("Current register state:\n");
-        uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rip, rflags;
-        __asm__ volatile(
-            "mov %%rax, %0\n"
-            "mov %%rbx, %1\n"
-            "mov %%rcx, %2\n"
-            "mov %%rdx, %3\n"
-            "mov %%rsi, %4\n"
-            "mov %%rdi, %5\n"
-            "mov %%rbp, %6\n"
-            "leaq (%%rip), %%rax\n"
-            "mov %%rax, %7\n"
-            "pushfq\n"
-            "pop %8\n"
-            : "=r"(rax), "=r"(rbx), "=r"(rcx), "=r"(rdx), "=r"(rsi), "=r"(rdi), "=r"(rbp), "=r"(rip), "=r"(rflags)
-            :
-            : "memory"
-        );
-        NUtil::printf("RIP: 0x%016lx RSP: 0x%016lx RFLAGS: 0x%016lx\n", rip, rsp, rflags);
-        NUtil::printf("RAX: 0x%016lx RBX: 0x%016lx RCX: 0x%016lx RDX: 0x%016lx\n", rax, rbx, rcx, rdx);
-        NUtil::printf("RSI: 0x%016lx RDI: 0x%016lx RBP: 0x%016lx\n", rsi, rdi, rbp);
-        NUtil::printf("R8:  0x%016lx R9:  0x%016lx R10: 0x%016lx R11: 0x%016lx\n", current->ctx.r8, current->ctx.r9, current->ctx.r10, current->ctx.r11);
-        NUtil::printf("R12: 0x%016lx R13: 0x%016lx R14: 0x%016lx R15: 0x%016lx\n", current->ctx.r12, current->ctx.r13, current->ctx.r14, current->ctx.r15);
-
         __builtin_unreachable();
     }
 
@@ -424,6 +397,11 @@ namespace NSched {
         assert(cpu, "Failed to acquire current CPU.\n");
 
         cpu->setint(false); // Disable interrupts, we don't want our scheduling work to be interrupted.
+
+        if (__atomic_exchange_n(&cpu->inschedule, true, memory_order_acq_rel)) {
+            // Already in scheduler, bail out. The outer invocation will handle scheduling.
+            return;
+        }
 
         size_t curintr = __atomic_add_fetch(&cpu->schedintr, 1, memory_order_seq_cst); // Increment the number of times this interrupt has been called.
 
@@ -494,18 +472,35 @@ namespace NSched {
 
                 // Use CAS to transition RUNNING -> WAITING/WAITINGINT.
                 enum Thread::state expected = Thread::state::RUNNING;
-                if (__atomic_compare_exchange_n(&prev->tstate, &expected, targetstate, false, memory_order_acq_rel, memory_order_acquire)) {
+                bool success = __atomic_compare_exchange_n(&prev->tstate, &expected, targetstate, false, memory_order_acq_rel, memory_order_acquire);
+
+                if (success) {
                     // Successfully transitioned to waiting state.
-                    __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+                    NArch::CPU::mb();
+                    enum Thread::pendingwait recheckpend = (enum Thread::pendingwait)__atomic_load_n(&prev->pendingwaitstate, memory_order_acquire);
+                    if (recheckpend == Thread::pendingwait::PENDING_NONE) {
+                        expected = targetstate;
+                        if (__atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
+                            // Successfully reverted to SUSPENDED, enqueue the thread.
+                            NArch::CPU::writemb();
+                            cpu->runqueue._insert(&prev->node, vruntimecmp);
+                        }
+                    }
+                    // If pendingwaitstate is still set, thread is properly waiting.
                 } else if (expected == Thread::state::DEAD) {
                     // Thread was marked dead by another CPU, queue for cleanup.
                     __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
                     queuezombie(prev);
                     prev = NULL;
+                } else {
+                    __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
                 }
             } else {
+                // No pending wait: try to transition RUNNING -> SUSPENDED.
                 enum Thread::state expected = Thread::state::RUNNING;
-                if (__atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
+                bool success = __atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire);
+
+                if (success) {
                     // Successfully transitioned to SUSPENDED, enqueue.
                     NArch::CPU::writemb();
                     cpu->runqueue._insert(&prev->node, vruntimecmp);
@@ -514,6 +509,7 @@ namespace NSched {
                     queuezombie(prev);
                     prev = NULL;
                 }
+                // If expected is something else, thread was already dequeued/waiting.
             }
         }
 
@@ -533,6 +529,19 @@ namespace NSched {
 
         assert(next != NULL, "Next thread is NULL.\n");
 
+        if (next != cpu->idlethread) {
+            enum Thread::state nstate = (enum Thread::state)__atomic_load_n(&next->tstate, memory_order_acquire);
+            if (nstate == Thread::state::DEAD) {
+                // Thread was killed after we selected it. Queue for cleanup and use idle thread.
+                queuezombie(next);
+                next = cpu->idlethread;
+            } else if (nstate == Thread::state::RUNNING) {
+                next = cpu->idlethread;
+            } else if (nstate != Thread::state::SUSPENDED && nstate != Thread::state::READY) {
+                next = cpu->idlethread;
+            }
+        }
+
         // Update CPU tracking.
         if (prev) {
             prev->lastcid = cpu->id;
@@ -546,13 +555,21 @@ namespace NSched {
             cpu->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
             Timer::rearm();
 
-            switchthread(next, needswap); // Swap to context.
+            __atomic_store_n(&cpu->inschedule, false, memory_order_release);
+
+            switchthread(next, needswap); // Swap to context. THIS SHOULD NEVER RETURN!
+
+            // If we reach here, ctx_swap returned unexpectedly - this indicates severe corruption.
+            panic("FATAL: switchthread() returned! Context corruption detected.\n");
         }
 
         __atomic_store_n(&next->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
 
         cpu->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
         Timer::rearm();
+
+        __atomic_store_n(&cpu->inschedule, false, memory_order_release);
+
         cpu->setint(true);
     }
 
@@ -598,7 +615,17 @@ namespace NSched {
         }
 
         if (this->cwd) {
+            if (this->cwd->fs) {
+                this->cwd->fs->fsunref();  // Release filesystem reference from cwd
+            }
             this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
+        }
+
+        if (this->root) {
+            if (this->root->fs) {
+                this->root->fs->fsunref();  // Release filesystem reference from root
+            }
+            this->root->unref(); // Unreference root directory.
         }
 
         this->addrspace->lock.acquire();
@@ -736,55 +763,43 @@ namespace NSched {
             return;
         }
 
-        // Disable interrupts to prevent races during yield setup.
-        // This ensures atomic setup of yield state.
-        bool oldint = cpu->setint(false);
-
-        // Mark that this thread is requesting a reschedule.
-        __atomic_store_n(&self->rescheduling, true, memory_order_release);
-
-        // Memory barrier to ensure rescheduling flag is visible.
-        CPU::writemb();
-
-        // Stop timer to prevent racing timer interrupt during yield.
-        APIC::lapicstop();
-
+        // Check if thread is dead before attempting to yield.
         enum Thread::state currentstate = (enum Thread::state)__atomic_load_n(&self->tstate, memory_order_acquire);
-
         if (currentstate == Thread::state::DEAD) {
             for (;;) {
                 asm volatile(
-                    "sti\n\t"          // Enable interrupts (required for int to work properly)
-                    "int $0xfe\n\t"    // Synchronously invoke scheduler
-                    "cli\n\t"          // Should never reach here, but disable if we do
+                    "sti\n\t"
+                    "int $0xfe\n\t"
+                    "cli\n\t"
                     : : : "memory"
                 );
             }
             __builtin_unreachable();
         }
 
-        APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPISELF);
-        //asm volatile("int $0xfe\n\t" : : : "memory");
+        // Disable interrupts to prevent races during yield setup.
+        bool oldint = cpu->setint(false);
 
-        // Enable interrupts so the IPI can be delivered.
-        cpu->setint(true);
+        // Mark that this thread is requesting a reschedule.
+        __atomic_store_n(&self->rescheduling, true, memory_order_release);
 
-        // Wait for the scheduler to process our yield request.
+        // Full memory barrier to ensure rescheduling flag is visible before IPI.
+        NArch::CPU::writemb();
+        NArch::CPU::readmb();
+
+        // Trigger scheduler via synchronous interrupt (means we can interrupt while interrupts are disabled!).
+        asm volatile(
+            "sti\n\t"
+            "int $0xfe\n\t"
+            : : : "memory"
+        );
+
         while (__atomic_load_n(&self->rescheduling, memory_order_acquire)) {
-            asm volatile(
-                "sti\n\t"
-                "hlt\n\t"
-                : : : "memory"
-            );
+            asm volatile("pause" : : : "memory");
         }
 
         // Restore original interrupt state.
         cpu->setint(oldint);
-
-        enum Thread::state exitstate = (enum Thread::state)__atomic_load_n(&self->tstate, memory_order_acquire);
-        if (exitstate == Thread::state::DEAD) {
-            panic("yield() returned for dead thread");
-        }
     }
 
     struct sleepstate { // Simple helper struct that avoids UAF.
@@ -838,71 +853,6 @@ namespace NSched {
         }
 
         return ret;
-    }
-
-    // XXX: Only guaranteed millisecond precision, as we convert from timespec to milliseconds.
-    extern "C" ssize_t sys_sleep(struct NSys::Clock::timespec *req, struct NSys::Clock::timespec *rem) {
-        SYSCALL_LOG("sys_sleep(%p, %p)\n", req, rem);
-
-        if (!req) {
-            SYSCALL_RET(-EFAULT);
-        }
-
-        // Copy timespec from userspace.
-        struct NSys::Clock::timespec kreq;
-        if (NMem::UserCopy::copyfrom(&kreq, req, sizeof(struct NSys::Clock::timespec)) < 0) {
-            SYSCALL_RET(-EFAULT);
-        }
-
-        // Validate timespec.
-        if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || kreq.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
-            SYSCALL_RET(-EINVAL);
-        }
-
-        // Convert to milliseconds, rounding up.
-        uint64_t ms = (uint64_t)kreq.tv_sec * NSys::Clock::MSEC_PER_SEC;
-        uint64_t ns_to_ms = (kreq.tv_nsec + 999999) / 1000000; // Round up nanoseconds to milliseconds.
-        ms += ns_to_ms;
-
-        // Record start time if we need to compute remaining time.
-        struct NSys::Clock::timespec start_time;
-        if (rem) {
-            NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
-            if (clock && clock->gettime(&start_time) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        // Perform sleep.
-        int ret = sleep(ms);
-
-        // If interrupted and rem is provided, calculate remaining time.
-        if (ret == -EINTR && rem) {
-            struct NSys::Clock::timespec end_time;
-            NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
-            if (clock && clock->gettime(&end_time) == 0) {
-                // Calculate elapsed time in nanoseconds.
-                uint64_t elapsed_ns = ((uint64_t)end_time.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)end_time.tv_nsec) -
-                                      ((uint64_t)start_time.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)start_time.tv_nsec);
-
-                // Calculate requested time in nanoseconds.
-                uint64_t requested_ns = (uint64_t)kreq.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)kreq.tv_nsec;
-
-                // Calculate remaining time.
-                uint64_t remaining_ns = (elapsed_ns < requested_ns) ? (requested_ns - elapsed_ns) : 0;
-
-                struct NSys::Clock::timespec krem;
-                krem.tv_sec = remaining_ns / NSys::Clock::NSEC_PER_SEC;
-                krem.tv_nsec = remaining_ns % NSys::Clock::NSEC_PER_SEC;
-
-                if (NMem::UserCopy::copyto(rem, &krem, sizeof(struct NSys::Clock::timespec)) < 0) {
-                    // If we can't copy the remaining time, we still return -EINTR.
-                    // POSIX allows this behavior.
-                }
-            }
-        }
-
-        SYSCALL_RET(ret);
     }
 
     void Mutex::acquire(void) {
@@ -1067,10 +1017,10 @@ namespace NSched {
 
     // Schedule a thread for execution on the most idle CPU.
     void schedulethread(Thread *thread) {
-
-        // Attempt to transition thread from current state to SUSPENDED state with CAS atomic operation, aborting if thread is marked DEAD.
+        // Attempt to transition thread from current state to SUSPENDED state.
         enum Thread::state expected = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
         while (true) {
+            // Check for states that prevent scheduling.
             if (expected == Thread::state::DEAD) {
                 return; // Thread is dead, do not schedule.
             }
@@ -1083,11 +1033,19 @@ namespace NSched {
                 return; // Thread is currently running, do not re-enqueue.
             }
 
+            if (expected != Thread::state::WAITING &&
+                expected != Thread::state::WAITINGINT &&
+                expected != Thread::state::PAUSED &&
+                expected != Thread::state::READY) {
+                return; // Unknown state, refuse to schedule.
+            }
+
             if (__atomic_compare_exchange_n(&thread->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
                 break; // Successfully transitioned to SUSPENDED.
             }
         }
 
+        // Full memory barrier to ensure state transition is visible.
         NArch::CPU::writemb();
 
         // Find the most idle CPU for this thread.
@@ -1096,16 +1054,21 @@ namespace NSched {
             cpu = CPU::get(); // Fallback to current CPU.
         }
 
+        // Set CPU ID before enqueueing to ensure consistency.
         __atomic_store_n(&thread->cid, cpu->id, memory_order_release);
+
+        // Memory barrier before insertion.
         NArch::CPU::writemb();
 
+        // Enqueue the thread.
         enqueuethread(cpu, thread);
         updateload(cpu);
 
-        // If the target CPU is idle, send an IPI to wake it up.
-        // This ensures the thread gets scheduled promptly.
-        if (cpu != CPU::get() && cpu->runqueue.count() == 1) {
-            APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+        if (cpu != CPU::get()) { // Only cause IPI if it's not us.
+            NArch::CPU::readmb();
+            if (cpu->runqueue.count() <= 1) { // Only force CPU to wake up if it wasn't already loaded with work (it'd be silly to wake up busy CPUs just for them to likely *not* reschedule our work).
+                APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+            }
         }
     }
 
@@ -1184,330 +1147,9 @@ namespace NSched {
         NArch::CPU::get()->intstatus = true;
     }
 
-    extern "C" uint64_t sys_fork(void) {
-        SYSCALL_LOG("sys_fork().\n");
-
-        NLib::ScopeIRQSpinlock pidguard(&pidtablelock);
-
-        Process *current = NArch::CPU::get()->currthread->process;
-
-        NLib::ScopeIRQSpinlock guard(&current->lock);
-
-        Process *child = new Process(VMM::forkcontext(current->addrspace), current->fdtable->fork());
-        if (!child) {
-            SYSCALL_RET(-ENOMEM);
-        }
-
-        pidtable->insert(child->id, child);
-
-        child->cwd = current->cwd;
-        if (child->cwd) {
-            child->cwd->ref(); // Add new reference.
-        }
-
-        // Clone for permissions.
-        child->euid = current->euid;
-        child->egid = current->egid;
-        child->suid = current->suid;
-        child->sgid = current->sgid;
-        child->uid = current->uid;
-        child->gid = current->gid;
-        child->umask = current->umask;
-
-        // Establish child<->parent relationship between processes.
-        child->parent = current;
-        current->children.push(child);
-
-        child->session = current->session;
-        child->pgrp = current->pgrp;
-
-        // Add to process group with proper locking.
-        {
-            NLib::ScopeIRQSpinlock pgrpguard(&child->pgrp->lock);
-            child->pgrp->procs.push(child);
-        }
-
-        Thread *cthread = new Thread(child, NSched::DEFAULTSTACKSIZE);
-        if (!cthread) {
-            // Clean up child process on thread allocation failure.
-            child->pgrp->lock.acquire();
-            child->pgrp->procs.remove([](Process *p, void *arg) {
-                return p == ((Process *)arg);
-            }, (void *)child);
-            child->pgrp->lock.release();
-            current->children.remove([](Process *p, void *arg) {
-                return p == ((Process *)arg);
-            }, (void *)child);
-            if (child->cwd) {
-                child->cwd->unref();
-            }
-            pidtable->remove(child->id);
-            delete child;
-            SYSCALL_RET(-ENOMEM);
-        }
-
-#ifdef __x86_64__
-        cthread->ctx = *NArch::CPU::get()->currthread->sysctx; // Initialise using system call context.
-
-        cthread->ctx.rax = 0; // Override return to indicate this is the child.
 
 
-        // Save extra contexts.
-        NArch::CPU::savexctx(&cthread->xctx);
-        if (NArch::CPU::get()->currthread->fctx.mathused) {
-            NArch::CPU::savefctx(&cthread->fctx);
-        }
 
-
-#endif
-
-        for (size_t i = 0; i < NSIG; i++) {
-            // Inherit handlers.
-            child->signalstate.actions[i] = current->signalstate.actions[i];
-        }
-        child->signalstate.pending = 0; // Pending signals are NOT inherited.
-        cthread->blocked = __atomic_load_n(&NArch::CPU::get()->currthread->blocked, memory_order_acquire); // Copy calling thread's signal mask to child thread.
-
-        NSched::schedulethread(cthread);
-
-        SYSCALL_RET(child->id);
-    }
-
-    extern "C" uint64_t sys_setsid(void) {
-        SYSCALL_LOG("sys_setsid().\n");
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        NLib::ScopeIRQSpinlock guard(&current->lock);
-
-        ProcessGroup *oldpgrp = current->pgrp;
-        oldpgrp->lock.acquire();
-        if (oldpgrp->id == current->id) {
-            oldpgrp->lock.release();
-            SYSCALL_RET(-EPERM); // Can't create a new session as group leader.
-        }
-        oldpgrp->lock.release();
-
-        // We must create a new session.
-        Session *session = new Session();
-        if (!session) {
-            SYSCALL_RET(-ENOMEM);
-        }
-        session->id = current->id;
-        session->ctty = 0;
-
-        // And a new session needs a new process group to be connected to it.
-        NSched::ProcessGroup *pgrp = new ProcessGroup();
-        if (!pgrp) {
-            delete session;
-            SYSCALL_RET(-ENOMEM);
-        }
-        pgrp->id = current->id;
-        pgrp->procs.push(current);
-        pgrp->session = session;
-
-        session->pgrps.push(pgrp);
-
-        // Remove from old process group and clean up if empty.
-        bool shoulddeleteoldpgrp = false;
-        Session *oldsession = NULL;
-        {
-            NLib::ScopeIRQSpinlock oldpgrpguard(&oldpgrp->lock);
-            oldpgrp->procs.remove([](Process *p, void *arg) {
-                return p == ((Process *)arg);
-            }, (void *)current);
-
-            if (oldpgrp->procs.empty()) {
-                shoulddeleteoldpgrp = true;
-                oldsession = oldpgrp->session;
-                if (oldsession) {
-                    NLib::ScopeIRQSpinlock sessionguard(&oldsession->lock);
-                    oldsession->pgrps.remove([](ProcessGroup *pg, void *arg) {
-                        return pg == ((ProcessGroup *)arg);
-                    }, (void *)oldpgrp);
-                }
-            }
-        }
-        if (shoulddeleteoldpgrp) {
-            delete oldpgrp;
-        }
-
-        current->pgrp = pgrp;
-        current->session = session;
-
-        SYSCALL_RET(session->id);
-    }
-
-    extern "C" uint64_t sys_setpgid(int pid, int pgid) {
-        SYSCALL_LOG("sys_setpgid(%d, %d).\n", pid, pgid);
-
-        Process *current = NArch::CPU::get()->currthread->process;
-
-        NLib::ScopeIRQSpinlock pidguard(&pidtablelock);
-
-        if (pid == 0) { // PID 0 means us.
-            pid = current->id;
-        }
-
-        if (pid < 0) {
-            SYSCALL_RET(-EINVAL);
-        }
-
-        if (pgid == 0) { // PGID 0 means use pid as pgid.
-            pgid = pid;
-        }
-
-        // Negative pgid is invalid.
-        if (pgid < 0) {
-            SYSCALL_RET(-EINVAL);
-        }
-
-        // Find the target process.
-        Process **ptarget = pidtable->find(pid);
-        if (!ptarget) {
-            SYSCALL_RET(-ESRCH); // No such process.
-        }
-        Process *target = *ptarget;
-
-        NLib::ScopeIRQSpinlock targetguard(&target->lock);
-
-        // The target process must be either the calling process or a child of the calling process.
-        if (target != current) {
-            bool ischild = false;
-            NLib::DoubleList<Process *>::Iterator it = current->children.begin();
-            for (; it.valid(); it.next()) {
-                if (*(it.get()) == target) {
-                    ischild = true;
-                    break;
-                }
-            }
-
-            if (!ischild) {
-                SYSCALL_RET(-ESRCH); // Not our child.
-            }
-
-            if (target->hasexeced) {
-                SYSCALL_RET(-EACCES); // Child has already called execve.
-            }
-        }
-
-        if (target->session && target->id == target->session->id) {
-            SYSCALL_RET(-EPERM); // Can't change pgid of a session leader.
-        }
-
-        ProcessGroup *newpgrp = NULL;
-        if (pgid != target->id) { // We join an existing process group if pgid != target's pid.
-            Process **pgleader = pidtable->find(pgid);
-            if (!pgleader) { // No leader found.
-                SYSCALL_RET(-EPERM); // Process group doesn't exist.
-            }
-            Process *gleader = *pgleader;
-
-            NLib::ScopeIRQSpinlock gleaderguard(&gleader->lock);
-
-            if (!gleader->pgrp || gleader->pgrp->id != (size_t)pgid) {
-                SYSCALL_RET(-EPERM); // Process is not a process group leader.
-            }
-
-            // Target and new process group must be in the same session.
-            if (!target->session || !gleader->session || target->session != gleader->session) {
-                SYSCALL_RET(-EPERM);
-            }
-
-            newpgrp = gleader->pgrp;
-        } else {
-            if (!target->session) { // Must have a session to create a new process group.
-                SYSCALL_RET(-EPERM);
-            }
-
-            // Create new process group.
-            newpgrp = new ProcessGroup();
-            if (!newpgrp) {
-                SYSCALL_RET(-ENOMEM);
-            }
-            newpgrp->id = pgid;
-            newpgrp->session = target->session;
-
-            // Add to session's process group list.
-            NLib::ScopeIRQSpinlock sessionguard(&target->session->lock);
-            target->session->pgrps.push(newpgrp);
-        }
-
-        // Remove from old process group.
-        ProcessGroup *oldpgrp = NULL;
-        bool shoulddeleteoldpgrp = false;
-        if (target->pgrp) {
-            oldpgrp = target->pgrp;
-            {
-                NLib::ScopeIRQSpinlock oldpgrpguard(&oldpgrp->lock);
-                oldpgrp->procs.remove([](Process *p, void *arg) {
-                    return p == ((Process *)arg);
-                }, (void *)target);
-
-                // If old process group is now empty and it's not the new one, clean it up.
-                if (oldpgrp->procs.empty() && oldpgrp != newpgrp) {
-                    shoulddeleteoldpgrp = true;
-                    Session *oldsession = oldpgrp->session;
-                    if (oldsession) {
-                        NLib::ScopeIRQSpinlock sessionguard(&oldsession->lock);
-                        oldsession->pgrps.remove([](ProcessGroup *pg, void *arg) {
-                            return pg == ((ProcessGroup *)arg);
-                        }, (void *)oldpgrp);
-                    }
-                }
-            }
-            // Delete after releasing lock.
-            if (shoulddeleteoldpgrp) {
-                delete oldpgrp;
-            }
-        }
-
-        // Add to new process group.
-        {
-            NLib::ScopeIRQSpinlock newpgrpguard(&newpgrp->lock);
-            target->pgrp = newpgrp;
-            newpgrp->procs.push(target);
-        }
-
-        SYSCALL_RET(0); // Success.
-    }
-
-    extern "C" uint64_t sys_getpgid(int pid) {
-        SYSCALL_LOG("sys_getpgid(%d).\n", pid);
-
-        NLib::ScopeIRQSpinlock guard(&pidtablelock);
-
-        if (!pid) {
-            // Return current process' process group ID.
-            SYSCALL_RET(NArch::CPU::get()->currthread->process->pgrp->id);
-        }
-
-        Process **pproc = pidtable->find(pid);
-        if (!pproc) {
-            SYSCALL_RET(-ESRCH);
-        }
-
-        Process *proc = *pproc;
-        // Return the process group of whatever we found.
-        SYSCALL_RET(proc->pgrp->id);
-    }
-
-    extern "C" uint64_t sys_gettid(void) {
-        SYSCALL_LOG("sys_gettid().\n");
-        SYSCALL_RET(CPU::get()->currthread->id);
-    }
-
-    extern "C" uint64_t sys_getpid(void) {
-        SYSCALL_LOG("sys_getpid().\n");
-        SYSCALL_RET(CPU::get()->currthread->process->id);
-    }
-
-    extern "C" uint64_t sys_getppid(void) {
-        SYSCALL_LOG("sys_getppid().\n");
-        if (CPU::get()->currthread->process->parent) {
-            SYSCALL_RET(CPU::get()->currthread->process->parent->id);
-        }
-        SYSCALL_RET(0); // Default to no parent PID.
-    }
 
     void handlelazyfpu(void) {
 #ifdef __x86_64__
@@ -1530,38 +1172,37 @@ namespace NSched {
 
     // Mark a thread as dead and remove it from any wait structures.
     static void markdeadandremove(Thread *thread) {
-        // Atomically mark the thread as dead.
+        // Atomically mark the thread as dead using exchange.
         enum Thread::state oldstate = (enum Thread::state)__atomic_exchange_n(
             &thread->tstate, Thread::state::DEAD, memory_order_acq_rel);
+
+        // Clear any pending wait state.
+        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
 
         // If thread was already dead, nothing more to do.
         if (oldstate == Thread::state::DEAD) {
             return;
         }
 
-        // If thread was waiting on a waitqueue, dequeue it.
-        thread->waitingonlock.acquire();
-        WaitQueue *wq = thread->waitingon;
-        if (wq && (oldstate == Thread::state::WAITING || oldstate == Thread::state::WAITINGINT)) {
-            wq->dequeue(thread);
-            thread->waitingon = NULL;
-        }
-        thread->waitingonlock.release();
+        // Memory barrier to ensure state change is visible.
+        NArch::CPU::writemb();
 
-        // The dead thread needs to be cleaned up. How we handle this depends on its previous state.
-        if (oldstate == Thread::state::SUSPENDED) {
-            // Thread is in a runqueue, and it will be cleaned up when the scheduler sees it.
-            size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
-            if (cid < NArch::SMP::awakecpus) {
-                struct CPU::cpulocal *cpu = NArch::SMP::cpulist[cid];
-                if (cpu) {
-                    APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
-                }
+        // If thread was waiting on a waitqueue, dequeue it.
+        if (oldstate == Thread::state::WAITING || oldstate == Thread::state::WAITINGINT) {
+            thread->waitingonlock.acquire();
+            WaitQueue *wq = thread->waitingon;
+            thread->waitingon = NULL;  // Clear it to prevent double-dequeue attempts
+            thread->waitingonlock.release();
+
+            if (wq) {
+                // dequeue() acquires waitinglock internally.
+                wq->dequeue(thread);
             }
-        } else if (oldstate == Thread::state::WAITING || oldstate == Thread::state::WAITINGINT) {
+
+            // The dequeue already handled cleanup; queue for deletion.
             queuezombie(thread);
-        } else if (oldstate == Thread::state::RUNNING) {
-            // Currently running threads should be signaled to reschedule immediately.
+        } else if (oldstate == Thread::state::SUSPENDED) {
+            // Thread is in a runqueue. The scheduler will find it marked DEAD and clean it up. Send IPI to ensure timely cleanup.
             size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
             if (cid < NArch::SMP::awakecpus) {
                 struct CPU::cpulocal *cpu = NArch::SMP::cpulist[cid];
@@ -1569,7 +1210,27 @@ namespace NSched {
                     APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
                 }
             }
-        } else {
+        } else if (oldstate == Thread::state::RUNNING) {
+            // Thread is currently running on a CPU.
+            thread->waitingonlock.acquire();
+            WaitQueue *wq = thread->waitingon;
+            thread->waitingon = NULL;  // Clear to prevent double-dequeue
+            thread->waitingonlock.release();
+
+            if (wq) {
+                wq->dequeue(thread);
+            }
+
+            // Send IPI to force reschedule.
+            size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
+            if (cid < NArch::SMP::awakecpus) {
+                struct CPU::cpulocal *cpu = NArch::SMP::cpulist[cid];
+                if (cpu) {
+                    APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+                }
+            }
+        } else if (oldstate == Thread::state::READY || oldstate == Thread::state::PAUSED) {
+            // Thread was not in any queue, safe to queue for deletion.
             queuezombie(thread);
         }
     }
@@ -1601,994 +1262,4 @@ namespace NSched {
         }
     }
 
-    extern "C" uint64_t sys_exit(int status) {
-        SYSCALL_LOG("sys_exit(%d).\n", status);
-
-        exit(status); // Exit.
-        __builtin_unreachable();
-    }
-
-    static void freeargsenvs(char **arr, size_t arrc) {
-        for (size_t i = 0; i < arrc; i++) {
-            delete[] arr[i];
-        }
-        delete[] arr;
-    }
-
-    extern "C" uint64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
-        SYSCALL_LOG("sys_execve(%s, %p, %p).\n", path, argv, envp);
-
-        ssize_t pathlen = NMem::UserCopy::strnlen(path, 4096);
-        if (pathlen <= 0) {
-            SYSCALL_RET(-EFAULT);
-        }
-
-        char *pathbuf = new char[pathlen + 1];
-        if (!pathbuf) {
-            SYSCALL_RET(-ENOMEM);
-        }
-
-        ssize_t ret = NMem::UserCopy::copyfrom(pathbuf, path, pathlen + 1);
-        if (ret < 0) {
-            delete[] pathbuf;
-            SYSCALL_RET(-EFAULT);
-        }
-        pathbuf[pathlen] = 0; // Null terminate.
-
-
-        if (!NMem::UserCopy::valid(argv, sizeof(char *))) {
-            delete[] pathbuf;
-            SYSCALL_RET(-EFAULT);
-        }
-
-        size_t argc = 0;
-        while (true) {
-            if (!NMem::UserCopy::valid(&argv[argc], sizeof(char *))) {
-                delete[] pathbuf;
-                SYSCALL_RET(-EFAULT);
-            }
-            if (!argv[argc]) {
-                break;
-            }
-            argc++;
-            if (argc > 4096) { // XXX: ARGMAX limit.
-                delete[] pathbuf;
-                SYSCALL_RET(-E2BIG);
-            }
-        }
-
-        char **aargv = new char *[argc + 1];
-        if (!aargv) {
-            delete[] pathbuf;
-            SYSCALL_RET(-ENOMEM);
-        }
-        for (size_t i = 0; i < argc; i++) {
-            ssize_t arglen = NMem::UserCopy::strnlen(argv[i], 4096);
-            if (arglen <= 0) {
-                delete[] pathbuf;
-                delete[] aargv;
-                SYSCALL_RET(-EFAULT);
-            }
-
-            aargv[i] = new char[arglen + 1];
-            if (!aargv[i]) {
-                for (size_t j = 0; j < i; j++) {
-                    delete[] aargv[j];
-                }
-                delete[] pathbuf;
-                delete[] aargv;
-                SYSCALL_RET(-ENOMEM);
-            }
-
-            ssize_t r = NMem::UserCopy::copyfrom(aargv[i], argv[i], arglen + 1);
-            if (r < 0) {
-                for (size_t j = 0; j <= i; j++) {
-                    delete[] aargv[j];
-                }
-                delete[] pathbuf;
-                delete[] aargv;
-                SYSCALL_RET(-EFAULT);
-            }
-            aargv[i][arglen] = 0; // Null terminate.
-        }
-        aargv[argc] = NULL; // Null terminate.
-
-        if (!NMem::UserCopy::valid(envp, sizeof(char *))) {
-            freeargsenvs(aargv, argc);
-            delete[] pathbuf;
-            SYSCALL_RET(-EFAULT);
-        }
-
-        // Copy envp array:
-        size_t envc = 0;
-        while (true) {
-            if (!NMem::UserCopy::valid(&envp[envc], sizeof(char *))) {
-                freeargsenvs(aargv, argc);
-                delete[] pathbuf;
-                SYSCALL_RET(-EFAULT);
-            }
-            if (!envp[envc]) {
-                break;
-            }
-            envc++;
-            if (envc > 4096) { // XXX: ARGMAX limit.
-                freeargsenvs(aargv, argc);
-                delete[] pathbuf;
-                SYSCALL_RET(-E2BIG);
-            }
-        }
-
-        char **aenvp = new char *[envc + 1];
-        if (!aenvp) {
-            freeargsenvs(aargv, argc);
-            delete[] pathbuf;
-            SYSCALL_RET(-ENOMEM);
-        }
-        for (size_t i = 0; i < envc; i++) {
-            ssize_t envlen = NMem::UserCopy::strnlen(envp[i], 4096);
-            if (envlen <= 0) {
-                freeargsenvs(aargv, argc);
-                delete[] pathbuf;
-                delete[] aenvp;
-                SYSCALL_RET(-EFAULT);
-            }
-            aenvp[i] = new char[envlen + 1];
-            if (!aenvp[i]) {
-                for (size_t j = 0; j < i; j++) {
-                    delete[] aenvp[j];
-                }
-                freeargsenvs(aargv, argc);
-                delete[] pathbuf;
-                delete[] aenvp;
-                SYSCALL_RET(-ENOMEM);
-            }
-            ssize_t r = NMem::UserCopy::copyfrom(aenvp[i], envp[i], envlen + 1);
-            if (r < 0) {
-                for (size_t j = 0; j <= i; j++) {
-                    delete[] aenvp[j];
-                }
-                freeargsenvs(aargv, argc);
-                delete[] pathbuf;
-                delete[] aenvp;
-                SYSCALL_RET(-EFAULT);
-            }
-            aenvp[i][envlen] = 0; // Null terminate.
-        }
-        aenvp[envc] = NULL; // Null terminate.
-
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        current->lock.acquire();
-        NFS::VFS::INode *cwd = current->cwd;
-        int euid = current->euid;
-        int egid = current->egid;
-        current->lock.release();
-
-        NFS::VFS::INode *inode;
-        ret = NFS::VFS::vfs->resolve(pathbuf, &inode, cwd, true);
-        if (ret < 0) {
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            SYSCALL_RET(ret);
-        }
-
-        // Check permission against EUID/EGID.
-        if (!NFS::VFS::vfs->checkaccess(inode, NFS::VFS::O_EXEC, euid, egid)) {
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            SYSCALL_RET(-EACCES);
-        }
-
-        // Check if interpreter script.
-        char shebang[128] = {0};
-
-        ssize_t res = inode->read(shebang, sizeof(shebang) - 1, 0, 0);
-        if (res < 2) { // Failed to read shebang.
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            SYSCALL_RET(-ENOEXEC);
-        }
-
-        if (shebang[0] == '#' && shebang[1] == '!') {
-            // TODO: Handle interpreter scripts.
-        }
-
-        struct NSys::ELF::header elfhdr;
-        res = inode->read(&elfhdr, sizeof(elfhdr), 0, 0);
-        if (res < (ssize_t)sizeof(elfhdr)) {
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            SYSCALL_RET(-ENOEXEC);
-        }
-
-        if (elfhdr.type != NSys::ELF::ET_EXECUTABLE && elfhdr.type != NSys::ELF::ET_DYNAMIC) {
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            SYSCALL_RET(-ENOEXEC);
-        }
-
-        if (!NSys::ELF::verifyheader(&elfhdr)) {
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            SYSCALL_RET(-ENOEXEC);
-        }
-
-        struct VMM::addrspace *newspace;
-        NArch::VMM::uclonecontext(&NArch::VMM::kspace, &newspace); // Start with a clone of the kernel address space.
-
-        bool isinterp = false;
-
-        void *ent = NULL;
-        void *interpent = NULL;
-        uintptr_t execbase = 0;
-        uintptr_t interpbase = 0;
-        uintptr_t phdraddr = 0;
-
-        if (elfhdr.type == NSys::ELF::ET_DYNAMIC) {
-            execbase = 0x400000; // Standard base for PIE.
-        } else {
-            execbase = 0; // Non-PIE executables load at fixed address.
-        }
-
-        if (!NSys::ELF::loadfile(&elfhdr, inode, newspace, &ent, execbase, &phdraddr)) {
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            delete newspace;
-            SYSCALL_RET(-ENOEXEC);
-        }
-
-        char *interp = NSys::ELF::getinterpreter(&elfhdr, inode);
-
-        if (interp != NULL) { // Dynamically linked executable.
-            isinterp = true;
-
-            // Load interpreter ELF.
-            NFS::VFS::INode *interpnode;
-            ssize_t r = NFS::VFS::vfs->resolve(interp, &interpnode, cwd, true);
-            delete[] interp;
-            if (r < 0) {
-                inode->unref();
-                freeargsenvs(aargv, argc);
-                freeargsenvs(aenvp, envc);
-                delete[] pathbuf;
-                delete newspace;
-                SYSCALL_RET(r);
-            }
-
-            struct NSys::ELF::header interpelfhdr;
-            ssize_t rd = interpnode->read(&interpelfhdr, sizeof(interpelfhdr), 0, 0);
-            if (rd < (ssize_t)sizeof(interpelfhdr)) {
-                inode->unref();
-                interpnode->unref();
-                freeargsenvs(aargv, argc);
-                freeargsenvs(aenvp, envc);
-                delete[] pathbuf;
-                delete newspace;
-                SYSCALL_RET(-ENOEXEC);
-            }
-
-            if (!NSys::ELF::verifyheader(&interpelfhdr)) {
-                inode->unref();
-                interpnode->unref();
-                freeargsenvs(aargv, argc);
-                freeargsenvs(aenvp, envc);
-                delete[] pathbuf;
-                delete newspace;
-                SYSCALL_RET(-ENOEXEC);
-            }
-
-            // Load interpreter at different base address
-            interpbase = 0x00000beef0000000;  // Place interpreter at a different address range
-            if (!NSys::ELF::loadfile(&interpelfhdr, interpnode, newspace, &interpent, interpbase, NULL)) {
-                inode->unref();
-                interpnode->unref();
-                freeargsenvs(aargv, argc);
-                freeargsenvs(aenvp, envc);
-                delete[] pathbuf;
-                delete newspace;
-                SYSCALL_RET(-ENOEXEC);
-            }
-
-            interpnode->unref();
-
-            if (!interpent || (uintptr_t)interpent >= 0x0000800000000000) {
-                inode->unref();
-                freeargsenvs(aargv, argc);
-                freeargsenvs(aenvp, envc);
-                delete[] pathbuf;
-                delete newspace;
-                SYSCALL_RET(-ENOEXEC);
-            }
-        }
-
-        if (!ent || (uintptr_t)ent >= 0x0000800000000000) {
-            inode->unref();
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            delete newspace;
-            SYSCALL_RET(-ENOEXEC);
-        }
-
-
-        struct NFS::VFS::stat attr = inode->getattr();
-
-        inode->unref();
-
-        uintptr_t ustackphy = (uintptr_t)PMM::alloc(1 << 20); // This is the physical memory behind the stack.
-        if (!ustackphy) {
-            freeargsenvs(aargv, argc);
-            freeargsenvs(aenvp, envc);
-            delete[] pathbuf;
-            delete newspace;
-            SYSCALL_RET(-ENOMEM);
-        }
-
-        uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Top of user space, minus a page for safety.
-        uintptr_t ustackbottom = ustacktop - (1 << 20); // Virtual address of bottom of user stack (where ustackphy starts).
-
-        struct NSys::ELF::execinfo einfo;
-        NLib::memset(&einfo, 0, sizeof(einfo));
-        einfo.argv = aargv;
-        einfo.envp = aenvp;
-        einfo.execpath = pathbuf;
-        einfo.entry = (uintptr_t)ent; // Executable's entry point. NOT interpreter entry point, EVER.
-        einfo.lnbase = interpbase;
-        einfo.phdraddr = phdraddr;
-
-        NSys::Random::EntropyPool *pool = CPU::get()->entropypool;
-        uint8_t randbuf[16];
-        pool->getrandom(randbuf, sizeof(randbuf), false, false); // Non-blocking, urandom source.
-        NLib::memcpy(einfo.random, randbuf, sizeof(randbuf));
-
-        current->lock.acquire();
-
-        einfo.uid = current->uid;
-        einfo.gid = current->gid;
-
-        if (NFS::VFS::S_ISSUID(attr.st_mode)) {
-            current->euid = attr.st_uid; // Run as owner of file.
-            einfo.secure = true; // SUID programs are "secure" executables.
-        }
-
-        if (NFS::VFS::S_ISSGID(attr.st_mode)) {
-            current->egid = attr.st_gid; // Run as owner of file.
-            einfo.secure = true; // SGID programs are "secure" executables.
-        }
-
-        einfo.euid = current->euid;
-        einfo.egid = current->egid;
-
-        current->lock.release();
-
-        void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustackphy + (1 << 20))), &elfhdr, ustacktop, &einfo);
-        freeargsenvs(aargv, argc);
-        freeargsenvs(aenvp, envc);
-        delete[] pathbuf; // Clean up path after preparestack copies it.
-
-        if (!rsp) {
-            PMM::free((void *)ustackphy, 1 << 20);
-            delete newspace;
-            SYSCALL_RET(-ENOMEM);
-        }
-
-        // Reserve user stack region.
-        newspace->vmaspace->reserve(ustackbottom, ustacktop, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
-        newspace->vmaspace->reserve(ustacktop, 0x0000800000000000, 0); // Guard page.
-
-        // Map user stack.
-        NArch::VMM::maprange(newspace, ustackbottom, (uintptr_t)ustackphy, NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::USER | NArch::VMM::PRESENT, 1<< 20);
-
-        // Kill other threads and await their death.
-        termothers(current);
-
-        current->lock.acquire();
-
-        // Mark that this process has called execve.
-        current->hasexeced = true;
-
-        // "The effective UID of the process is copied to the saved set-user-ID"
-        current->suid = current->euid;
-        current->sgid = current->egid;
-
-        // RUID and RGID remain unchanged.
-
-        current->addrspace->lock.acquire();
-        current->addrspace->ref--;
-        size_t ref = current->addrspace->ref;
-        current->addrspace->lock.release();
-        if (ref == 0) {
-            delete current->addrspace;
-        }
-
-        newspace->ref++;
-        current->addrspace = newspace;
-
-        current->fdtable->doexec(); // Close FDs with O_CLOEXEC.
-
-        // Reset signal handlers to SIG_DFL on exec (except those set to SIG_IGN remain SIG_IGN).
-        for (size_t i = 0; i < NSIG; i++) {
-            if (current->signalstate.actions[i].handler != SIG_IGN) {
-                current->signalstate.actions[i].handler = SIG_DFL;
-                current->signalstate.actions[i].mask = 0;
-                current->signalstate.actions[i].flags = 0;
-                current->signalstate.actions[i].restorer = NULL;
-            }
-        }
-        // Pending signals are cleared on exec.
-        current->signalstate.pending = 0;
-        // Signal mask is preserved across exec.
-
-        struct NArch::CPU::context *sysctx = NArch::CPU::get()->currthread->sysctx;
-#ifdef __x86_64__
-        NLib::memset(&NArch::CPU::get()->currthread->xctx, 0, sizeof(NArch::CPU::get()->currthread->xctx));
-
-        sysctx->rip = isinterp ? (uint64_t)interpent : (uint64_t)ent; // Entry point.
-        sysctx->rsp = (uint64_t)rsp;
-        sysctx->rflags = 0x202; // Enable interrupts.
-
-        NUtil::printf("Execve: Entry point at 0x%lx, stack at 0x%lx\n", sysctx->rip, sysctx->rsp);
-
-        NLib::memset(NArch::CPU::get()->currthread->fctx.fpustorage, 0, CPU::get()->fpusize);
-        NArch::CPU::get()->currthread->fctx.mathused = false; // Mark as unused.
-
-        if (CPU::get()->hasxsave) {
-            uint64_t cr0 = CPU::rdcr0();
-            asm volatile("clts");
-            // Initialise region.
-            asm volatile("xsave (%0)" : : "r"(NArch::CPU::get()->currthread->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
-            CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
-        }
-
-        NArch::VMM::swapcontext(newspace);
-        current->lock.release();
-
-        SYSCALL_RET(sysctx->rax); // Success. This should usually be the system call number of sys_execve.
-#else
-        // Other architectures not implemented yet.
-        current->lock.release();
-        delete newspace;
-        SYSCALL_RET(-ENOSYS);
-#endif
-    }
-
-    #define WNOHANG     1 // Don't block.
-    #define WUNTRACED   2 // Report stopped children.
-
-    static Process *findchild(Process *parent, int pid, bool zombie) {
-        NLib::DoubleList<Process *>::Iterator it = parent->children.begin();
-        int childcount = 0;
-        for (; it.valid(); it.next()) {
-            Process *child = *(it.get());
-            childcount++;
-
-            bool match = false;
-
-            child->lock.acquire();
-            // Skip processes being reaped by another waitpid call.
-            if (zombie && child->pstate != Process::state::ZOMBIE) {
-                child->lock.release();
-                continue; // Wanted zombies, but this is not one (or already being reaped).
-            }
-
-            if (pid == -1) { // Any child.
-                match = true;
-            } else if (pid > 0) { // Specific PID.
-                if (child->id == (size_t)pid) {
-                    match = true;
-                }
-            } else if (pid == 0) { // Any child in our process group.
-                if (child->pgrp == parent->pgrp) {
-                    match = true;
-                }
-            } else { // Negative PID means any child in process group -pid.
-                if (child->pgrp->id == (size_t)(-pid)) {
-                    match = true;
-                }
-            }
-
-            if (match && zombie) {
-                // Atomically claim the zombie by transitioning to REAPING state.
-                // This prevents other concurrent waitpid calls from reaping the same child.
-                child->pstate = Process::state::REAPING;
-                child->lock.release();
-                return child;
-            }
-
-            child->lock.release();
-
-            if (match) {
-                return child;
-            }
-        }
-        return NULL;
-    }
-
-    extern "C" uint64_t sys_waitpid(int pid, int *status, int options) {
-        SYSCALL_LOG("sys_waitpid(%d, %p, %d).\n", pid, status, options);
-
-        if (status && !NMem::UserCopy::valid(status, sizeof(int))) {
-            SYSCALL_RET(-EFAULT);
-        }
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        current->lock.acquire();
-
-        // Check if we have any children that match.
-        bool haschildren = findchild(current, pid, false) != NULL;
-
-        if (!haschildren) {
-            current->lock.release();
-            SYSCALL_RET(-ECHILD); // No matching children.
-        }
-
-        Process *zombie = NULL;
-
-        if (options & WNOHANG) {
-            // Non-blocking wait.
-            zombie = findchild(current, pid, true);
-            if (!zombie) {
-                current->lock.release();
-                SYSCALL_RET(0); // No matching zombies.
-            }
-        } else {
-            // Blocking wait.
-            int ret;
-
-            // Manually expand the macro to add debugging.
-            ret = 0;
-            while (true) {
-                zombie = findchild(current, pid, true);
-                if (zombie != NULL) {
-                    break;
-                }
-                int __ret = current->exitwq.waitinterruptiblelocked(&current->lock);
-                if (__ret < 0) {
-                    ret = __ret;
-                    break;
-                }
-            }
-
-            if (ret < 0) {
-                // Even if interrupted, check if a zombie appeared.
-                zombie = findchild(current, pid, true);
-                if (!zombie) {
-                    current->lock.release();
-                    SYSCALL_RET(ret); // Interrupted and no zombie.
-                }
-                // Fall through to reap the zombie.
-            }
-        }
-
-        // The zombie is now in REAPING state (claimed by us in findchild),
-        // so no other waitpid can race with us to reap it.
-        current->lock.release();
-
-        zombie->lock.acquire();
-        // Verify we still own the zombie (should always be true since we claimed it).
-        assert(zombie->pstate == Process::state::REAPING, "Zombie not in REAPING state after claim");
-        int zstatus = zombie->exitstatus;
-        size_t zid = zombie->id;
-
-        if (status) {
-            // Copy status out.
-            if (NMem::UserCopy::copyto(status, &zstatus, sizeof(int)) < 0) {
-                // Revert to ZOMBIE state so another waiter can try.
-                zombie->pstate = Process::state::ZOMBIE;
-                zombie->lock.release();
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        zombie->pstate = Process::state::DEAD;
-        zombie->lock.release();
-
-        // Destructor will acquire parent lock to remove from children list.
-        // Don't hold it here to avoid double acquisition.
-        delete zombie; // Reap process.
-
-        SYSCALL_RET(zid);
-    }
-
-    extern "C" uint64_t sys_yield(void) {
-        SYSCALL_LOG("sys_yield().\n");
-        yield();
-        SYSCALL_RET(0);
-    }
-
-    extern "C" uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
-        SYSCALL_LOG("sys_getresuid(%p, %p, %p).\n", ruid, euid, suid);
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        NLib::ScopeIRQSpinlock guard(&current->lock);
-
-        if (ruid) {
-            if (!NMem::UserCopy::valid(ruid, sizeof(int))) {
-                SYSCALL_RET(-EFAULT);
-            }
-            int r = current->uid;
-            if (NMem::UserCopy::copyto(ruid, &r, sizeof(int)) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        if (euid) {
-            if (!NMem::UserCopy::valid(euid, sizeof(int))) {
-                SYSCALL_RET(-EFAULT);
-            }
-            int e = current->euid;
-            if (NMem::UserCopy::copyto(euid, &e, sizeof(int)) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        if (suid) {
-            if (!NMem::UserCopy::valid(suid, sizeof(int))) {
-                SYSCALL_RET(-EFAULT);
-            }
-            int s = current->suid;
-            if (NMem::UserCopy::copyto(suid, &s, sizeof(int)) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        SYSCALL_RET(0);
-    }
-
-    extern "C" uint64_t sys_getresgid(int *rgid, int *egid, int *sgid) {
-        SYSCALL_LOG("sys_getresgid(%p, %p, %p).\n", rgid, egid, sgid);
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        NLib::ScopeIRQSpinlock guard(&current->lock);
-
-        if (rgid) {
-            if (!NMem::UserCopy::valid(rgid, sizeof(int))) {
-                SYSCALL_RET(-EFAULT);
-            }
-            int r = current->gid;
-            if (NMem::UserCopy::copyto(rgid, &r, sizeof(int)) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        if (egid) {
-            if (!NMem::UserCopy::valid(egid, sizeof(int))) {
-                SYSCALL_RET(-EFAULT);
-            }
-            int e = current->egid;
-            if (NMem::UserCopy::copyto(egid, &e, sizeof(int)) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        if (sgid) {
-            if (!NMem::UserCopy::valid(sgid, sizeof(int))) {
-                SYSCALL_RET(-EFAULT);
-            }
-            int s = current->sgid;
-            if (NMem::UserCopy::copyto(sgid, &s, sizeof(int)) < 0) {
-                SYSCALL_RET(-EFAULT);
-            }
-        }
-
-        SYSCALL_RET(0);
-    }
-
-    extern "C" uint64_t sys_setresuid(int ruid, int euid, int suid) {
-        SYSCALL_LOG("sys_setresuid(%d, %d, %d).\n", ruid, euid, suid);
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        NLib::ScopeIRQSpinlock guard(&current->lock);
-
-        bool privileged = (NArch::CPU::get()->currthread->process->euid == 0);
-        // setresuid(2):
-        // An unprivileged process may change its real UID, effective UID,
-        // and saved set-user-ID, each to one of: the current real UID, the
-        // current effective UID, or the current saved set-user-ID.
-
-        if (ruid != -1) {
-            if (privileged || ruid == current->uid || ruid == current->euid || ruid == current->suid) {
-                current->uid = ruid;
-            } else {
-                SYSCALL_RET(-EPERM);
-            }
-        }
-        if (euid != -1) {
-            if (privileged || euid == current->uid || euid == current->euid || euid == current->suid) {
-                current->euid = euid;
-            } else {
-                SYSCALL_RET(-EPERM);
-            }
-        }
-        if (suid != -1) {
-            if (privileged || suid == current->uid || suid == current->euid || suid == current->suid) {
-                current->suid = suid;
-            } else {
-                SYSCALL_RET(-EPERM);
-            }
-        }
-
-        SYSCALL_RET(0);
-    }
-
-    extern "C" uint64_t sys_setresgid(int rgid, int egid, int sgid) {
-        SYSCALL_LOG("sys_setresgid(%d, %d, %d).\n", rgid, egid, sgid);
-
-        Process *current = NArch::CPU::get()->currthread->process;
-        NLib::ScopeIRQSpinlock guard(&current->lock);
-
-        bool privileged = (NArch::CPU::get()->currthread->process->euid == 0);
-        // setresgid(2):
-        // An unprivileged process may change its real GID, effective GID,
-        // and saved set-group-ID, each to one of: the current real GID, the
-        // current effective GID, or the current saved set-group-ID.
-
-        if (rgid != -1) {
-            if (privileged || rgid == current->gid || rgid == current->egid || rgid == current->sgid) {
-                current->gid = rgid;
-            } else {
-                SYSCALL_RET(-EPERM);
-            }
-        }
-        if (egid != -1) {
-            if (privileged || egid == current->gid || egid == current->egid || egid == current->sgid) {
-                current->egid = egid;
-            } else {
-                SYSCALL_RET(-EPERM);
-            }
-        }
-        if (sgid != -1) {
-            if (privileged || sgid == current->gid || sgid == current->egid || sgid == current->sgid) {
-                current->sgid = sgid;
-            } else {
-                SYSCALL_RET(-EPERM);
-            }
-        }
-
-        SYSCALL_RET(0);
-    }
-
-    struct timespec {
-        long tv_sec;
-        long tv_nsec;
-    };
-
-    #define FUTEX_WAIT          0
-    #define FUTEX_WAKE          1
-    #define FUTEX_PRIVATE_FLAG  128
-    #define FUTEX_CMD_MASK      (~FUTEX_PRIVATE_FLAG)
-
-    struct futexentry {
-        WaitQueue wq;
-        size_t waiters; // Number of threads waiting on this futex.
-    };
-
-    // Key is physical address of futex! Pretty neat, actually, since shared memory works correctly.
-    static NLib::KVHashMap<uintptr_t, struct futexentry *> *futextable = NULL;
-    static NArch::IRQSpinlock futexlock;
-
-    // Get or create a futex entry for a given physical address.
-    static struct futexentry *futexget(uintptr_t phys) {
-        struct futexentry **entry = futextable->find(phys);
-        if (entry) {
-            return *entry;
-        }
-
-        // Create a new futex entry.
-        struct futexentry *newentry = new struct futexentry;
-        newentry->waiters = 0;
-        futextable->insert(phys, newentry);
-        return newentry;
-    }
-
-    // Remove futex entry if no more waiters.
-    static void futexput(uintptr_t phys, struct futexentry *entry) {
-        if (entry->waiters == 0) {
-            futextable->remove(phys);
-            delete entry;
-        }
-    }
-
-    // Wait state for sleep()-like interruptible wake with timeout.
-    struct futexwaitstate {
-        WaitQueue *wq;
-        bool completed;
-        NArch::Spinlock lock;
-    };
-
-    // Timer callback for futex timeout.
-    static void futextimeoutwork(void *arg) {
-        struct futexwaitstate *state = (struct futexwaitstate *)arg;
-
-        state->lock.acquire();
-        if (!state->completed) {
-            state->completed = true;
-            state->lock.release();
-            state->wq->wakeone(); // Wake the sleeping thread.
-        } else {
-            // Thread was already woken. Cleanup.
-            state->lock.release();
-            delete state;
-        }
-    }
-
-    extern "C" ssize_t sys_futex(int *ptr, int op, int expected, struct timespec *timeout) {
-        SYSCALL_LOG("sys_futex(%p, %d, %d, %p).\n", ptr, op, expected, timeout);
-
-        // Lazily initialize the futex table.
-        if (!futextable) {
-            futexlock.acquire();
-            if (!futextable) {
-                futextable = new NLib::KVHashMap<uintptr_t, struct futexentry *>();
-            }
-            futexlock.release();
-        }
-
-        // Validate pointer.
-        if (!ptr || !NMem::UserCopy::valid(ptr, sizeof(int))) {
-            SYSCALL_RET(-EFAULT);
-        }
-
-        // Get physical address for futex key (shared memory works correctly).
-        Process *proc = NArch::CPU::get()->currthread->process;
-        uintptr_t phys = NArch::VMM::virt2phys(proc->addrspace, (uintptr_t)ptr);
-        if (phys == 0) {
-            SYSCALL_RET(-EFAULT);
-        }
-
-        int cmd = op & FUTEX_CMD_MASK;
-
-        switch (cmd) {
-            case FUTEX_WAIT: {
-                // Copy timeout from userspace if provided.
-                uint64_t timeoutms = 0;
-                bool hastimeout = false;
-                if (timeout) {
-                    struct timespec ktimeout;
-                    if (NMem::UserCopy::copyfrom(&ktimeout, timeout, sizeof(struct timespec)) < 0) {
-                        SYSCALL_RET(-EFAULT);
-                    }
-                    if (ktimeout.tv_sec < 0 || ktimeout.tv_nsec < 0 || ktimeout.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
-                        SYSCALL_RET(-EINVAL);
-                    }
-                    // Convert to milliseconds, rounding up.
-                    timeoutms = (uint64_t)ktimeout.tv_sec * NSys::Clock::MSEC_PER_SEC;
-                    timeoutms += (ktimeout.tv_nsec + 999999) / 1000000;
-                    hastimeout = true;
-                }
-
-                futexlock.acquire();
-                struct futexentry *entry = futexget(phys);
-
-                // Atomically check the futex value.
-                int currentval;
-                if (NMem::UserCopy::copyfrom(&currentval, ptr, sizeof(int)) < 0) {
-                    futexput(phys, entry);
-                    futexlock.release();
-                    SYSCALL_RET(-EFAULT);
-                }
-
-                if (currentval != expected) {
-                    futexput(phys, entry);
-                    futexlock.release();
-                    SYSCALL_RET(-EAGAIN);
-                }
-
-                entry->waiters++;
-                futexlock.release();
-
-                int ret = 0;
-
-                if (hastimeout && timeoutms > 0) {
-                    // Wait with timeout.
-                    struct futexwaitstate *state = new struct futexwaitstate;
-                    state->wq = &entry->wq;
-                    state->completed = false;
-
-                    NSys::Timer::timerlock();
-                    NSys::Timer::create(futextimeoutwork, state, timeoutms);
-                    NSys::Timer::timerunlock();
-
-                    ret = entry->wq.waitinterruptible();
-
-                    // Check if we timed out or were woken.
-                    state->lock.acquire();
-                    if (!state->completed) {
-                        // We were woken (by wake or signal), mark completed so timer cleans up.
-                        state->completed = true;
-                        state->lock.release();
-                    } else {
-                        // Timer expired and woke us. This is a timeout.
-                        state->lock.release();
-                        delete state;
-                        if (ret == 0) {
-                            ret = -ETIMEDOUT;
-                        }
-                    }
-                } else if (hastimeout && timeoutms == 0) {
-                    // Zero timeout means don't wait at all.
-                    ret = -ETIMEDOUT;
-                } else {
-                    // Wait without timeout.
-                    ret = entry->wq.waitinterruptible();
-                }
-
-                futexlock.acquire();
-                entry->waiters--;
-                futexput(phys, entry);
-                futexlock.release();
-
-                SYSCALL_RET(ret);
-            }
-
-            case FUTEX_WAKE: {
-                futexlock.acquire();
-                struct futexentry **entryptr = futextable->find(phys);
-                if (!entryptr) {
-                    futexlock.release();
-                    SYSCALL_RET(0); // No waiters.
-                }
-
-                struct futexentry *entry = *entryptr;
-                int woken = 0;
-                int towake = expected; // 'expected' is actually the count for FUTEX_WAKE.
-
-                size_t actualwaiters = entry->waiters;
-                while (towake > 0 && actualwaiters > 0) {
-                    entry->wq.wakeone(); // Wake up whatever we can.
-                    woken++;
-                    towake--;
-                    actualwaiters--;
-                }
-
-                futexlock.release();
-                SYSCALL_RET(woken);
-            }
-
-            default:
-                SYSCALL_RET(-ENOSYS);
-        }
-    }
-
-    extern "C" ssize_t sys_newthread(void *entry, void *stack) {
-        SYSCALL_LOG("sys_newthread(%p, %p).\n", entry, stack);
-
-        Process *proc = NArch::CPU::get()->currthread->process;
-
-        Thread *newthread = new Thread(proc, NSched::DEFAULTSTACKSIZE);
-        if (!newthread) {
-            SYSCALL_RET(-ENOMEM);
-        }
-
-        newthread->ctx.rip = (uint64_t)entry;
-        newthread->ctx.rsp = (uint64_t)stack;
-
-        NSched::schedulethread(newthread);
-        SYSCALL_RET(newthread->id);
-    }
-
-    extern "C" ssize_t sys_exitthread(void) {
-        SYSCALL_LOG("sys_exitthread().\n");
-
-        // Mark ourselves as dead and yield.
-        NArch::CPU::get()->setint(false);
-        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release);
-        NArch::CPU::get()->setint(true);
-        yield();
-
-        __builtin_unreachable();
-    }
 }

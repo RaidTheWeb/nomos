@@ -105,7 +105,7 @@ namespace NLib {
     char *strcpy(char *dest, char *src) {
         size_t len = strlen(src);
         memcpy(dest, src, len); // Utilise memcpy for fast copying strings.
-        dest[len + 1] = '\0';
+        dest[len] = '\0';
         return dest;
     }
 
@@ -115,7 +115,7 @@ namespace NLib {
 
         // Pad remaining bytes.
         if (n > len) {
-            memset(dest + (len + 1), 0, (n - len));
+            memset(dest + len, 0, (n - len));
         }
         return dest;
     }
@@ -226,6 +226,15 @@ namespace NLib {
         return dup;
     }
 
+    char *strcat(char *dest, char *src) {
+        char *ptr = dest + strlen(dest);
+        while (*src) {
+            *ptr++ = *src++;
+        }
+        *ptr = '\0';
+        return dest;
+    }
+
     char *strndup(const char *str, size_t n) {
         size_t len = strnlen(str, n);
 
@@ -235,5 +244,62 @@ namespace NLib {
         return dup;
     }
 
+    int atoi(const char *str) {
+        int result = 0;
+        bool negative = false;
 
+        while (*str == ' ') {
+            str++;
+        }
+
+        if (*str == '-') {
+            negative = true;
+            str++;
+        } else if (*str == '+') {
+            str++;
+        }
+
+        while (*str >= '0' && *str <= '9') {
+            result = result * 10 + (*str - '0');
+            str++;
+        }
+
+        return negative ? -result : result;
+    }
+
+    int itoa(int value, char *str, int base) {
+        if (base < 2 || base > 36) {
+            *str = '\0';
+            return 0;
+        }
+
+        char *ptr = str, *ptr1 = str, tmp_char;
+        int tmp_value;
+        bool negative = false;
+
+        if (value < 0 && base == 10) {
+            negative = true;
+            value = -value;
+        }
+
+        do {
+            tmp_value = value;
+            value /= base;
+            // It's pretty neat that we can do this.
+            *ptr++ = "0123456789abcdefghijklmnopqrstuvwxyz"[tmp_value - value * base];
+        } while (value);
+
+        if (negative) {
+            *ptr++ = '-';
+        }
+        *ptr-- = '\0';
+
+        while (ptr1 < ptr) {
+            tmp_char = *ptr;
+            *ptr-- = *ptr1;
+            *ptr1++ = tmp_char;
+        }
+
+        return ptr - str + 1;
+    }
 }

@@ -93,10 +93,8 @@ namespace NDev {
 
                     VFS::INode *devnode;
                     char path[512];
-                    NUtil::snprintf(path, sizeof(path), "/dev/fb%lu", i);
-                    ssize_t res = VFS::vfs->create(path, &devnode, st);
-                    assert(res == 0, "Failed to create framebuffer device node.");
-                    devnode->unref();
+                    NUtil::snprintf(path, sizeof(path), "fb%lu", i);
+                    DEVFS::registerdevfile(path, st);
                 }
             }
 

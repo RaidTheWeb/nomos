@@ -786,17 +786,12 @@ dowrite:
                     .st_blksize = 1024
                 };
 
-                VFS::INode *devnode;
-                ssize_t res = VFS::vfs->create("/dev/tty0", &devnode, st);
-                assert(res == 0, "Failed to create device node."); // Create device node.
-                devnode->unref();
-
+                DEVFS::registerdevfile("tty0", st);
                 st.st_rdev = CURDEVICEID;
                 // Should be rw by all users. It's not an actual device itself, it just points to the current one.
                 st.st_mode = (VFS::S_IRUSR | VFS::S_IWUSR | VFS::S_IRGRP | VFS::S_IWGRP | VFS::S_IROTH | VFS::S_IWOTH) | VFS::S_IFCHR;
-                res = VFS::vfs->create("/dev/tty", &devnode, st);
-                assert(res == 0, "Failed to create device node."); // Create abstract /dev/tty.
-                devnode->unref();
+
+                DEVFS::registerdevfile("tty", st);
 
                 for (size_t i = 0; i < MAXTTYS; i++) {
                     uint32_t minor = MINMINOR + i; // Device ID minor.
@@ -812,13 +807,8 @@ dowrite:
                         .st_blksize = 1024
                     };
                     char path[512];
-                    NUtil::snprintf(path, sizeof(path), "/dev/tty%lu", minor);
-
-
-                    VFS::INode *devnode;
-                    ssize_t res = VFS::vfs->create(path, &devnode, st);
-                    assert(res == 0, "Failed to create device node."); // Create device node. This will automatically assign the TTYDevice to the node, and give the TTYDevice reference to its node.
-                    devnode->unref();
+                    NUtil::snprintf(path, sizeof(path), "tty%lu", minor);
+                    DEVFS::registerdevfile(path, st);
                 }
 
                 handler.connect = NULL;
@@ -927,51 +917,37 @@ notspecial:
                 }
             }
 
-            VFS::INode *getctty(void) {
+            // Get the device ID of the controlling TTY for the current process.
+            uint64_t getcttydev(void) {
                 NSched::Process *proc = NArch::CPU::get()->currthread->process;
-
-                uint64_t ctty = __atomic_load_n(&proc->tty, memory_order_relaxed); // Get current TTY.
-
-                uint32_t num = DEVFS::minor(ctty) - 1;
-                assert(num < MAXTTYS, "Process is somehow being controlled by an invalid TTY.\n"); // XX: Implement check for /dev/ttyS#.
-                TTYDevice *dev = ttys[num];
-                assert(dev->ifnode, "TTY device was never given reference to its device node.\n");
-                dev->ifnode->ref();
-                return dev->ifnode;
+                uint64_t ctty = __atomic_load_n(&proc->tty, memory_order_relaxed);
+                return ctty;
             }
 
             int stat(uint64_t dev, struct NFS::VFS::stat *st) override {
                 if (dev == CURDEVICEID) {
-                    VFS::INode *ifnode = this->getctty();
-                    *st = ifnode->getattr(); // Fill stat buffer with the wrapped node's attributes.
-                    ifnode->unref();
-                    return 0;
+                    uint64_t cttydev = this->getcttydev();
+                    if (cttydev == 0) {
+                        return -ENXIO; // No controlling terminal.
+                    }
+                    return stat(cttydev, st); // Forward to actual TTY.
                 } else if (dev == CURVTDEVICEID) {
                     assert((currentvt - 1) < MAXTTYS, "Current VT exceeds number of TTYs.\n");
-
-                    TTYDevice *tty = ttys[currentvt - 1];
-                    tty->devlock.acquire();
-                    tty->ifnode->ref();
-                    *st = tty->ifnode->getattr();
-                    tty->ifnode->unref();
-                    tty->devlock.release();
-                    return 0;
+                    return stat(DEVFS::makedev(MAJOR, currentvt), st); // Forward to current VT.
                 }
                 return DEVFS::NOSTAT; // Default to node fill of our stat.
             }
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {
                 if (dev == CURDEVICEID) { // Device is /dev/tty
-                    VFS::INode *ifnode = this->getctty();
-                    ssize_t ret = ifnode->read(buf, count, offset, fdflags); // Pass operation to CTTY node.
-                    ifnode->unref();
-                    return ret;
+                    uint64_t cttydev = this->getcttydev();
+                    if (cttydev == 0) {
+                        return -ENXIO; // No controlling terminal.
+                    }
+                    return read(cttydev, buf, count, offset, fdflags); // Forward to actual TTY.
                 } else if (dev == CURVTDEVICEID) { // Device is /dev/tty0
                     assert((currentvt - 1) < MAXTTYS, "Current VT exceeds number of TTYs.\n");
-
-                    TTYDevice *tty = ttys[currentvt - 1];
-                    ssize_t ret = tty->tty->read((char *)buf, count, fdflags);
-                    return ret;
+                    return read(DEVFS::makedev(MAJOR, currentvt), buf, count, offset, fdflags); // Forward to current VT.
                 } else { // Device is /dev/tty1-63
                     // Here, we could be coming from direct access, or through /dev/tty.
                     uint32_t num = DEVFS::minor(dev) - 1;
@@ -985,10 +961,11 @@ notspecial:
 
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 if (dev == CURDEVICEID) {
-                    VFS::INode *ifnode = this->getctty();
-                    ssize_t ret = ifnode->write(buf, count, offset, fdflags);
-                    ifnode->unref();
-                    return ret;
+                    uint64_t cttydev = this->getcttydev();
+                    if (cttydev == 0) {
+                        return -ENXIO; // No controlling terminal.
+                    }
+                    return write(cttydev, buf, count, offset, fdflags); // Forward to actual TTY.
                 } else if (dev == CURVTDEVICEID) {
                     return write(DEVFS::makedev(MAJOR, currentvt), buf, count, offset, fdflags);
                 } else {
@@ -1007,10 +984,11 @@ notspecial:
             int ioctl(uint64_t dev, unsigned long request, uint64_t arg) override {
                 (void)dev;
                 if (dev == CURDEVICEID) {
-                    VFS::INode *ifnode = this->getctty();
-                    int ret = ifnode->ioctl(request, arg);
-                    ifnode->unref();
-                    return ret;
+                    uint64_t cttydev = this->getcttydev();
+                    if (cttydev == 0) {
+                        return -ENXIO; // No controlling terminal.
+                    }
+                    return ioctl(cttydev, request, arg); // Forward to actual TTY.
                 } else if (dev == CURVTDEVICEID) {
                     return ioctl(DEVFS::makedev(MAJOR, currentvt), request, arg);
                 } else {
@@ -1149,15 +1127,12 @@ notspecial:
                             tty->tty->fpgrp = proc->pgrp;
                             proc_session->ctty = tty->id;
 
-                            // Store TTY device ID in process structure.
-                            tty->ifnode->ref();
-                            __atomic_store_n(&proc->tty, tty->ifnode->getattr().st_rdev, memory_order_relaxed);
-                            tty->ifnode->unref();
+                            // Store TTY device ID in process structure directly.
+                            __atomic_store_n(&proc->tty, tty->id, memory_order_relaxed);
 
                             tty->devlock.release();
                             return 0;
                         }
-
                         case TTY::ioctls::TIOCGPGRP: {
                             if (!arg) {
                                 tty->devlock.release();
@@ -1371,10 +1346,11 @@ notspecial:
 
             int poll(uint64_t dev, short events, short *revents, int fdflags) override {
                 if (dev == CURDEVICEID) {
-                    VFS::INode *ifnode = this->getctty();
-                    int ret = ifnode->poll(events, revents, fdflags);
-                    ifnode->unref();
-                    return ret;
+                    uint64_t cttydev = this->getcttydev();
+                    if (cttydev == 0) {
+                        return -ENXIO; // No controlling terminal.
+                    }
+                    return poll(cttydev, events, revents, fdflags); // Forward to actual TTY.
                 } else if (dev == CURVTDEVICEID) {
                     return poll(DEVFS::makedev(MAJOR, currentvt), events, revents, fdflags);
                 } else {

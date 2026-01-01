@@ -17,23 +17,28 @@ namespace NSched {
             (wq)->waitinglock.release(); \
             NSched::yield(); \
             (wq)->waitinglock.acquire(); \
-            (wq)->finishwait(); \
+            (wq)->finishwait(true); \
         } \
         (wq)->waitinglock.release(); \
     } while (0)
 
-// Wait on this wait queue, with external lock held, until condition becomes true. Non-interruptible.
+// Wait on this wait queue, with external lock held, until condition becomes true. Non-interruptible. The external lock protects the condition.
 #define waiteventlocked(wq, condition, lock) do { \
         while (!(condition)) { \
             (wq)->waitinglock.acquire(); \
-            (wq)->preparewait(); \
-            (wq)->waitinglock.release(); \
-            (lock)->release(); \
-            NSched::yield(); \
-            (lock)->acquire(); \
-            (wq)->waitinglock.acquire(); \
-            (wq)->finishwait(); \
-            (wq)->waitinglock.release(); \
+            if (!(condition)) { \
+                (wq)->preparewait(); \
+                (wq)->waitinglock.release(); \
+                (lock)->release(); \
+                NSched::yield(); \
+                (lock)->acquire(); \
+                (wq)->waitinglock.acquire(); \
+                (wq)->finishwait(true); \
+                (wq)->waitinglock.release(); \
+            } else { \
+                (wq)->waitinglock.release(); \
+                break; \
+            } \
         } \
     } while (0)
 
@@ -50,7 +55,7 @@ namespace NSched {
             (wq)->waitinglock.release(); \
             NSched::yield(); \
             (wq)->waitinglock.acquire(); \
-            int __finret = (wq)->finishwaitinterruptible(); \
+            int __finret = (wq)->finishwaitinterruptible(true); \
             if (__finret < 0) { \
                 (wq)->waitinglock.release(); \
                 (result) = __finret; \
@@ -62,25 +67,30 @@ namespace NSched {
         } \
     } while (0)
 
-// Wait on this wait queue, with external lock held, until condition becomes true. Interruptible by signals.
+// Wait on this wait queue, with external lock held, until condition becomes true. Interruptible by signals. External lock protects the condition.
 #define waiteventinterruptiblelocked(wq, condition, lock, result) do { \
         (result) = 0; \
         while (!(condition)) { \
             (wq)->waitinglock.acquire(); \
-            if ((wq)->preparewaitinterruptible()) { \
+            if (!(condition)) { \
+                if ((wq)->preparewaitinterruptible()) { \
+                    (wq)->waitinglock.release(); \
+                    (result) = -EINTR; \
+                    break; \
+                } \
                 (wq)->waitinglock.release(); \
-                (result) = -EINTR; \
-                break; \
-            } \
-            (wq)->waitinglock.release(); \
-            (lock)->release(); \
-            NSched::yield(); \
-            (lock)->acquire(); \
-            (wq)->waitinglock.acquire(); \
-            int __finret = (wq)->finishwaitinterruptible(); \
-            (wq)->waitinglock.release(); \
-            if (__finret < 0) { \
-                (result) = __finret; \
+                (lock)->release(); \
+                NSched::yield(); \
+                (lock)->acquire(); \
+                (wq)->waitinglock.acquire(); \
+                int __finret = (wq)->finishwaitinterruptible(true); \
+                (wq)->waitinglock.release(); \
+                if (__finret < 0) { \
+                    (result) = __finret; \
+                    break; \
+                } \
+            } else { \
+                (wq)->waitinglock.release(); \
                 break; \
             } \
         } \

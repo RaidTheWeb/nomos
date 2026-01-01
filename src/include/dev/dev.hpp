@@ -78,8 +78,6 @@ namespace NDev {
 
             uint64_t id;
 
-            NFS::VFS::INode *ifnode = NULL; // Device node for interface. Set automatically during node creation.
-
             Device(uint64_t id, DevDriver *driver) {
                 this->id = id;
                 this->driver = driver;

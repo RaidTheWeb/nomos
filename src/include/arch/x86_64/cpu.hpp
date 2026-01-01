@@ -125,6 +125,9 @@ namespace NArch {
             uintptr_t schedstacktop;
             uint8_t *schedstack = NULL; // Scheduler stack, allocated for this CPU to use during interrupts (when we shouldn't be using a stack that has ANYTHING to do with a thread).
 
+            uint8_t *ist1stack = NULL;  // IST1: NMI stack.
+            uint8_t *ist2stack = NULL;  // IST2: Double Fault stack.
+
             NSched::Thread *idlethread = NULL; // Fallback idle thread, for when trere's no work.
             uint64_t lastschedts; // For runtime delta calculations.
 
@@ -159,6 +162,7 @@ namespace NArch {
             size_t intcntr = 0; // Count of interrupts handled, for random seeding rate limiting.
 
             bool preemptdisabled = true; // Is preemption disabled on this CPU?
+            volatile bool inschedule = false; // Is this CPU currently in the scheduler? Prevents nested scheduler invocations.
 
             bool setint(bool status) {
                 asm volatile("cli");

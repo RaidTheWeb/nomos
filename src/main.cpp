@@ -84,22 +84,16 @@ void kpostarch(void) {
         if (NArch::cmdline.get("root") && !NLib::strcmp(NArch::cmdline.get("root"), "initramfs")) { // If the boot command line specifies that the initramfs should be used as the filesystem root, we should load it.
             NFS::POSIXTAR::POSIXTARFileSystem *fs = new NFS::POSIXTAR::POSIXTARFileSystem(NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
             NFS::VFS::vfs->mount(NULL, "/", fs, 0, NULL);
+            fs->reclaim(); // Reclaim initramfs memory now that mount is complete.
         }
     }
 
     NFS::PipeFS::pipefs = new NFS::PipeFS::PipeFileSystem(NFS::VFS::vfs); // Create global PipeFS instance.
 
-    NFS::VFS::INode *devnode;
-    NFS::VFS::vfs->create("/dev", &devnode, (struct NFS::VFS::stat) {
-        .st_mode = 0755 | NFS::VFS::S_IFDIR
-    });
-    devnode->unref();
-
     NDev::setup(); // Initialise device registry.
 
     NMem::initpagecache(); // Initialise global page cache.
-
-    NFS::VFS::vfs->mount(NULL, "/dev", "devfs", 0, NULL); // Mount devfs at /dev.
+    NMem::startpagecachethread(); // Start writeback thread now that scheduler is running.
 
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE1) {
@@ -141,6 +135,9 @@ void kpostarch(void) {
     // PROCESS
     NSched::Process *proc = new NSched::Process(uspace);
     proc->cwd = NFS::VFS::vfs->getroot(); // Set initial CWD to root.
+    if (proc->cwd && proc->cwd->fs) {
+        proc->cwd->fs->fsref();  // Filesystem reference for initial cwd
+    }
 
     NSched::pidtable->insert(proc->id, proc); // PID 1
 

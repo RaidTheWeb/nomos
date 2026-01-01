@@ -7,6 +7,7 @@
 #include <sched/sched.hpp>
 #include <std/stdatomic.h>
 #include <std/stddef.h>
+#include <sys/timer.hpp>
 #include <util/kprint.hpp>
 
 #ifdef __x86_64__
@@ -26,8 +27,8 @@ namespace NMem {
         while (true) {
             uint16_t expected = __atomic_load_n(&this->flags, memory_order_acquire);
             if (expected & PAGE_LOCKED) {
-                // Page is already locked, wait.
-                this->waitq.wait();
+                // Page is already locked, wait using waitevent to avoid lost wakeups.
+                waitevent(&this->waitq, !(__atomic_load_n(&this->flags, memory_order_acquire) & PAGE_LOCKED));
                 continue;
             }
 
@@ -57,10 +58,8 @@ namespace NMem {
     }
 
     void CachePage::waitunlocked(void) {
-        // Wait until page is unlocked.
-        while (__atomic_load_n(&this->flags, memory_order_acquire) & PAGE_LOCKED) {
-            this->waitq.wait();
-        }
+        // Wait until page is unlocked using waitevent to avoid lost wakeups.
+        waitevent(&this->waitq, !(__atomic_load_n(&this->flags, memory_order_acquire) & PAGE_LOCKED));
     }
 
     void CachePage::setflag(uint16_t flag) {
@@ -374,8 +373,6 @@ namespace NMem {
         this->maxpages = maxpages;
         this->targetfreepages = targetfree;
 
-        // TODO: Writeback thread.
-        (void)this->wbthread;
 
         NUtil::printf("[mm/pagecache]: Page cache initialized with max %lu pages.\n", maxpages);
     }
@@ -558,6 +555,11 @@ namespace NMem {
             NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
         }
 
+        // Release reference to inode or blockdev to allow them to be freed.
+        if (page->inode) {
+            page->inode->unref();
+        }
+
         this->totalpages--;
 
         delete page;
@@ -577,8 +579,10 @@ namespace NMem {
         if (page->inode) {
             // Inode-backed page: write via inode.
             NFS::VFS::INode *inode = page->inode;
-            void *data = page->data();
-            result = inode->write(data, NArch::PAGESIZE, page->offset, 0);
+            result = inode->writepage(page);
+            if (result == 0) {
+                result = NArch::PAGESIZE; // writepage returns 0 on success
+            }
         } else if (page->blockdev) {
             // Block device page: write via block device.
             NDev::BlockDevice *dev = page->blockdev;
@@ -855,13 +859,11 @@ namespace NMem {
     }
 
     void PageCache::writebackthread(void) {
+        NUtil::printf("[mm/pagecache]: Writeback thread started.\n");
+
         while (this->isrunning()) {
-            // Sleep for 5 seconds.
-            // TODO: Use proper timer-based sleep.
-            for (int i = 0; i < 500 && this->isrunning(); i++) {
-                // Yield in a loop for ~5 seconds worth of scheduling quanta.
-                NSched::yield();
-            }
+            // Wait for either timeout or explicit wakeup.
+            NSched::sleep(WRITEBACKINTERVALMS);
 
             if (!this->isrunning()) {
                 break;
@@ -873,7 +875,7 @@ namespace NMem {
                 NLib::ScopeIRQSpinlock guard(&this->cachelock);
 
                 CachePage *page = this->activehead;
-                while (page && written < 64) { // Limit pages per cycle.
+                while (page && written < MAXWRITEBACKPERCYCLE) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
                         if (page->trypagelock()) {
@@ -886,7 +888,7 @@ namespace NMem {
                 }
 
                 page = this->inactivehead;
-                while (page && written < 64) {
+                while (page && written < MAXWRITEBACKPERCYCLE) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
                         if (page->trypagelock()) {
@@ -898,9 +900,43 @@ namespace NMem {
                     page = next;
                 }
             }
+
+            if (written > 0) {
+                NUtil::printf("[mm/pagecache]: Wrote back %lu dirty pages.\n", written);
+            }
         }
 
+        NUtil::printf("[mm/pagecache]: Writeback thread exiting.\n");
         this->signalexit();
+    }
+
+    // Static wrapper for thread entry point.
+    static void writebackthreadentry(void *arg) {
+        PageCache *cache = (PageCache *)arg;
+        cache->writebackthread();
+        NSched::exit(0);
+    }
+
+    void PageCache::startwritebackthread(void) {
+        if (this->wbthread) {
+            return; // Already started.
+        }
+
+        // Create kernel thread for writeback.
+        this->wbthread = new NSched::Thread(NSched::kprocess, NSched::DEFAULTSTACKSIZE, (void *)writebackthreadentry, (void *)this);
+        if (!this->wbthread) {
+            NUtil::printf("[mm/pagecache]: Failed to create writeback thread!\n");
+            return;
+        }
+
+        // Schedule the thread.
+        NSched::schedulethread(this->wbthread);
+        NUtil::printf("[mm/pagecache]: Writeback thread scheduled.\n");
+    }
+
+    void PageCache::wakewriteback(void) {
+        // Wake writeback thread if it's sleeping.
+        this->wakeupwq.wake();
     }
 
     size_t PageCache::shrink(size_t count) {
@@ -940,11 +976,166 @@ namespace NMem {
         }
     }
 
+    int PageCache::invalidatepage(NFS::VFS::INode *inode, off_t offset) {
+        if (!inode) {
+            return -EINVAL;
+        }
+
+        off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
+        off_t index = pageoffset / NArch::PAGESIZE;
+
+        RadixTree *cache = inode->getpagecache();
+        if (!cache) {
+            return 0; // No cache, nothing to invalidate.
+        }
+
+        CachePage *page = cache->lookup(index);
+        if (!page) {
+            return 0; // Page not cached.
+        }
+
+        // Lock the page.
+        page->pagelock();
+
+        // If dirty, write it back first (we don't want to lose data).
+        if (page->testflag(PAGE_DIRTY)) {
+            writebackpage(page);
+        }
+
+        // Remove from cache and LRU.
+        cache->remove(index);
+        {
+            NLib::ScopeIRQSpinlock guard(&this->cachelock);
+            removefromlru(page);
+            this->totalpages--;
+        }
+
+        // Free physical page.
+        if (page->pagemeta) {
+            page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+            page->pagemeta->cacheentry = NULL;
+        }
+        if (page->physaddr) {
+            NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+        }
+
+        // Release reference to inode.
+        if (page->inode) {
+            page->inode->unref();
+        }
+
+        delete page;
+        return 0;
+    }
+
+    int PageCache::invalidateinode(NFS::VFS::INode *inode) {
+        if (!inode) {
+            return -EINVAL;
+        }
+
+        RadixTree *cache = inode->getpagecache();
+        if (!cache) {
+            return 0; // No cache.
+        }
+
+        int errors = 0;
+
+        // Callback to invalidate each page.
+        struct invalidatectx {
+            PageCache *pc;
+            int errors;
+        };
+
+        invalidatectx ctx = { this, 0 };
+
+        // We need to collect pages first since we can't modify tree during iteration.
+        while (true) {
+            CachePage *page = cache->lookup(0);
+            // Walk tree to find any page.
+            bool found = false;
+
+            cache->foreach([](CachePage *page, void *arg) -> bool {
+                CachePage **foundpage = (CachePage **)arg;
+                *foundpage = page;
+                return false; // Stop at first page.
+            }, &page);
+
+            if (!page) {
+                break; // No more pages.
+            }
+            found = true;
+
+            page->pagelock();
+
+            // Write back if dirty.
+            if (page->testflag(PAGE_DIRTY)) {
+                int err = writebackpage(page);
+                if (err < 0) {
+                    errors++;
+                }
+            }
+
+            off_t index = page->offset / NArch::PAGESIZE;
+            cache->remove(index);
+
+            {
+                NLib::ScopeIRQSpinlock guard(&this->cachelock);
+                removefromlru(page);
+                this->totalpages--;
+            }
+
+            if (page->pagemeta) {
+                page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                page->pagemeta->cacheentry = NULL;
+            }
+            if (page->physaddr) {
+                NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+            }
+
+            // Release reference to inode.
+            if (page->inode) {
+                page->inode->unref();
+            }
+
+            delete page;
+
+            if (!found) {
+                break;
+            }
+        }
+
+        return errors;
+    }
+
+    bool PageCache::shouldthrottle(void) const {
+        if (this->maxpages == 0) {
+            return false; // No limit.
+        }
+
+        size_t dirty = __atomic_load_n(&this->dirtypages, memory_order_acquire);
+        size_t threshold = (this->maxpages * DIRTYTHRESHOLDPERCENT) / 100;
+
+        return dirty > threshold;
+    }
+
     void initpagecache(void) {
         pagecache = new PageCache();
         if (pagecache) {
             pagecache->init(16384, 256); // 16k pages, but TRY to keep at least 256 free.
         }
+    }
+
+    void startpagecachethread(void) {
+        if (pagecache) {
+            //pagecache->startwritebackthread();
+        }
+    }
+
+    size_t reclaimcachepages(size_t count) {
+        if (!pagecache) {
+            return 0;
+        }
+        return pagecache->shrink(count);
     }
 
 }

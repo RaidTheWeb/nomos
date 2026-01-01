@@ -83,6 +83,9 @@ namespace NArch {
         // TODO: Memory reclamation, so FLAGS_NOWAIT has a use.
         void *alloc(size_t size, uint8_t flags = 0);
         void free(void *ptr, size_t size = 0, bool track = true);
+
+        // Commit new bitmap zone for allocations (used for reclaimable memory).
+        void newzone(uintptr_t addr, size_t size);
     }
 }
 

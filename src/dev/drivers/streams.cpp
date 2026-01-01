@@ -43,25 +43,19 @@ namespace NDev {
                     .st_blksize = 4096
                 };
 
-                VFS::INode *devnode;
-                VFS::vfs->create("/dev/null", &devnode, st);
-                devnode->unref();
+                DEVFS::registerdevfile("null", st);
 
                 st.st_rdev = DEVFS::makedev(MAJOR, ZEROMINOR);
-                VFS::vfs->create("/dev/zero", &devnode, st);
-                devnode->unref();
+                DEVFS::registerdevfile("zero", st);
 
                 st.st_rdev = DEVFS::makedev(MAJOR, FULLMINOR);
-                VFS::vfs->create("/dev/full", &devnode, st);
-                devnode->unref();
+                DEVFS::registerdevfile("full", st);
 
                 st.st_rdev = DEVFS::makedev(MAJOR, RANDOMMINOR);
-                VFS::vfs->create("/dev/random", &devnode, st);
-                devnode->unref();
+                DEVFS::registerdevfile("random", st);
 
                 st.st_rdev = DEVFS::makedev(MAJOR, URANDOMMINOR);
-                VFS::vfs->create("/dev/urandom", &devnode, st);
-                devnode->unref();
+                DEVFS::registerdevfile("urandom", st);
             }
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) override {

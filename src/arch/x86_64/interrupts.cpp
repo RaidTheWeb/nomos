@@ -324,6 +324,9 @@ pffault:
                 idt[i].cs = 0x08; // Kernel code segment -> We want the kernel to be handling all interrupts.
                 idt[i].rsvd = 0;
             }
+
+            idt[2].ist = 1;  // NMI uses IST1.
+            idt[8].ist = 2;  // Double Fault uses IST2.
         }
 
         void reload(void) {

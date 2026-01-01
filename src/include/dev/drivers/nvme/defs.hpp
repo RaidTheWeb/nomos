@@ -242,18 +242,18 @@ namespace NDev {
     } __attribute__((packed));
 
     struct nvmequeue {
-        uint32_t head;
+        volatile uint32_t head; // Updated atomically by completion handler.
         uint32_t tail;
         uint32_t size;
         uint32_t id;
         uint16_t cqvec;
-        uint8_t phase;
+        volatile uint8_t phase; // Updated atomically by completion handler.
         void *entries;
         uintptr_t dmaaddr;
 
-        NArch::Spinlock qlock; // Lock for this queue.
+        NArch::Spinlock qlock; // Lock for this queue (submission and completion updates).
 
-        uint16_t nextcid; // Next command ID for this queue. Only use for submission queues.
+        volatile uint16_t nextcid; // Next command ID for this queue. Only use for submission queues. Accessed atomically.
     };
 
     struct nvmens {
@@ -281,8 +281,9 @@ namespace NDev {
     struct nvmepending {
         NSched::WaitQueue wq; // Wait queue for this pending operation.
         volatile bool done; // Is the operation done? Accessed atomically.
-        int status;
+        volatile int status; // Status code. Written by ISR, read after done=true.
         volatile bool inuse; // Are we using this slot? Accessed atomically.
+        volatile uint64_t submittsc; // TSC timestamp when submitted, for timeout detection.
     };
 
     struct nvmectrl {

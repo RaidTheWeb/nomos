@@ -33,11 +33,11 @@ extern isr_handle
 
 ; Generic Handler
 isr_common:
+    lfence
     test qword [rsp + 24], 0x3 ; Are we in the user code segment?
     jz .kentry ; Interrupt was triggered during kernel code, no need to swap GS.
 
     push rax
-
 
     swapgs
     lfence

@@ -52,6 +52,7 @@ namespace NFS {
                 }
 
                 int mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) override;
+                void reclaim(void); // Reclaim initramfs memory after mount completes.
         };
 
         // Convert octal to binary integer.

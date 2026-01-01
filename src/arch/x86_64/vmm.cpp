@@ -56,6 +56,12 @@ namespace NArch {
                     }
 
                     struct CPU::tlblocal *state = &SMP::cpulist[i]->tlblocal;
+
+                    // Wait for previous operation to complete.
+                    while (__atomic_load_n(&state->pending, memory_order_acquire)) {
+                        asm volatile("pause");
+                    }
+
                     state->type = type;
                     state->start = start;
                     state->end = end;
@@ -479,10 +485,14 @@ namespace NArch {
                 pd->entries[pdidx] = (uint64_t)pt_phys | WRITEABLE | PRESENT | (user ? USER : 0);
             }
 
+            bool wasPresent = pt->entries[ptidx] & PRESENT;
+
             // At the end of all the indirection:
             pt->entries[ptidx] = (phys & ADDRMASK) | flags;
 
-            doshootdown(CPU::TLBSHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
+            if (wasPresent) {
+                doshootdown(CPU::TLBSHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
+            }
             return true;
         }
 

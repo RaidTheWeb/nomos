@@ -646,7 +646,7 @@ namespace NFS {
 
                 // Read via block device.
                 off_t diskoffset = physblk * blksize + blkoff;
-                ssize_t res = this->ext4fs->blkdev->readbytes(dest, chunk, diskoffset, 0);
+                ssize_t res = this->ext4fs->blkdev->readbytesdirect(dest, chunk, diskoffset);
                 if (res < 0) {
                     return (int)res;
                 }
@@ -707,7 +707,7 @@ namespace NFS {
 
                 // Write via block device.
                 off_t diskoffset = physblk * blksize + blkoff;
-                ssize_t res = this->ext4fs->blkdev->writebytes(src + byteswritten, chunk, diskoffset, 0);
+                ssize_t res = this->ext4fs->blkdev->writebytesdirect(src + byteswritten, chunk, diskoffset);
                 if (res < 0) {
                     page->clearflag(NMem::PAGE_WRITEBACK);
                     page->errorcount++;
@@ -1327,12 +1327,14 @@ namespace NFS {
 
         ssize_t Ext4FileSystem::readblock(uint64_t blknum, void *buf) {
             off_t offset = blknum * this->blksize;
-            return this->blkdev->readbytes(buf, this->blksize, offset, 0);
+            // Use IO_METADATA to enable caching for filesystem metadata.
+            return this->blkdev->readbytes(buf, this->blksize, offset, 0, NDev::IO_METADATA);
         }
 
         ssize_t Ext4FileSystem::writeblock(uint64_t blknum, const void *buf) {
             off_t offset = blknum * this->blksize;
-            return this->blkdev->writebytes(buf, this->blksize, offset, 0);
+            // Use IO_METADATA to enable caching for filesystem metadata.
+            return this->blkdev->writebytes(buf, this->blksize, offset, 0, NDev::IO_METADATA);
         }
 
         void Ext4FileSystem::setinodebitmappadding(void *bitmap) {
@@ -1444,7 +1446,7 @@ namespace NFS {
             }
 
             // Read the existing on-disk inode to preserve extra fields.
-            ssize_t res = this->blkdev->readbytes(inodebuf, this->sb.inodesize, inodeoff, 0);
+            ssize_t res = this->blkdev->readbytes(inodebuf, this->sb.inodesize, inodeoff, 0, NDev::IO_METADATA);
             if (res < 0) {
                 delete[] inodebuf;
                 NUtil::printf("[fs/ext4fs]: Failed to read inode %u for update: %d.\n", ino, (int)res);
@@ -1469,7 +1471,7 @@ namespace NFS {
             }
 
             // Write the full inode buffer back to disk.
-            res = this->blkdev->writebytes(inodebuf, this->sb.inodesize, inodeoff, 0);
+            res = this->blkdev->writebytes(inodebuf, this->sb.inodesize, inodeoff, 0, NDev::IO_METADATA);
             delete[] inodebuf;
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to write inode %u: %d.\n", ino, (int)res);
@@ -1484,7 +1486,7 @@ namespace NFS {
                 this->sb.checksum = this->calcsuperblocksum();
             }
 
-            ssize_t res = this->blkdev->writebytes(&this->sb, sizeof(struct superblock), 1024, 0);
+            ssize_t res = this->blkdev->writebytes(&this->sb, sizeof(struct superblock), 1024, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to write superblock: %d\n", (int)res);
                 return res;
@@ -1504,7 +1506,7 @@ namespace NFS {
             uint16_t descsize = this->sb.descsize ? this->sb.descsize : 32;
             uint64_t offset = bgdtblock * this->blksize + group * descsize;
 
-            ssize_t res = this->blkdev->writebytes(&this->groupdescs[group], descsize, offset, 0);
+            ssize_t res = this->blkdev->writebytes(&this->groupdescs[group], descsize, offset, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to write group descriptor %u: %d\n", group, (int)res);
                 return res;
@@ -2019,7 +2021,7 @@ namespace NFS {
 
             // Read the inode.
             struct inode diskino;
-            ssize_t res = this->blkdev->readbytes(&diskino, sizeof(struct inode), inodeoff, 0);
+            ssize_t res = this->blkdev->readbytes(&diskino, sizeof(struct inode), inodeoff, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to read inode %u: %d\n", ino, (int)res);
                 return NULL;
@@ -2070,7 +2072,7 @@ namespace NFS {
             NDev::BlockDevice *blkdev = (NDev::BlockDevice *)dev;
             this->blkdev = blkdev;
 
-            res = blkdev->readbytes(&this->sb, sizeof(struct superblock), 1024, 0);
+            res = blkdev->readbytes(&this->sb, sizeof(struct superblock), 1024, 0, NDev::IO_METADATA);
             if (res < 0) {
                 devnode->unref();
                 return res;
@@ -2099,7 +2101,7 @@ namespace NFS {
             size_t bgdtsize = this->numgroups * descsize;
 
             this->groupdescs = new struct groupdesc[this->numgroups];
-            res = blkdev->readbytes(this->groupdescs, bgdtsize, bgdtblock * this->blksize, 0);
+            res = blkdev->readbytes(this->groupdescs, bgdtsize, bgdtblock * this->blksize, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to read block group descriptors\n");
                 delete[] this->groupdescs;

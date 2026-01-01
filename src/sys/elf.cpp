@@ -335,12 +335,14 @@ namespace NSys {
 
                     // Read file data if there is any.
                     if (phdrs[i].fsize > 0) {
+                        NUtil::printf("Loading segment %lu: vaddr=0x%lx, phys=0x%lx, fsize=0x%lx, msize=0x%lx, flags=0x%x\n", i, vaddr, (uintptr_t)phys, phdrs[i].fsize, phdrs[i].msize, phdrs[i].flags);
                         if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
                             // Failed. Unmap and free.
                             NArch::VMM::unmaprange(space, vaddr, phdrs[i].msize);
                             NArch::PMM::free(phys, phdrs[i].msize + misalign);
                             goto fail;
                         }
+                        NUtil::printf("Loaded segment %lu: vaddr=0x%lx, phys=0x%lx, fsize=0x%lx, msize=0x%lx, flags=0x%x\n", i, vaddr, (uintptr_t)phys, phdrs[i].fsize, phdrs[i].msize, phdrs[i].flags);
                     }
 
                     if (phdrs[i].msize > phdrs[i].fsize) {

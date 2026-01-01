@@ -4,6 +4,7 @@
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/sync.hpp>
+#include <mm/pagecache.hpp>
 #include <mm/slab.hpp>
 #include <util/kprint.hpp>
 
@@ -263,6 +264,12 @@ namespace NArch {
             }
 
             if (found == ALLOCLEVEL) { // If we have actually reached the maximum allocation level, then we couldn't find anything.
+                // Try to reclaim pages from the page cache before giving up.
+                size_t reclaimed = NMem::reclaimcachepages(16);
+                if (reclaimed > 0) {
+                    // Retry allocation after reclaim.
+                    return buddyalloc(size, flags);
+                }
                 panic("PMM Buddy allocator OOM.\n");
 
                 return NULL; // OOM.
@@ -356,6 +363,14 @@ namespace NArch {
                         }
                     }
                     page++;
+                }
+            }
+            // Try to reclaim pages from the page cache before giving up.
+            {
+                size_t reclaimed = NMem::reclaimcachepages(needed > 16 ? needed : 16);
+                if (reclaimed > 0) {
+                    // Retry allocation after reclaim.
+                    return bmapalloc(size, flags);
                 }
             }
             panic("PMM Bitmap allocator OOM.\n");
@@ -463,6 +478,44 @@ done:
                 assert(size > 0, "Attempting to free bitmap allocation without size.\n");
                 bitmapfree(ptr, size, track);
             }
+        }
+
+        void newzone(uintptr_t addr, size_t size) {
+            assert(numbitmapzones < 16, "Exceeded maximum number of bitmap zones.\n");
+
+            size_t pages = size / PAGESIZE;
+            size_t bmapsize = (pages + 7) / 8; // Bitmap is represented with qwords, this is going to be rounded up to the nearest page.
+            size_t bmappages = NLib::alignup(bmapsize, PAGESIZE) / PAGESIZE;
+
+            assert(size > bmappages * PAGESIZE, "New bitmap zone too small to hold bitmap.\n");
+
+            // Allocate page tracking metadata BEFORE acquiring the lock to avoid deadlock.
+            size_t metasize = ((size - bmappages * PAGESIZE) / PAGESIZE) * sizeof(PageMeta);
+            PageMeta *meta = (PageMeta *)PMM::alloc(metasize, FLAGS_NOTRACK);
+            assert(meta, "Failed to allocate bitmap page metadata.\n");
+            meta = (PageMeta *)hhdmoff(meta);
+
+            // Now acquire the lock to update the zone data structures.
+            NLib::ScopeIRQSpinlock guard(&alloclock);
+
+            bitmapzones[numbitmapzones].addr = addr + bmappages * PAGESIZE;
+            bitmapzones[numbitmapzones].size = size - bmappages * PAGESIZE;
+            bitmapzones[numbitmapzones].bitmap = (uint8_t *)addr;
+            NLib::memset(bitmapzones[numbitmapzones].bitmap, 0, bmappages * PAGESIZE);
+
+            for (size_t j = 0; j < bmappages; j++) {
+                bitmapzones[numbitmapzones].bitmap[j / 8] |= (1 << (j % 8));
+            }
+
+            bitmapzones[numbitmapzones].meta = meta;
+
+            for (size_t j = 0; j < bitmapzones[numbitmapzones].size / PAGESIZE; j++) {
+                bitmapzones[numbitmapzones].meta[j].refcount = 0;
+                bitmapzones[numbitmapzones].meta[j].flags = 0;
+                bitmapzones[numbitmapzones].meta[j].addr = (uintptr_t)hhdmsub((void *)bitmapzones[numbitmapzones].addr) + (j * PAGESIZE);
+            }
+
+            numbitmapzones++;
         }
     }
 }

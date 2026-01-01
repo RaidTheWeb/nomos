@@ -60,6 +60,14 @@ namespace NDev {
         PARTTYPE_GPT    = 2
     };
 
+    // I/O context flags for block device operations.
+    enum IOContext {
+        IO_DIRECT     = 0,        // Direct I/O, bypass cache (default)
+        IO_METADATA   = (1 << 0), // Metadata read/write, safe to cache
+        IO_FILEDATA   = (1 << 1), // File data from readpage/writepage, MUST use direct I/O
+        IO_RAW        = (1 << 2), // Raw device access from userspace, safe to cache
+    };
+
     class BlockDevice : public Device {
         protected:
             NMem::RadixTree *pagecache = NULL; // Device-level page cache.
@@ -79,10 +87,14 @@ namespace NDev {
             virtual ssize_t readblocks(uint64_t lba, size_t count, void *buf);
             virtual ssize_t writeblocks(uint64_t lba, size_t count, const void *buf);
 
-            // Read raw bytes from block device, goes through cache.
-            virtual ssize_t readbytes(void *buf, size_t count, off_t offset, int fdflags);
-            // Write raw bytes to block device, goes through cache.
-            virtual ssize_t writebytes(const void *buf, size_t count, off_t offset, int fdflags);
+            // Read/write raw bytes from block device with context-aware caching.
+            // CRITICAL: Never call with IO_METADATA from within readpage/writepage!
+            virtual ssize_t readbytes(void *buf, size_t count, off_t offset, int fdflags, IOContext ctx = IO_DIRECT);
+            virtual ssize_t writebytes(const void *buf, size_t count, off_t offset, int fdflags, IOContext ctx = IO_DIRECT);
+
+            // Direct I/O methods (bypass page cache) - used internally and by page I/O.
+            ssize_t readbytesdirect(void *buf, size_t count, off_t offset);
+            ssize_t writebytesdirect(const void *buf, size_t count, off_t offset);
 
             ssize_t readbytespagecache(void *buf, size_t count, off_t offset);
             ssize_t writebytespagecache(const void *buf, size_t count, off_t offset);

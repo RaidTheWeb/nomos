@@ -19,11 +19,15 @@ extern "C" {
     int strncmp(const char *s1, const char *s2, size_t n);
     char *strchr(char *str, int c);
     char *strstr(const char *haystack, const char *needle);
+    char *strcat(char *dest, char *src);
     char *strdup(const char *str);
     char *strndup(const char *str, size_t n);
 
     // Non-standard.
     char *strtrim(char *str);
+
+    int atoi(const char *str);
+    int itoa(int value, char *str, int base);
 }
 
 }

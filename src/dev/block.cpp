@@ -194,17 +194,133 @@ namespace NDev {
     }
 
 
-    // Read raw bytes from block device, goes through cache.
-    ssize_t BlockDevice::readbytes(void *buf, size_t count, off_t offset, int fdflags) {
+    // Read raw bytes from block device with context-aware caching.
+    ssize_t BlockDevice::readbytes(void *buf, size_t count, off_t offset, int fdflags, IOContext ctx) {
         (void)fdflags;
-        return this->readbytespagecache(buf, count, offset);
+
+        if (ctx & (IO_METADATA | IO_RAW)) {
+            return this->readbytespagecache(buf, count, offset);
+        }
+
+        // Direct I/O for file data and default case.
+        return this->readbytesdirect(buf, count, offset);
     }
 
 
-    // Write raw bytes to block device, goes through page cache.
-    ssize_t BlockDevice::writebytes(const void *buf, size_t count, off_t offset, int fdflags) {
+    // Write raw bytes to block device with context-aware caching.
+    ssize_t BlockDevice::writebytes(const void *buf, size_t count, off_t offset, int fdflags, IOContext ctx) {
         (void)fdflags;
-        return this->writebytespagecache(buf, count, offset);
+
+        if (ctx & (IO_METADATA | IO_RAW)) {
+            return this->writebytespagecache(buf, count, offset);
+        }
+
+        // Direct I/O for file data and default case.
+        return this->writebytesdirect(buf, count, offset);
+    }
+
+    // Direct read bypassing page cache (for filesystem page I/O).
+    ssize_t BlockDevice::readbytesdirect(void *buf, size_t count, off_t offset) {
+        if (!buf || count == 0) {
+            return 0;
+        }
+
+        uint8_t *dest = (uint8_t *)buf;
+        ssize_t totalread = 0;
+
+        while (count > 0) {
+            uint64_t lba = offset / this->blksize;
+            size_t blkoff = offset % this->blksize;
+            size_t toread = this->blksize - blkoff;
+            if (toread > count) {
+                toread = count;
+            }
+
+            // Read block into temporary buffer if not block-aligned.
+            if (blkoff != 0 || toread < this->blksize) {
+                uint8_t *blkbuf = new uint8_t[this->blksize];
+                if (!blkbuf) {
+                    return totalread > 0 ? totalread : -ENOMEM;
+                }
+
+                ssize_t res = this->readblock(lba, blkbuf);
+                if (res < 0) {
+                    delete[] blkbuf;
+                    return totalread > 0 ? totalread : res;
+                }
+
+                NLib::memcpy(dest, blkbuf + blkoff, toread);
+                delete[] blkbuf;
+            } else {
+                // Block-aligned read, directly into destination.
+                ssize_t res = this->readblock(lba, dest);
+                if (res < 0) {
+                    return totalread > 0 ? totalread : res;
+                }
+            }
+
+            dest += toread;
+            offset += toread;
+            count -= toread;
+            totalread += toread;
+        }
+
+        return totalread;
+    }
+
+    // Direct write bypassing page cache (for filesystem page I/O).
+    ssize_t BlockDevice::writebytesdirect(const void *buf, size_t count, off_t offset) {
+        if (!buf || count == 0) {
+            return 0;
+        }
+
+        const uint8_t *src = (const uint8_t *)buf;
+        ssize_t totalwritten = 0;
+
+        while (count > 0) {
+            uint64_t lba = offset / this->blksize;
+            size_t blkoff = offset % this->blksize;
+            size_t towrite = this->blksize - blkoff;
+            if (towrite > count) {
+                towrite = count;
+            }
+
+            // Write block from temporary buffer if not block-aligned.
+            if (blkoff != 0 || towrite < this->blksize) {
+                uint8_t *blkbuf = new uint8_t[this->blksize];
+                if (!blkbuf) {
+                    return totalwritten > 0 ? totalwritten : -ENOMEM;
+                }
+
+                // Read-modify-write for partial block.
+                ssize_t res = this->readblock(lba, blkbuf);
+                if (res < 0) {
+                    // If read fails, zero the block.
+                    NLib::memset(blkbuf, 0, this->blksize);
+                }
+
+                NLib::memcpy(blkbuf + blkoff, (void *)src, towrite);
+                res = this->writeblock(lba, blkbuf);
+                delete[] blkbuf;
+
+                if (res < 0) {
+                    return totalwritten > 0 ? totalwritten : res;
+                }
+            } else {
+                // Block-aligned write, directly from source.
+                ssize_t res = this->writeblock(lba, src);
+                if (res < 0) {
+                    return totalwritten > 0 ? totalwritten : res;
+                }
+            }
+
+            src += towrite;
+            offset += towrite;
+            count -= towrite;
+            totalwritten += towrite;
+        }
+
+        return totalwritten;
     }
 
     int BlockDevice::readpagedata(void *pagebuf, off_t pageoffset) {
@@ -384,7 +500,7 @@ namespace NDev {
     struct parttableinfo *getpartinfo(BlockDevice *dev) {
         // Check if MBR or GPT.
         uint8_t mbrsector[512];
-        ssize_t res = dev->readbytes(mbrsector, sizeof(mbrsector), 0, 0);
+        ssize_t res = dev->readbytes(mbrsector, sizeof(mbrsector), 0, 0, IO_METADATA);
         if (res != sizeof(mbrsector)) {
             NUtil::printf("[dev/block]: Failed to read MBR sector for partition info (err=%d).\n", (int)res);
             return NULL;
@@ -392,6 +508,99 @@ namespace NDev {
 
         // Check MBR signature.
         if (mbrsector[510] == 0x55 && mbrsector[511] == 0xAA) {
+            // Check if this is a protective MBR for GPT.
+            struct mbrpartentry *mbrents = (struct mbrpartentry *)&mbrsector[446];
+            if (mbrents[0].type == 0xEE) {
+                // This is a protective MBR, read GPT header from LBA 1.
+                uint8_t gptheadersector[512];
+                res = dev->readbytes(gptheadersector, sizeof(gptheadersector), 512, 0, IO_METADATA);
+                if (res != sizeof(gptheadersector)) {
+                    NUtil::printf("[dev/block]: Failed to read GPT header sector (err=%d).\n", (int)res);
+                    return NULL;
+                }
+
+                struct gptheader *hdr = (struct gptheader *)gptheadersector;
+
+                // Validate GPT signature "EFI PART".
+                uint64_t gptsig = 0x5452415020494645ULL; // "EFI PART" in little-endian.
+                if (hdr->signature != gptsig) {
+                    NUtil::printf("[dev/block]: Invalid GPT signature.\n");
+                    return NULL;
+                }
+
+                // Read partition entries.
+                size_t partarraysize = hdr->numparts * hdr->partsize;
+                uint8_t *partarray = new uint8_t[partarraysize];
+                if (!partarray) {
+                    NUtil::printf("[dev/block]: Failed to allocate GPT partition array.\n");
+                    return NULL;
+                }
+
+                off_t partoffset = hdr->partlba * dev->blksize;
+                res = dev->readbytes(partarray, partarraysize, partoffset, 0, IO_METADATA);
+                if (res != (ssize_t)partarraysize) {
+                    NUtil::printf("[dev/block]: Failed to read GPT partition entries (err=%d).\n", (int)res);
+                    delete[] partarray;
+                    return NULL;
+                }
+
+                // Count valid partitions (non-zero type GUID).
+                size_t validparts = 0;
+                for (size_t i = 0; i < hdr->numparts; i++) {
+                    struct gptpartentry *ent = (struct gptpartentry *)(partarray + (i * hdr->partsize));
+                    bool iszero = true;
+                    for (size_t j = 0; j < 16; j++) {
+                        if (ent->tuid[j] != 0) {
+                            iszero = false;
+                            break;
+                        }
+                    }
+                    if (!iszero) {
+                        validparts++;
+                    }
+                }
+
+                struct partinfo *parts = new struct partinfo[validparts];
+                if (!parts) {
+                    NUtil::printf("[dev/block]: Failed to allocate GPT partition info.\n");
+                    delete[] partarray;
+                    return NULL;
+                }
+
+                // Populate partition info.
+                size_t partidx = 0;
+                for (size_t i = 0; i < hdr->numparts; i++) {
+                    struct gptpartentry *ent = (struct gptpartentry *)(partarray + (i * hdr->partsize));
+                    bool iszero = true;
+                    for (size_t j = 0; j < 16; j++) {
+                        if (ent->tuid[j] != 0) {
+                            iszero = false;
+                            break;
+                        }
+                    }
+                    if (!iszero) {
+                        parts[partidx].firstlba = ent->firstlba;
+                        parts[partidx].lastlba = ent->lastlba;
+                        partidx++;
+                    }
+                }
+
+                delete[] partarray;
+
+                struct parttableinfo *ptinfo = new struct parttableinfo;
+                if (!ptinfo) {
+                    NUtil::printf("[dev/block]: Failed to allocate GPT parttableinfo struct.\n");
+                    delete[] parts;
+                    return NULL;
+                }
+
+                ptinfo->type = PARTTYPE_GPT;
+                ptinfo->numparts = validparts;
+                ptinfo->partitions = parts;
+                return ptinfo;
+            }
+
+            // Standard MBR partition table.
             struct partinfo *parts = new struct partinfo[4];
             if (!parts) {
                 NUtil::printf("[dev/block]: Failed to allocate MBR partition info.\n");

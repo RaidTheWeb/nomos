@@ -13,6 +13,7 @@
 #include <sched/signal.hpp>
 #include <util/kmarker.hpp>
 #include <stddef.h>
+#include <stdint.h>
 
 namespace NSched {
 
@@ -52,9 +53,9 @@ namespace NSched {
             void preparewait(void);
             bool preparewaitinterruptible(void);
 
-
-            void finishwait(void);
-            int finishwaitinterruptible(void);
+            // Finish wait and remove from list if still queued.
+            void finishwait(bool locked = false);
+            int finishwaitinterruptible(bool locked = false);
 
             // Non-interruptible wait. If locked=true, waitinglock is already held.
             void wait(bool locked = false);
@@ -104,6 +105,7 @@ namespace NSched {
             size_t tidcounter = 1; // Thread ID counter.
             NFS::VFS::FileDescriptorTable *fdtable = NULL;
             NFS::VFS::INode *cwd = NULL;
+            NFS::VFS::INode *root = NULL; // Root directory for this process (chroot support).
 
             // At process creation, these should all be the UID and GID of the runner.
 
@@ -210,9 +212,10 @@ namespace NSched {
             volatile enum pendingwait pendingwaitstate = pendingwait::PENDING_NONE; // Pending wait state. Access atomically.
             struct RBTree::node node; // Red-Black tree node for this thread.
             struct Thread *nextzombie = NULL; // Next zombie in the zombie list.
+            volatile bool zombiequeued = false; // Set when thread is queued for deletion. Prevents double-queue.
             size_t id = 0; // Thread ID.
             volatile size_t cid = 0; // Current CPU ID. What CPU owns this right now? Access atomically.
-            size_t lastcid = 0; // Last CPU ID. What CPU owned it before?
+            volatile size_t lastcid = 0; // Last CPU ID. What CPU owned it before? Access atomically.
 
             volatile bool migratedisabled = false; // Outright prevent migration of this thread.
             volatile size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
@@ -225,6 +228,11 @@ namespace NSched {
             void *altstackbase = NULL;
             size_t altstacksize = 0;
             int altstackflags = 0;
+
+            // Check if this thread can be safely deleted (refcount is zero and queued).
+            bool candelete(void) const {
+                return  __atomic_load_n(&this->zombiequeued, memory_order_acquire);
+            }
 
             // Called every timeslice, updates weighted vruntime for later scheduling prioritisation.
             void setvruntime(uint64_t delta) {

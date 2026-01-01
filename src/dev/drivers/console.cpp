@@ -19,7 +19,8 @@ namespace NDev {
             // TTY that syscon aliases can be determined by command line options.
 
             static const uint64_t DEVICEID = DEVFS::makedev(5, 1); // /dev/console device id.
-            VFS::INode *targetnode = NULL;
+            Device *targetdev = NULL;
+            uint64_t targetdevnum = 0;
             NSched::Mutex devlock; // Lock for device access.
         public:
             ConsoleDriver(void) {
@@ -34,10 +35,7 @@ namespace NDev {
                     .st_blksize = 1024
                 };
 
-                VFS::INode *devnode;
-                ssize_t res = VFS::vfs->create("/dev/console", &devnode, st);
-                assert(res == 0, "Failed to create device node.\n");
-                devnode->unref();
+                DEVFS::registerdevfile("console", st);
 
                 const char *target = NArch::cmdline.get("syscon");
                 if (!target) {
@@ -45,21 +43,27 @@ namespace NDev {
                     // Technically, redirects don't care about whether the target is a TTY or not, we could just send reads and writes to /dev/null, to disable kernel logging.
                     target = "tty1"; // Default to tty0. XXX: Actually implement VT handling through /dev/tty0.
                 }
-                char path[1024];
-                NUtil::snprintf(path, sizeof(path), "/dev/%s", target);
-                assert(VFS::vfs->resolve(path, &this->targetnode, NULL, false) == 0, "Failed to resolve syscon target node.\n");
 
-                assert(this->targetnode, "Invalid syscon target.");
-                this->targetnode->unref();
+                // Extract tty number from target, and turn that into a TTY minor number.
+                uint32_t minor = 0;
+                if (NLib::strncmp(target, "tty", 3) == 0) {
+                    minor = NLib::atoi(&target[3]);
+                } else if (NLib::strncmp(target, "ttyS", 4) == 0) {
+                    minor = 64 + NLib::atoi(&target[4]); // Serial TTYs start at minor 64.
+                } else {
+                    assert(false, "syscon target is not a valid TTY device.\n");
+                }
+
+                this->targetdevnum = DEVFS::makedev(4, minor); // TTY major is 4.
+                this->targetdev = registry->get(this->targetdevnum);
+                assert(this->targetdev != NULL, "syscon target TTY device not found in registry.\n");
             }
 
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
                 this->devlock.acquire();
 
-                this->targetnode->ref();
-                ssize_t ret = this->targetnode->write(buf, count, offset, fdflags);
-                this->targetnode->unref();
+                ssize_t ret = this->targetdev->driver->write(this->targetdevnum, buf, count, offset, fdflags);
                 this->devlock.release();
                 return ret;
             }
@@ -69,9 +73,7 @@ namespace NDev {
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
 
                 this->devlock.acquire();
-                this->targetnode->ref();
-                ssize_t ret = this->targetnode->read(buf, count, offset, fdflags);
-                this->targetnode->unref();
+                ssize_t ret = this->targetdev->driver->read(this->targetdevnum, buf, count, offset, fdflags);
                 this->devlock.release();
                 return ret;
             }
@@ -80,9 +82,7 @@ namespace NDev {
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
 
                 this->devlock.acquire();
-                this->targetnode->ref();
-                int ret = this->targetnode->ioctl(request, arg);
-                this->targetnode->unref();
+                int ret = this->targetdev->driver->ioctl(this->targetdevnum, request, arg);
                 this->devlock.release();
                 return ret;
             }
@@ -91,9 +91,7 @@ namespace NDev {
                 assert(dev == DEVICEID, "Invalid device given to console driver.\n");
 
                 this->devlock.acquire();
-                this->targetnode->ref();
-                int ret = this->targetnode->poll(events, revents, fdflags);
-                this->targetnode->unref();
+                int ret = this->targetdev->driver->poll(this->targetdevnum, events, revents, fdflags);
                 this->devlock.release();
                 return ret;
             }

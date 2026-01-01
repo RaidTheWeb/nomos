@@ -458,7 +458,7 @@ namespace NLib {
 
                 struct entry *current = this->buckets[idx]; // Get current bucket at this index.
                 this->buckets[idx] = new struct entry;
-                this->buckets[idx]->key = key;
+                this->buckets[idx]->key = NLib::strdup(key); // Copy key to avoid dangling pointer if original is freed.
                 this->buckets[idx]->value = val;
                 this->buckets[idx]->next = current; // Point the bucket to our previous current bucket, while also setting values.
                 this->itemcount++;
@@ -472,6 +472,7 @@ namespace NLib {
                     if (!NLib::strcmp((*entry)->key, key)) {
                         struct entry *todel = *entry;
                         *entry = todel->next; // Skip this entry, we're deleting it.
+                        delete[] todel->key; // Free the copied key.
                         delete todel;
 
                         this->itemcount--;

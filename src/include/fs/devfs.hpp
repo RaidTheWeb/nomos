@@ -34,6 +34,8 @@ namespace NFS {
                     (uint32_t)(dev & MINORLO);
         }
 
+        class DevFileSystem;
+
         class DevNode : public VFS::INode {
             private:
                 const char *symlinktarget = NULL;
@@ -61,6 +63,10 @@ namespace NFS {
 
                 void setdev(NDev::Device *dev) {
                     this->device = dev;
+                }
+
+                NLib::HashMap<DevNode *> &getchildren(void) {
+                    return this->children;
                 }
 
                 ssize_t read(void *buf, size_t count, off_t offset, int fdflags) override;
@@ -96,6 +102,8 @@ namespace NFS {
                     this->root = new DevNode(this, "", attr);
                 }
 
+                ~DevFileSystem(void);
+
                 static VFS::IFileSystem *instance(VFS::VFS *vfs) {
                     return new DevFileSystem(vfs);
                 }
@@ -105,7 +113,52 @@ namespace NFS {
                 int umount(int flags) override;
                 ssize_t create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) override;
                 int unlink(VFS::INode *node, VFS::INode *parent) override;
+
+                // Create a class directory node directly on this filesystem.
+                DevNode *createclassnode(const char *classname);
+                // Remove a class directory node from this filesystem.
+                void removeclassnode(const char *classname);
+                // Create a device file node directly on this filesystem.
+                DevNode *createdevnode(const char *name, struct VFS::stat attr, const char *classname);
+                // Remove a device file node from this filesystem.
+                void removedevnode(const char *name, const char *classname);
         };
+
+        struct regclass {
+            const char *name; // Class name (for /dev/<class>/).
+        };
+
+        struct regdevfile {
+            const char *name; // Device file name (for /dev/<class>/<name>).
+            const char *classname; // Device class name, or NULL for generic (root /dev/).
+            struct VFS::stat attr; // Attributes for the device node.
+        };
+
+        extern NArch::Spinlock devlock;
+        extern NLib::DoubleList<struct regclass> registeredclasses;
+        extern NLib::DoubleList<struct regdevfile> registered;
+        extern NLib::DoubleList<DevFileSystem *> mountedinstances;
+
+        // Register a mounted devfs instance for automatic updates.
+        void registerinstance(DevFileSystem *fs);
+        // Unregister a devfs instance.
+        void unregisterinstance(DevFileSystem *fs);
+
+        // Register a device class (creates /dev/<name>/ directory).
+        void registerclass(const char *name);
+        // Unregister a device class.
+        void unregisterclass(const char *name);
+
+        // Register a device file under a device class. If classname is NULL, registers under /dev/ directly.
+        void registerdevfile(const char *name, struct VFS::stat attr, const char *classname = NULL);
+        // Unregister a device file.
+        void unregisterdevfile(const char *name, const char *classname = NULL);
+
+        // Find a registered class by name. Returns NULL if not found.
+        struct regclass *findclass(const char *name);
+
+        // Lookup a device node by name from the first mounted devfs instance.
+        DevNode *lookupdevnode(const char *name, const char *classname = NULL);
     }
 }
 #endif

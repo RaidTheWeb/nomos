@@ -21,7 +21,7 @@ namespace NDev {
                     return -EFAULT; // Invalid buffer.
                 }
 
-                return blkdev->readbytes(buf, count, offset, fdflags);
+                return blkdev->readbytes(buf, count, offset, fdflags, NDev::IO_RAW);
             }
             return -ENODEV;
         }
@@ -42,7 +42,7 @@ namespace NDev {
                     return -EFAULT; // Invalid buffer.
                 }
 
-                return blkdev->writebytes(buf, count, offset, fdflags);
+                return blkdev->writebytes(buf, count, offset, fdflags, NDev::IO_RAW);
             }
             return -ENODEV;
         }

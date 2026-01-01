@@ -268,9 +268,24 @@ namespace NFS {
                     }
                 }
 
+                // Calculate the length needed to construct the path.
+                size_t constructlen(void) {
+                    size_t len = this->absolute ? 1 : 0; // Leading slash if absolute.
+                    this->components.forcmp([](const char **c, void *udata) {
+                        size_t *lenptr = (size_t *)udata;
+                        *lenptr += NLib::strlen(*c) + 1; // Component + slash.
+                    }, (void *)&len);
+                    // Account for null terminator, and the trailing slash becoming null.
+                    return len > 0 ? len : 1;
+                }
+
                 const char *construct(void) {
-                    char *res = new char[1024]; // Allocate string.
-                    NLib::memset(res, 0, 1024);
+                    size_t buflen = this->constructlen() + 1; // +1 for safety.
+                    char *res = new char[buflen];
+                    if (!res) {
+                        return NULL;
+                    }
+                    NLib::memset(res, 0, buflen);
                     char *ptr = res; // Point to start for working pointer.
 
                     if (this->absolute) {
@@ -288,7 +303,7 @@ namespace NFS {
                         (*p)++;
                     }, (void *)&ptr);
 
-                    // Remove trailing zero.
+                    // Remove trailing slash.
                     if (!this->components.empty()) {
                         *(ptr - 1) = '\0';
                     }
@@ -298,11 +313,9 @@ namespace NFS {
 
                 bool equals(const char *normalised) {
                     const char *path = this->construct();
-                    if (!NLib::strcmp(path, normalised)) {
-                        delete path;
-                        return true;
-                    }
-                    return false;
+                    bool result = !NLib::strcmp(path, normalised);
+                    delete[] path;
+                    return result;
                 }
 
                 size_t depth(void) {
@@ -554,7 +567,22 @@ namespace NFS {
                 NArch::Spinlock spin;
                 VFS *vfs;
                 bool mounted = false;
+                size_t mountrefcount = 0;  // Tracks active usage (open files, cwds, roots)
             public:
+                // Increment mount reference count when filesystem is actively used.
+                void fsref(void) {
+                    __atomic_add_fetch(&this->mountrefcount, 1, memory_order_seq_cst);
+                }
+
+                // Decrement mount reference count when filesystem usage is released.
+                void fsunref(void) {
+                    __atomic_sub_fetch(&this->mountrefcount, 1, memory_order_seq_cst);
+                }
+
+                // Get current mount reference count.
+                size_t getfsrefcount(void) {
+                    return __atomic_load_n(&this->mountrefcount, memory_order_seq_cst);
+                }
                 virtual ~IFileSystem(void) {
                     if (this->root) {
                         this->root->unref();
@@ -633,10 +661,12 @@ namespace NFS {
                 INode *root = NULL;
 
                 struct mntpoint *_findmount(Path *path);
+                struct mntpoint *_findmountbynode(INode *node);
             public:
                 VFS(void) { };
 
                 struct mntpoint *findmount(Path *path);
+                struct mntpoint *findmountbynode(INode *node);
 
                 // Mount filesystem on path, with a new filesystem instance.
                 int mount(const char *src, const char *path, const char *fs, uint64_t flags, const void *data);
@@ -650,15 +680,21 @@ namespace NFS {
                     return this->root;
                 }
 
+                INode *setroot(INode *newroot) {
+                    INode *oldroot = this->root;
+                    this->root = newroot;
+                    return oldroot;
+                }
+
                 // Check if UID or GID are allowed to access the node, given the flags.
                 bool checkaccess(INode *node, int flags, uint32_t uid, uint32_t gid);
 
                 // Resolve node by path.
-                ssize_t resolve(const char *path, INode **nodeout, INode *relativeto = NULL, bool symlink = true);
+                ssize_t resolve(const char *path, INode **nodeout, INode *relativeto = NULL, bool symlink = true, INode *procroot = NULL);
 
-                ssize_t create(const char *path, INode **nodeout, struct stat attr, INode *relativeto = NULL);
-                int unlink(const char *path, INode *relativeto = NULL, int flags = 0, int uid = 0, int gid = 0);
-                int rename(const char *oldpath, INode *oldrelativeto, const char *newpath, INode *newrelativeto, int uid = 0, int gid = 0);
+                ssize_t create(const char *path, INode **nodeout, struct stat attr, INode *relativeto = NULL, INode *procroot = NULL);
+                int unlink(const char *path, INode *relativeto = NULL, int flags = 0, int uid = 0, int gid = 0, INode *procroot = NULL);
+                int rename(const char *oldpath, INode *oldrelativeto, const char *newpath, INode *newrelativeto, int uid = 0, int gid = 0, INode *procroot = NULL);
 
                 int identifyfs(const char *src);
 

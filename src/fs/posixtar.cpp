@@ -230,7 +230,14 @@ namespace NFS {
 
                 current = (struct info *)((uintptr_t)current + 512 + NLib::alignup(fsize, 512));
             }
+
             return 0;
+        }
+
+        void POSIXTARFileSystem::reclaim(void) {
+            // Reclaim the initramfs memory by creating a new bitmap zone.
+            NUtil::printf("[fs/ustar]: Reclaiming initramfs memory at %p with length %lu.\n", this->modinfo.loc, this->modinfo.size);
+            NArch::PMM::newzone(this->modinfo.loc, this->modinfo.size);
         }
 
     }

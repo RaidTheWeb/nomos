@@ -6,6 +6,7 @@
 #include <sched/event.hpp>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/timer.hpp>
 
 #ifdef __x86_64__
 #include <arch/x86_64/pmm.hpp>
@@ -124,6 +125,7 @@ namespace NMem {
 
             RadixTreeNode *extendtree(off_t index);
             static size_t maxindex(uint8_t height);
+            CachePage *lookupinternal(off_t index); // Internal lookup without lock.
         public:
             RadixTree(void) = default;
             ~RadixTree(void);
@@ -133,6 +135,9 @@ namespace NMem {
 
             // Lookup a page by index.
             CachePage *lookup(off_t index);
+
+            // Lookup a page and lock it atomically. Prevents race with eviction.
+            CachePage *lookupandlock(off_t index);
 
             // Remove a page by index.
             CachePage *remove(off_t index);
@@ -166,7 +171,13 @@ namespace NMem {
             volatile bool running = true;
             volatile bool exited = false;
             NSched::WaitQueue exitwq;
+            NSched::WaitQueue wakeupwq; // Wake writeback thread early.
             NSched::Thread *wbthread = NULL;
+
+            // Writeback configuration.
+            static constexpr uint64_t WRITEBACKINTERVALMS = 5000; // 5 seconds default.
+            static constexpr size_t MAXWRITEBACKPERCYCLE = 64; // Max pages per writeback cycle.
+            static constexpr size_t DIRTYTHRESHOLDPERCENT = 40; // Start throttling at 40% dirty.
 
             void addtoactive(CachePage *page);
             void addtoinactive(CachePage *page);
@@ -208,11 +219,26 @@ namespace NMem {
             // Background writeback thread entry point.
             void writebackthread(void);
 
+            // Start the writeback thread. Called after scheduler is initialized.
+            void startwritebackthread(void);
+
+            // Immediately wake the writeback thread.
+            void wakewriteback(void);
+
             // Try to free 'count' pages. Returns number actually freed.
             size_t shrink(size_t count);
 
             // Reclaim pages under memory pressure.
             void reclaim(void);
+
+            // Invalidate a single page.
+            int invalidatepage(NFS::VFS::INode *inode, off_t offset);
+
+            // Invalidate all pages for an inode.
+            int invalidateinode(NFS::VFS::INode *inode);
+
+            // Check if dirty page throttling should occur.
+            bool shouldthrottle(void) const;
 
             size_t gettotalpages(void) const {
                 return this->totalpages;
@@ -251,6 +277,12 @@ namespace NMem {
 
     // Initialize the global page cache subsystem.
     void initpagecache(void);
+
+    // Start the page cache writeback thread (call after scheduler init).
+    void startpagecachethread(void);
+
+    // Called by PMM under memory pressure to reclaim pages.
+    size_t reclaimcachepages(size_t count);
 
     // Convert byte offset to page index.
     static inline off_t offsettopageindex(off_t offset) {
