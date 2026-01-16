@@ -21,6 +21,7 @@ namespace NDev {
                     return -EFAULT; // Invalid buffer.
                 }
 
+                // IO_RAW specified so we can use page cache.
                 return blkdev->readbytes(buf, count, offset, fdflags, NDev::IO_RAW);
             }
             return -ENODEV;
@@ -42,6 +43,7 @@ namespace NDev {
                     return -EFAULT; // Invalid buffer.
                 }
 
+                // Same story over here.
                 return blkdev->writebytes(buf, count, offset, fdflags, NDev::IO_RAW);
             }
             return -ENODEV;

@@ -21,33 +21,11 @@ namespace NSched {
         return unblocked != 0;
     }
 
-    static Thread *wakeoneinternal(NLib::DoubleList<Thread *> &waiting) {
-        while (!waiting.empty()) {
-            Thread *thread = waiting.pop();
-
-            __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
-
-            NArch::CPU::mb();
-
-            // Clear the waitingon pointer while holding waitingonlock.
-            thread->waitingonlock.acquire();
-            thread->waitingon = NULL;
-            thread->waitingonlock.release();
-
-            // Read current state to determine action.
-            enum Thread::state curstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-
-            if (curstate == Thread::state::WAITING || curstate == Thread::state::WAITINGINT) {
-                schedulethread(thread);
-            }
-
-            return thread;
-        }
-        return NULL;
-    }
-
     void WaitQueue::preparewait(void) {
         Thread *thread = NArch::CPU::get()->currthread;
+
+        // Clear wokenbeforewait flag before setting up wait.
+        __atomic_store_n(&thread->wokenbeforewait, false, memory_order_release);
 
         // Set pending wait state FIRST, before adding to list.
         // This ensures signal handlers see the pending state even if list add races.
@@ -73,6 +51,9 @@ namespace NSched {
         if (haspendingsignal(thread)) {
             return true; // Signal pending, caller should not wait.
         }
+
+        // Clear wokenbeforewait flag before setting up wait.
+        __atomic_store_n(&thread->wokenbeforewait, false, memory_order_release);
 
         // Set pending wait state for interruptible wait.
         __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release);
@@ -111,29 +92,42 @@ namespace NSched {
             return;
         }
 
-        thread->waitingonlock.acquire();
-        WaitQueue *wq = thread->waitingon;
-        thread->waitingonlock.release();
+        // Unlocked path: need to find and lock the waitqueue we're on.
+        // Use a retry loop to handle races with wake() safely.
+        for (;;) {
+            thread->waitingonlock.acquire();
+            WaitQueue *wq = thread->waitingon;
+            thread->waitingonlock.release();
 
-        if (!wq) {
-            // Not on any waitqueue (already woken or never added).
-            return;
+            if (!wq) {
+                // Not on any waitqueue (already woken or never added).
+                return;
+            }
+
+            // Acquire locks in correct order: waitinglock -> waitingonlock.
+            wq->waitinglock.acquire();
+            thread->waitingonlock.acquire();
+
+            // Re-check waitingon in case it changed while we acquired locks.
+            if (thread->waitingon == wq) {
+                wq->waiting.remove([](Thread *t, void *udata) -> bool {
+                    return t == (Thread *)udata;
+                }, (void *)thread);
+                thread->waitingon = NULL;
+                thread->waitingonlock.release();
+                wq->waitinglock.release();
+                return;
+            } else if (thread->waitingon == NULL) {
+                // wake() already cleared us, we're done.
+                thread->waitingonlock.release();
+                wq->waitinglock.release();
+                return;
+            }
+
+            // waitingon changed to a different waitqueue, release and retry.
+            thread->waitingonlock.release();
+            wq->waitinglock.release();
         }
-
-        wq->waitinglock.acquire();
-        thread->waitingonlock.acquire();
-
-        // Re-check waitingon in case it changed while we acquired locks.
-        if (thread->waitingon == wq) {
-            wq->waiting.remove([](Thread *t, void *udata) -> bool {
-                return t == (Thread *)udata;
-            }, (void *)thread);
-            thread->waitingon = NULL;
-        }
-        // If waitingon changed (e.g., became NULL because wake() ran), nothing to do.
-
-        thread->waitingonlock.release();
-        wq->waitinglock.release();
     }
 
     int WaitQueue::finishwaitinterruptible(bool locked) {
@@ -154,11 +148,18 @@ namespace NSched {
             }
             thread->waitingonlock.release();
         } else {
-            thread->waitingonlock.acquire();
-            WaitQueue *wq = thread->waitingon;
-            thread->waitingonlock.release();
+            // Unlocked path: use retry loop for safe lock ordering.
+            for (;;) {
+                thread->waitingonlock.acquire();
+                WaitQueue *wq = thread->waitingon;
+                thread->waitingonlock.release();
 
-            if (wq) {
+                if (!wq) {
+                    // Already woken or never added.
+                    break;
+                }
+
+                // Acquire locks in correct order: waitinglock -> waitingonlock.
                 wq->waitinglock.acquire();
                 thread->waitingonlock.acquire();
 
@@ -167,8 +168,17 @@ namespace NSched {
                         return t == (Thread *)udata;
                     }, (void *)thread);
                     thread->waitingon = NULL;
+                    thread->waitingonlock.release();
+                    wq->waitinglock.release();
+                    break;
+                } else if (thread->waitingon == NULL) {
+                    // wake() already cleared us.
+                    thread->waitingonlock.release();
+                    wq->waitinglock.release();
+                    break;
                 }
 
+                // waitingon changed to a different waitqueue, release and retry.
                 thread->waitingonlock.release();
                 wq->waitinglock.release();
             }
@@ -188,6 +198,9 @@ namespace NSched {
         if (!locked) {
             this->waitinglock.acquire();
         }
+
+        // Clear wokenbeforewait flag before setting up wait.
+        __atomic_store_n(&thread->wokenbeforewait, false, memory_order_release);
 
         // Set up the wait state atomically while holding the lock.
         __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAIT, memory_order_release);
@@ -214,6 +227,7 @@ namespace NSched {
     void WaitQueue::funcname(locktype *lock) { \
         Thread *thread = NArch::CPU::get()->currthread; \
         this->waitinglock.acquire(); \
+        __atomic_store_n(&thread->wokenbeforewait, false, memory_order_release); \
         __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAIT, memory_order_release); \
         thread->waitingonlock.acquire(); \
         thread->waitingon = this; \
@@ -244,6 +258,9 @@ namespace NSched {
             return -EINTR;
         }
 
+        // Clear wokenbeforewait flag before setting up wait.
+        __atomic_store_n(&thread->wokenbeforewait, false, memory_order_release);
+
         // Set up interruptible wait.
         __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release);
 
@@ -273,6 +290,7 @@ namespace NSched {
             this->waitinglock.release(); \
             return -EINTR; \
         } \
+        __atomic_store_n(&thread->wokenbeforewait, false, memory_order_release); \
         __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_WAITINT, memory_order_release); \
         thread->waitingonlock.acquire(); \
         thread->waitingon = this; \
@@ -291,38 +309,79 @@ namespace NSched {
     WAITINTLOCKED_IMPL(waitinterruptiblelocked, NSched::Mutex)
 
     void WaitQueue::wake(void) {
+        NLib::SingleList<Thread *> towake;
+
         this->waitinglock.acquire();
 
-        // Wake all waiting threads.
+        // Collect all waiting threads.
         while (!this->waiting.empty()) {
             Thread *thread = this->waiting.pop();
 
-            // Clear pending wait state FIRST to prevent scheduler from re-transitioning.
-            __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+            // Set wokenbeforewait FIRST to prevent scheduler from transitioning to WAITING.
+            __atomic_store_n(&thread->wokenbeforewait, true, memory_order_release);
 
-            // Full memory barrier.
-            NArch::CPU::mb();
+            // Clear pending wait state to prevent scheduler from re-transitioning.
+            __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
 
             // Clear waitingon pointer. Lock order: waitinglock (held) -> waitingonlock.
             thread->waitingonlock.acquire();
             thread->waitingon = NULL;
             thread->waitingonlock.release();
 
-            // Read current state to determine action.
-            enum Thread::state curstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-
-            if (curstate == Thread::state::WAITING || curstate == Thread::state::WAITINGINT) {
-                schedulethread(thread);
-            }
+            towake.push(thread);
         }
 
         this->waitinglock.release();
+
+        // Full memory barrier before scheduling.
+        NArch::CPU::mb();
+
+        // Now schedule threads without holding waitinglock.
+        while (!towake.empty()) {
+            Thread *thread = towake.pop();
+            enum Thread::state curstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+            if (curstate == Thread::state::DEAD) {
+                continue;
+            }
+
+            schedulethread(thread);
+        }
     }
 
     void WaitQueue::wakeone(void) {
+        Thread *thread = NULL;
+
         this->waitinglock.acquire();
-        wakeoneinternal(this->waiting);
+
+        if (!this->waiting.empty()) {
+            thread = this->waiting.pop();
+
+            // Set wokenbeforewait FIRST to prevent scheduler from transitioning to WAITING.
+            __atomic_store_n(&thread->wokenbeforewait, true, memory_order_release);
+
+            __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
+
+            // Clear waitingon pointer. Lock order: waitinglock (held) -> waitingonlock.
+            thread->waitingonlock.acquire();
+            thread->waitingon = NULL;
+            thread->waitingonlock.release();
+        }
+
         this->waitinglock.release();
+
+        // Schedule thread without holding waitinglock.
+        if (thread) {
+            NArch::CPU::mb();
+
+            enum Thread::state curstate = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+            if (curstate == Thread::state::DEAD) {
+                return;
+            }
+
+            schedulethread(thread);
+        }
     }
 
     bool WaitQueue::dequeue(Thread *target) {
@@ -334,6 +393,9 @@ namespace NSched {
         }, (void *)target);
 
         if (found) {
+            // Set wokenbeforewait FIRST to prevent scheduler from transitioning to WAITING.
+            __atomic_store_n(&target->wokenbeforewait, true, memory_order_release);
+
             __atomic_store_n(&target->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
 
             // Memory barrier.

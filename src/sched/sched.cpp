@@ -13,31 +13,188 @@
 #include <mm/ucopy.hpp>
 #include <sched/event.hpp>
 #include <sched/sched.hpp>
+#include <std/stdatomic.h>
 #include <sys/clock.hpp>
 #include <sys/elf.hpp>
 #include <sys/syscall.hpp>
 #include <sys/timer.hpp>
+#include <util/kprint.hpp>
 
-// NOTE: Lock ordering:
-// - When acquiring multiple locks, always acquire in this order to prevent deadlocks:
-// 1. pidtablelock
-// 2. proc->lock
-// 3. session->lock
-// 4. runqueue.lock (ordered by CPU ID)
-// 5. waitqueue.waitinglock
-// 6. thread->waitingonlock
-// 7. zombielock
+// This is SUPER easy to get wrong, be VERY careful when acquiring multiple locks.
+// Lock ordering hierarchy:
+// Level 1:
+// - pidtablelock
+// - futexlock
+// Level 2:
+// - Process::lock
+// Level 3:
+// - ProcessGroup::lock
+// - Session::lock
+// Level 4:
+// - VMM::addrspace::lock
+// Level 5:
+// - waitinglock (WaitQueue)
+// Level 6:
+// - Thread::waitingonlock
+// Level 7:
+// - runqueue.lock (per-cpu)
 
 namespace NSched {
     using namespace NArch;
 
-    static int vruntimecmp(struct RBTree::node *a, struct RBTree::node *b);
+    // Scheduler initialisation state, set by BSP setup.
+    bool initialised = false;
 
-    // Global zombie list for deferred thread cleanup.
-    static NArch::IRQSpinlock zombielock;
-    static Thread *zombiehead = NULL;
+    // Zombie queue for deferred thread deletion.
+    static Thread *zombiehead = NULL; // Fresh zombies.
+    static Thread *oldzombies = NULL; // Zombies from previous cycle (will be deleted next cycle).
+    static Spinlock zombielock;
 
-    // Comparison function for insertion logic.
+    // Queue a dead thread for deferred deletion.
+    static void queuezombie(Thread *thread) {
+        zombielock.acquire();
+        thread->nextzombie = zombiehead;
+        zombiehead = thread;
+        zombielock.release();
+    }
+
+    // Called periodically from the scheduler to clean up dead threads.
+    static void reapzombies(void) {
+        // First, delete threads from the previous cycle (oldzombies).
+        Thread *todelete = __atomic_exchange_n(&oldzombies, NULL, memory_order_acq_rel);
+        while (todelete) {
+            Thread *next = todelete->nextzombie;
+            todelete->nextzombie = NULL;
+            delete todelete;
+            todelete = next;
+        }
+
+        // Then, move current zombies to oldzombies for next cycle.
+        zombielock.acquire();
+        Thread *zombie = zombiehead;
+        zombiehead = NULL;
+        zombielock.release();
+
+        if (zombie) {
+            // Append to oldzombies (will be deleted next cycle).
+            __atomic_store_n(&oldzombies, zombie, memory_order_release);
+        }
+    }
+
+    void setthreadstate(Thread *thread, Thread::state newstate, const char *loc) {
+#ifdef TSTATE_DEBUG
+        Thread::state oldstate = (Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+        __atomic_store_n(&thread->laststate, oldstate, memory_order_release);
+        __atomic_store_n(&thread->laststateloc, loc, memory_order_release);
+#ifdef __x86_64__
+        __atomic_store_n(&thread->laststatetransition, TSC::query(), memory_order_release);
+#endif
+
+#endif
+        __atomic_store_n(&thread->tstate, newstate, memory_order_release);
+    }
+
+#ifdef TSTATE_DEBUG
+    void dumpthread(Thread *thread) {
+        Thread::state curstate = (Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+        Thread::state laststate = (Thread::state)__atomic_load_n(&thread->laststate, memory_order_acquire);
+        Thread::pendingwait pendwait = (Thread::pendingwait)__atomic_load_n(&thread->pendingwaitstate, memory_order_acquire);
+        bool inrq = __atomic_load_n(&thread->inrunqueue, memory_order_acquire);
+        bool wokenbefore = __atomic_load_n(&thread->wokenbeforewait, memory_order_acquire);
+        size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
+        size_t lastcid = __atomic_load_n(&thread->lastcid, memory_order_acquire);
+        uint64_t lastts = __atomic_load_n(&thread->laststatetransition, memory_order_acquire);
+        const char *lastloc = (const char *)__atomic_load_n((uintptr_t *)&thread->laststateloc, memory_order_acquire);
+
+        uint64_t now = 0;
+#ifdef __x86_64__
+        now = TSC::query();
+#endif
+        uint64_t agems = (lastts > 0 && now > lastts) ? ((now - lastts) * 1000 / TSC::hz) : 0;
+
+        NUtil::printf("  Thread %p [pid=%lu tid=%lu]: state=%s (was %s), pending=%s\n",
+            thread,
+            thread->process ? thread->process->id : 0,
+            thread->id,
+            Thread::statename(curstate),
+            Thread::statename(laststate),
+            Thread::pendingwaitname(pendwait));
+        NUtil::printf("    inrunqueue=%d, wokenbeforewait=%d, cid=%lu, lastcid=%lu\n",
+            inrq, wokenbefore, cid, lastcid);
+        NUtil::printf("    laststatetrans=%lums ago @ %s\n", agems, lastloc ? lastloc : "(unknown)");
+
+        // Check for potential issues.
+        if (curstate == Thread::state::READY && !inrq) {
+            NUtil::printf("    !!! WARNING: Thread in READY state but not in runqueue!\n");
+        }
+        if (curstate == Thread::state::SUSPENDED && !inrq) {
+            NUtil::printf("    !!! WARNING: Thread in SUSPENDED state but not in runqueue!\n");
+        }
+        if ((curstate == Thread::state::WAITING || curstate == Thread::state::WAITINGINT) && inrq) {
+            NUtil::printf("    !!! WARNING: Thread in WAITING state but still in runqueue!\n");
+        }
+        if (curstate == Thread::state::RUNNING && thread != CPU::get()->currthread) {
+            NUtil::printf("    !!! WARNING: Thread marked RUNNING but not current on this CPU!\n");
+        }
+
+        // Check for thread stuck in WAITING without a waitqueue.
+        thread->waitingonlock.acquire();
+        WaitQueue *wq = thread->waitingon;
+        thread->waitingonlock.release();
+        if ((curstate == Thread::state::WAITING || curstate == Thread::state::WAITINGINT) && !wq) {
+            NUtil::printf("    !!! WARNING: Thread in WAITING state but waitingon is NULL!\n");
+        }
+    }
+
+    // Debug: Dump state of all threads in the system.
+    void dumpthreads(void) {
+        NUtil::printf("=== THREAD STATE DUMP ===\n");
+
+        // Dump CPU runqueues.
+        for (size_t i = 0; i < SMP::awakecpus; i++) {
+            struct CPU::cpulocal *cpu = SMP::cpulist[i];
+            NUtil::printf("CPU %lu: currthread=%p (idle=%p), runqueue count=%lu\n",
+                i,
+                cpu->currthread,
+                cpu->idlethread,
+                cpu->runqueue.count());
+
+            // Dump threads in this CPU's runqueue.
+            cpu->runqueue.lock.acquire();
+            RBTree::node *n = cpu->runqueue._first();
+            size_t count = 0;
+            while (n && count < 10) { // Limit to 10 for safety.
+                Thread *t = RBTree::getentry<Thread>(n);
+                dumpthread(t);
+                n = cpu->runqueue._next(n);
+                count++;
+            }
+            cpu->runqueue.lock.release();
+        }
+
+        // Dump all processes and their threads.
+        NUtil::printf("\n--- All Processes ---\n");
+        pidtablelock.acquire();
+        for (auto it = pidtable->begin(); it.valid(); it.next()) {
+            Process *proc = *it.value();
+            NUtil::printf("Process %lu (state=%d, threads=%lu):\n",
+                proc->id, proc->pstate, proc->threadcount);
+
+            proc->lock.acquire();
+            auto tit = proc->threads.begin();
+            while (tit.valid()) {
+                Thread *t = *tit.get();
+                dumpthread(t);
+                tit.next();
+            }
+            proc->lock.release();
+        }
+        pidtablelock.release();
+
+        NUtil::printf("=== END DUMP ===\n");
+    }
+#endif
+
     static int vruntimecmp(struct RBTree::node *a, struct RBTree::node *b) {
         // Get references to threads from Red-Black tree nodes.
         Thread *ta = RBTree::getentry<Thread>(a);
@@ -53,321 +210,207 @@ namespace NSched {
         return (ta->id < tb->id) ? -1 : 1;
     }
 
-    // Locked enqueue, expects state to already be set.
-    static void enqueuethread(struct CPU::cpulocal *cpu, Thread *thread) {
-        assert(thread != cpu->idlethread, "Cannot enqueue idle thread.\n");
-        cpu->runqueue.lock.acquire();
-        cpu->runqueue._insert(&thread->node, vruntimecmp);
-        cpu->runqueue.lock.release();
+    // Save pointer system call context before a system call, so we can use it for sys_fork and sys_execve.
+    extern "C" __attribute__((no_caller_saved_registers)) void sched_savesysstate(struct CPU::context *ctx) {
+        struct CPU::cpulocal *cpu = CPU::get();
+        Thread *thread = cpu->currthread;
+
+        // Update pointer to context. Since it's a pointer, we can just overwrite it to return somewhere else after the system call (great for sys_execve or sys_sigreturn).
+        thread->sysctx = ctx;
+        // Inform kernel of current interrupt status.
+        cpu->intstatus = true;
     }
 
-    // Caller must hold the runqueue lock.
-    static Thread *dequeuethread_locked(struct CPU::cpulocal *cpu) {
-        struct RBTree::node *node = cpu->runqueue._first();
-        if (!node) {
-            return NULL;
-        }
-        cpu->runqueue._erase(node);
-        return RBTree::getentry<Thread>(node);
-    }
-
-    // Process any dead threads in the zombie list.
-    // Two-phase zombie collection for safe deferred deletion.
-    static Thread *oldzombies = NULL;
-
-    static void reapzombies(void) {
-        Thread *todelete = __atomic_exchange_n(&oldzombies, NULL, memory_order_acq_rel);
-        while (todelete) {
-            Thread *next = todelete->nextzombie;
-            todelete->nextzombie = NULL;
-            delete todelete;
-            todelete = next;
-        }
-
-        // Then, move current zombies to oldzombies for next cycle.
-        if (!__atomic_load_n(&zombiehead, memory_order_acquire)) {
-            return; // What? No head?
-        }
-
-        zombielock.acquire();
-        Thread *zombie = zombiehead;
-        zombiehead = NULL;
-        zombielock.release();
-
-        if (zombie) {
-            // Find end of zombie chain.
-            Thread *tail = zombie;
-            while (tail->nextzombie) {
-                tail = tail->nextzombie;
+    // Handle lazily restoring FPU context on-demand.
+    void handlelazyfpu(void) {
+#ifdef __x86_64__
+        uint64_t cr0 = CPU::rdcr0();
+        if (cr0 & (1 << 3)) {
+            asm volatile("clts");
+            Thread *thread = CPU::get()->currthread;
+            if (thread && thread->fctx.fpustorage) {
+                CPU::restorefctx(&thread->fctx);
+                thread->fctx.mathused = true;
             }
+            return;
+        }
+#endif
+        assert(false, "Invalid FPU lazy restore!\n");
+    }
 
-            // Atomically prepend to oldzombies.
-            Thread *expected = __atomic_load_n(&oldzombies, memory_order_acquire);
-            do {
-                tail->nextzombie = expected;
-            } while (!__atomic_compare_exchange_n(&oldzombies, &expected, zombie,
-                                                   false, memory_order_acq_rel, memory_order_acquire));
+    // Update minvruntime after removing the leftmost thread. Must hold cpu->runqueue.lock.
+    static void updateminvruntime(struct CPU::cpulocal *cpu) {
+        RBTree::node *first = cpu->runqueue._first();
+        if (first) {
+            Thread *t = RBTree::getentry<Thread>(first);
+            uint64_t newmin = t->getvruntime();
+            uint64_t oldmin = __atomic_load_n(&cpu->minvruntime, memory_order_acquire);
+            // Only update if new minimum is greater (monotonic increase).
+            if (newmin > oldmin) {
+                __atomic_store_n(&cpu->minvruntime, newmin, memory_order_release);
+            }
+        }
+        // If queue is empty, leave minvruntime unchanged.
+    }
+
+    // Update minvruntime after inserting a thread (might lower the minimum). Must hold cpu->runqueue.lock.
+    static void updateminvruntimeoninsert(struct CPU::cpulocal *cpu, Thread *thread) {
+        uint64_t newvrt = thread->getvruntime();
+        uint64_t oldmin = __atomic_load_n(&cpu->minvruntime, memory_order_acquire);
+        if (newvrt < oldmin || oldmin == 0) {
+            __atomic_store_n(&cpu->minvruntime, newvrt, memory_order_release);
         }
     }
 
-    // Queue a thread for deferred deletion.
-    static bool queuezombie(Thread *thread) {
-        // Use CAS to ensure only one caller can queue this thread.
-        bool expected = false;
-        if (!__atomic_compare_exchange_n(&thread->zombiequeued, &expected, true, false, memory_order_acq_rel, memory_order_acquire)) {
-            return false; // Already queued by another path.
-        }
-
-        zombielock.acquire();
-        thread->nextzombie = zombiehead;
-        zombiehead = thread;
-        zombielock.release();
-        return true;
-    }
-
-
-    // Attempts to locate a busier CPU (considering STEALTHRESHOLD) to steal tasks from. This is used for load balancing.
-    static struct CPU::cpulocal *getstealbusiest(void) {
-        // XXX: Calculate within the same NUMA node, to avoid cross-node migrations.
-
-        uint64_t maxload = 0;
+    static struct CPU::cpulocal *getbusiest(void) {
         struct CPU::cpulocal *busiest = NULL;
-        uint64_t ourload = __atomic_load_n(&CPU::get()->loadweight, memory_order_seq_cst);
+        uint64_t maxload = STEALTHRESHOLD * 1024; // Minimum threshold.
 
         for (size_t i = 0; i < SMP::awakecpus; i++) {
-            // Atomically load the load of the CPU. We want to be avoiding using spinlocks, so we don't occupy the instance's state.
-            uint64_t load = __atomic_load_n(&SMP::cpulist[i]->loadweight, memory_order_seq_cst);
-
-            if (load > ourload * 2) { // Early exit for severely overloaded CPU.
-                return SMP::cpulist[i];
-            }
-
-            if (load > maxload && load > ourload + STEALTHRESHOLD) { // If this is the biggest load thus far, *AND* exceeds our threshold, we'll keep this in mind for stealing from.
-                maxload = load; // Update maximum load thus far, for comparison against others.
-                busiest = SMP::cpulist[i]; // Thus far, this is our busiest CPU.
+            struct CPU::cpulocal *cpu = SMP::cpulist[i];
+            uint64_t load = __atomic_load_n(&cpu->loadweight, memory_order_acquire);
+            if (load > maxload) {
+                maxload = load;
+                busiest = cpu;
             }
         }
-
         return busiest;
     }
 
-    // Attempts to locate the most idle CPU. This is used for scheduling, and for the target of load balancing.
     static struct CPU::cpulocal *getidlest(void) {
-        // XXX: Calculate within the same NUMA node, to avoid cross-node migrations.
-
-        uint64_t minload = __UINT64_MAX__; // Start at theoretical maximum, so any lower load will be chosen first.
         struct CPU::cpulocal *idlest = NULL;
+        uint64_t minload = __UINT64_MAX__;
 
         for (size_t i = 0; i < SMP::awakecpus; i++) {
-            uint64_t load = __atomic_load_n(&SMP::cpulist[i]->loadweight, memory_order_seq_cst);
-
-            if (load < minload) { // If this CPU has less load than the last, pick it.
+            struct CPU::cpulocal *cpu = SMP::cpulist[i];
+            uint64_t load = __atomic_load_n(&cpu->loadweight, memory_order_acquire);
+            if (load < minload) {
                 minload = load;
-                idlest = SMP::cpulist[i];
-
-                if (load == 0) { // CPU has no work!
-                    break; // Break so we choose this one.
-                }
+                idlest = cpu;
             }
         }
-
         return idlest;
     }
 
+    // Update load weight for a CPU based on its runqueue size.
     void updateload(struct CPU::cpulocal *cpu) {
         size_t num = cpu->runqueue.count();
-        // Weighted load balancing calculation, considering the number of active tasks.
-        // Use exponential moving average for smoother load tracking.
+
         uint64_t oldload = __atomic_load_n(&cpu->loadweight, memory_order_acquire);
         uint64_t newload = (oldload * 3 + num * 1024) / 4;
         __atomic_store_n(&cpu->loadweight, newload, memory_order_release);
+
     }
 
     void loadbalance(struct CPU::cpulocal *cpu) {
-        size_t count = cpu->runqueue.count();
-        if (count <= LOADTHRESHOLD) {
-            return; // We're done here.
+        // Skip if we're not overloaded.
+        if (cpu->runqueue.count() <= LOADTHRESHOLD) {
+            return;
         }
 
-        // Migrate our tasks to other CPUs to mitigate load.
         struct CPU::cpulocal *target = getidlest();
-        if (!target || cpu == target) { // Don't try to load balance to ourselves! We'd just end up deadlocking.
+        if (!target || target == cpu) {
             return;
         }
 
-        // Only proceed if target actually has less load.
-        if (__atomic_load_n(&target->loadweight, memory_order_acquire) >=
-            __atomic_load_n(&cpu->loadweight, memory_order_acquire)) {
-            return;
-        }
+        // Migrate up to 1/4 of our excess work.
+        size_t quota = (cpu->runqueue.count() - LOADTHRESHOLD) / 4;
+        if (quota == 0) quota = 1;
 
-        size_t quota = (count - LOADTHRESHOLD) / 4; // Target should be given a quarter of our work.
-        if (quota == 0) {
-            return;
-        }
+        cpu->runqueue.lock.acquire();
 
-        // Lock ordering to prevent cyclic deadlocks.
-        // Always acquire locks in ascending CPU ID order.
-        struct CPU::cpulocal *first = (cpu->id < target->id) ? cpu : target;
-        struct CPU::cpulocal *second = (cpu->id < target->id) ? target : cpu;
-
-        first->runqueue.lock.acquire();
-        second->runqueue.lock.acquire();
-
-        struct RBTree::node *node = cpu->runqueue._last();
         size_t migrated = 0;
-        while (node && migrated < quota) {
-            Thread *candidate = RBTree::getentry<Thread>(node);
-            struct RBTree::node *prev = cpu->runqueue._prev(node);
+        size_t checked = 0;
+        size_t maxcheck = cpu->runqueue.count();
 
-            // Check if thread is eligible for migration.
-            enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
-            if (tstate != Thread::state::SUSPENDED ||
-                __atomic_load_n(&candidate->locksheld, memory_order_acquire) > 0 ||
-                __atomic_load_n(&candidate->migratedisabled, memory_order_acquire) ||
-                candidate->fctx.mathused) {
-                node = prev;
-                continue;
+        RBTree::node *candidate = cpu->runqueue._last();
+
+        while (migrated < quota && candidate && checked < maxcheck) {
+            Thread *thread = RBTree::getentry<Thread>(candidate);
+            RBTree::node *prev = cpu->runqueue._prev(candidate);
+
+            // Check if this thread can be migrated.
+            if (!__atomic_load_n(&thread->migratedisabled, memory_order_acquire) &&
+                __atomic_load_n(&thread->locksheld, memory_order_acquire) == 0 &&
+                thread->gettargetmode() != Thread::target::STRICT) {
+
+                cpu->runqueue._erase(candidate);
+                __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+
+                cpu->runqueue.lock.release();
+
+                // Normalize vruntime to target's minvruntime before inserting.
+                uint64_t targetmin = __atomic_load_n(&target->minvruntime, memory_order_acquire);
+                uint64_t curvrt = thread->getvruntime();
+                if (curvrt < targetmin) {
+                    thread->setvruntimeabs(targetmin);
+                }
+
+                // Insert into target's queue.
+                __atomic_store_n(&thread->cid, target->id, memory_order_release);
+
+                target->runqueue.lock.acquire();
+                __atomic_store_n(&thread->inrunqueue, true, memory_order_release);
+                target->runqueue._insert(&thread->node, vruntimecmp);
+                updateminvruntimeoninsert(target, thread);
+                target->runqueue.lock.release();
+
+                migrated++;
+                cpu->runqueue.lock.acquire();
+
+                // Restart from end after tree modification.
+                candidate = cpu->runqueue._last();
+                checked = 0;
+            } else {
+                // Can't migrate this one, try the previous.
+                candidate = prev;
+                checked++;
             }
-
-            cpu->runqueue._erase(node);
-            __atomic_store_n(&candidate->lastcid, __atomic_load_n(&candidate->cid, memory_order_acquire), memory_order_release);
-            __atomic_store_n(&candidate->cid, target->id, memory_order_release);
-            NArch::CPU::writemb();
-            target->runqueue._insert(node, vruntimecmp);
-            migrated++;
-
-            node = prev;
         }
 
-        // Release locks in reverse order of acquisition.
-        second->runqueue.lock.release();
-        first->runqueue.lock.release();
-
-        if (migrated > 0) { // Only bother updating load if we actually did anything.
-            updateload(target);
-            updateload(cpu);
-        }
+        cpu->runqueue.lock.release();
     }
 
-    // Attempt to steal work from a busier CPU.
-    static Thread *steal(void) {
-        struct CPU::cpulocal *busiest = getstealbusiest();
 
-        if (!busiest || busiest == CPU::get()) {
+    static Thread *steal(void) {
+        struct CPU::cpulocal *victim = getbusiest();
+        if (!victim || victim == CPU::get()) {
             return NULL;
         }
 
-        Thread *stolen = NULL;
-        busiest->runqueue.lock.acquire();
+        victim->runqueue.lock.acquire();
 
-        // Try to find a stealable thread from the back (highest vruntime = least urgent).
-        struct RBTree::node *node = busiest->runqueue._last();
-        while (node) {
-            Thread *candidate = RBTree::getentry<Thread>(node);
-            struct RBTree::node *prev = busiest->runqueue._prev(node);
+        // Scan from the back (highest vruntime = least urgent).
+        RBTree::node *candidate = victim->runqueue._last();
+        while (candidate) {
+            Thread *thread = RBTree::getentry<Thread>(candidate);
 
-            enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
+            // Safety checks for migration eligibility.
+            if (!__atomic_load_n(&thread->migratedisabled, memory_order_acquire) &&
+                __atomic_load_n(&thread->locksheld, memory_order_acquire) == 0 &&
+                thread->gettargetmode() != Thread::target::STRICT) {
 
-            // Only steal threads that are actually waiting to run and can be migrated.
-            // Also check mathused to avoid stealing threads with potentially unsaved FPU state.
-            if (tstate == Thread::state::SUSPENDED &&
-                __atomic_load_n(&candidate->locksheld, memory_order_acquire) == 0 &&
-                !__atomic_load_n(&candidate->migratedisabled, memory_order_acquire) &&
-                !candidate->fctx.mathused) {
-                busiest->runqueue._erase(node);
-                stolen = candidate;
-                break;
+                victim->runqueue._erase(candidate);
+
+                // Clear inrunqueue flag.
+                __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+
+                // Update cid to reflect new owner (the stealing CPU).
+                __atomic_store_n(&thread->cid, CPU::get()->id, memory_order_release);
+
+                // Update victim's minvruntime.
+                updateminvruntime(victim);
+
+                victim->runqueue.lock.release();
+                return thread;
             }
-            node = prev;
+            candidate = victim->runqueue._prev(candidate);
         }
 
-        busiest->runqueue.lock.release();
-
-        if (stolen) {
-            updateload(busiest);
-            // Atomically update lastcid and cid to prevent data races.
-            __atomic_store_n(&stolen->lastcid, __atomic_load_n(&stolen->cid, memory_order_acquire), memory_order_release);
-            __atomic_store_n(&stolen->cid, CPU::get()->id, memory_order_release);
-            // Memory barrier to ensure cid update is visible.
-            NArch::CPU::writemb();
-        }
-
-        return stolen;
-    }
-
-    // Get the next thread to run from the current CPU's runqueue.
-    static Thread *_nextthread(struct CPU::cpulocal *cpu) {
-        struct RBTree::node *node = cpu->runqueue._first();
-        while (node) {
-            Thread *candidate = RBTree::getentry<Thread>(node);
-            struct RBTree::node *next = cpu->runqueue._next(node);
-
-            enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&candidate->tstate, memory_order_acquire);
-
-            // Skip and clean up dead threads.
-            if (tstate == Thread::state::DEAD) {
-                cpu->runqueue._erase(node);
-                queuezombie(candidate);
-                node = next;
-                continue;
-            }
-
-            // Found a runnable thread.
-            if (tstate == Thread::state::SUSPENDED) {
-                cpu->runqueue._erase(node);
-                return candidate;
-            }
-
-            cpu->runqueue._erase(node);
-            node = next;
-        }
+        victim->runqueue.lock.release();
         return NULL;
     }
 
-    Thread *nextthread(void) {
-        struct CPU::cpulocal *cpu = CPU::get();
-        cpu->runqueue.lock.acquire();
-        Thread *next = _nextthread(cpu);
-        cpu->runqueue.lock.release();
-
-        if (!next) {
-            next = steal(); // Try to steal from another CPU.
-        }
-        return next;
-    }
-
-    // Perform the actual context switch to a new thread.
-    static void switchthread(Thread *thread, bool needswap) {
-        Thread *prev = CPU::get()->currthread;
-        CPU::get()->currthread = thread;
-
-        assert(prev, "Previous thread before context switch should *never* be NULL.\n");
-
-        NArch::CPU::mb();
-
-        if (needswap) {
-            swaptopml4(thread->process->addrspace->pml4phy);
-        }
-
-#ifdef __x86_64__
-        CPU::get()->intstatus = thread->ctx.rflags & 0x200; // Restore the interrupt status of the thread.
-        CPU::get()->ist.rsp0 = (uint64_t)thread->stacktop;
-
-        thread->fctx.mathused = false; // Start thread not having used maths (so we don't *have* to save the context during this quantum, unless the thread uses the FPU in this time).
-        uint64_t cr0 = CPU::rdcr0();
-        cr0 |= (1 << 3); // Set TS bit for lazy FPU restore.
-        CPU::wrcr0(cr0);
-#endif
-        __atomic_store_n(&thread->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
-
-        CPU::restorexctx(&thread->xctx); // Restore extra context.
-
-        CPU::ctx_swap(&thread->ctx); // Restore context.
-        __builtin_unreachable();
-    }
-
-    // Check and fire ITIMER_REAL for a process if it has expired.
     static void checkitimer(Process *proc, uint64_t now) {
         if (proc->itimerdeadline == 0) {
             return; // Timer not armed.
@@ -386,692 +429,305 @@ namespace NSched {
         }
     }
 
-    // Scheduler interrupt entry, handles save.
+    Thread *nextthread(void) {
+        struct CPU::cpulocal *cpu = CPU::get();
+
+        // Fast path: pop from our own runqueue.
+        cpu->runqueue.lock.acquire();
+        RBTree::node *first = cpu->runqueue._first();
+        if (first) {
+            Thread *thread = RBTree::getentry<Thread>(first);
+            cpu->runqueue._erase(first);
+
+            // Clear inrunqueue flag while holding lock.
+            __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+
+            // Update minvruntime to next thread.
+            updateminvruntime(cpu);
+
+            cpu->runqueue.lock.release();
+            return thread;
+        }
+        cpu->runqueue.lock.release();
+
+        // Slow path: try to steal work.
+        return steal();
+    }
+
+    static void switchthread(Thread *thread, bool needswap) {
+        struct CPU::cpulocal *cpu = CPU::get();
+
+        // Swap address space if switching to a different process.
+        if (needswap && thread->process && thread->process->addrspace) {
+#ifdef __x86_64__
+            swaptopml4(thread->process->addrspace->pml4phy);
+#endif
+        }
+
+#ifdef __x86_64__
+        // Reset FPU state for lazy loading.
+        thread->fctx.mathused = false;
+        // Set TS bit so FPU context is lazily loaded.
+        uint64_t cr0 = CPU::rdcr0();
+        CPU::wrcr0(cr0 | (1 << 3)); // CR0.TS = 1
+#endif
+
+        // Restore extra context (FSBASE, etc).
+        CPU::restorexctx(&thread->xctx);
+
+        // Update kernel stack pointer in TSS for syscalls.
+        cpu->ist.rsp0 = (uint64_t)thread->stacktop;
+
+        // Set thread state to running.
+        setthreadstate(thread, Thread::state::RUNNING, "sched:switchthread");
+
+        // Update current thread pointer.
+        cpu->currthread = thread;
+
+        // Perform the actual context switch.
+        CPU::ctx_swap(&thread->ctx);
+    }
+
+    // Scheduler interrupt handler.
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
-        (void)isr;
+        struct CPU::cpulocal *cpu = CPU::get();
 
-        APIC::lapicstop();
-
-        struct CPU::cpulocal *cpu = CPU::get(); // Get an easy local reference to our current CPU.
-
-        assert(cpu, "Failed to acquire current CPU.\n");
-
-        cpu->setint(false); // Disable interrupts, we don't want our scheduling work to be interrupted.
-
-        if (__atomic_exchange_n(&cpu->inschedule, true, memory_order_acq_rel)) {
-            // Already in scheduler, bail out. The outer invocation will handle scheduling.
+        // Prevent nested scheduler invocation.
+        if (__atomic_exchange_n(&cpu->inschedule, true, memory_order_acquire)) {
             return;
         }
 
-        size_t curintr = __atomic_add_fetch(&cpu->schedintr, 1, memory_order_seq_cst); // Increment the number of times this interrupt has been called.
-
-        assert(cpu->currthread, "Current thread should NEVER be NULL.\n");
-
-        // Calculate time delta since last schedule.
         uint64_t now = TSC::query();
-        uint64_t delta = ((now - cpu->lastschedts) * 1000) / TSC::hz;
-        cpu->lastschedts = now;
-
         Thread *prev = cpu->currthread;
 
-        // Update vruntime for the current thread (unless it's the idle thread).
-        if (prev != cpu->idlethread) {
+        // Protect prev from being stolen while we're using it.
+        if (prev && prev != cpu->idlethread) {
+            prev->disablemigrate();
+        }
+
+        // 1. Calculate time delta and update vruntime.
+        uint64_t delta = now - cpu->lastschedts;
+        cpu->lastschedts = now;
+
+        if (prev && prev != cpu->idlethread) {
             prev->setvruntime(delta);
         }
 
+        // 2. Update load weight periodically.
         updateload(cpu);
 
-        // Periodic zombie cleanup and load balancing.
-        cpu->setint(true); // Enable interrupts for TLB shootdown handling.
-        reapzombies();
-        cpu->setint(false);
-
-        if ((curintr % 4) == 0) {
+        // 3. Load balance every N quantums (e.g., every 4 = 40ms).
+        if ((cpu->schedintr % 4) == 0) {
             loadbalance(cpu);
         }
+        cpu->schedintr++;
 
-        // Check interval timers for the current process.
+        // 4. Check process itimer.
         if (prev && prev->process && !prev->process->kernel) {
             checkitimer(prev->process, now);
         }
 
-        // Handle migration re-enable on reschedule request.
-        if (prev->rescheduling) {
-            __atomic_store_n(&prev->rescheduling, false, memory_order_release);
-            prev->enablemigrate();
-        }
-
-        Thread *next = NULL;
-
-        bool shouldsave = prev && prev != cpu->idlethread;
-
-        if (shouldsave) {
-#ifdef __x86_64__
-            if (prev->fctx.mathused) {
-                CPU::savefctx(&prev->fctx);
-            }
-#endif
-            prev->savexctx();
+        // 5. Save context of previous thread.
+        if (prev) {
             prev->savectx(ctx);
-        }
+            prev->savexctx();
 
-        // Memory barrier to ensure context writes are visible before state transition.
-        NArch::CPU::writemb();
+            // Handle pending state transitions.
+            enum Thread::pendingwait pendwait =
+                (enum Thread::pendingwait)__atomic_exchange_n(
+                    &prev->pendingwaitstate,
+                    Thread::pendingwait::PENDING_NONE,
+                    memory_order_acq_rel);
 
-        cpu->runqueue.lock.acquire();
+            // Check if wake() raced ahead and already woke this thread.
+            // If wokenbeforewait is set, the thread should stay runnable, not transition to WAITING.
+            bool woken = __atomic_exchange_n(&prev->wokenbeforewait, false, memory_order_acq_rel);
 
-        // Re-enqueue previous thread if it was running (not idle, not dead, not waiting).
-        if (prev != cpu->idlethread) {
-            enum Thread::pendingwait pendwait = (enum Thread::pendingwait)__atomic_load_n(&prev->pendingwaitstate, memory_order_acquire);
-
-            // Handle pending wait state transitions using CAS to avoid race with markdeadandremove().
-            if (pendwait != Thread::pendingwait::PENDING_NONE) {
-                // Determine target state based on pending wait type.
-                enum Thread::state targetstate = (pendwait == Thread::pendingwait::PENDING_WAIT)
-                    ? Thread::state::WAITING : Thread::state::WAITINGINT;
-
-                // Use CAS to transition RUNNING -> WAITING/WAITINGINT.
-                enum Thread::state expected = Thread::state::RUNNING;
-                bool success = __atomic_compare_exchange_n(&prev->tstate, &expected, targetstate, false, memory_order_acq_rel, memory_order_acquire);
-
-                if (success) {
-                    // Successfully transitioned to waiting state.
-                    NArch::CPU::mb();
-                    enum Thread::pendingwait recheckpend = (enum Thread::pendingwait)__atomic_load_n(&prev->pendingwaitstate, memory_order_acquire);
-                    if (recheckpend == Thread::pendingwait::PENDING_NONE) {
-                        expected = targetstate;
-                        if (__atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
-                            // Successfully reverted to SUSPENDED, enqueue the thread.
-                            NArch::CPU::writemb();
-                            cpu->runqueue._insert(&prev->node, vruntimecmp);
-                        }
-                    }
-                    // If pendingwaitstate is still set, thread is properly waiting.
-                } else if (expected == Thread::state::DEAD) {
-                    // Thread was marked dead by another CPU, queue for cleanup.
-                    __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
-                    queuezombie(prev);
-                    prev = NULL;
-                } else {
-                    __atomic_store_n(&prev->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
-                }
-            } else {
-                // No pending wait: try to transition RUNNING -> SUSPENDED.
-                enum Thread::state expected = Thread::state::RUNNING;
-                bool success = __atomic_compare_exchange_n(&prev->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire);
-
-                if (success) {
-                    // Successfully transitioned to SUSPENDED, enqueue.
-                    NArch::CPU::writemb();
-                    cpu->runqueue._insert(&prev->node, vruntimecmp);
-                } else if (expected == Thread::state::DEAD) {
-                    // Thread was marked dead, queue for cleanup.
-                    queuezombie(prev);
-                    prev = NULL;
-                }
-                // If expected is something else, thread was already dequeued/waiting.
+            if (!woken && pendwait == Thread::pendingwait::PENDING_WAIT) {
+                setthreadstate(prev, Thread::state::WAITING, "sched:PENDING_WAIT");
+            } else if (!woken && pendwait == Thread::pendingwait::PENDING_WAITINT) {
+                setthreadstate(prev, Thread::state::WAITINGINT, "sched:PENDING_WAITINT");
             }
         }
 
-        // Get next thread from runqueue.
-        next = _nextthread(cpu);
-        cpu->runqueue.lock.release();
+        // 6. Re-insert previous thread if still runnable (skip idle thread).
+        enum Thread::state prevstate = prev ?
+            (enum Thread::state)__atomic_load_n(&prev->tstate, memory_order_acquire) :
+            Thread::state::DEAD;
 
-        // If no thread available locally, try to steal.
-        if (!next) {
-            next = steal();
+        if (prev && prev != cpu->idlethread && prevstate == Thread::state::RUNNING) {
+            setthreadstate(prev, Thread::state::SUSPENDED, "sched:reinsert");
+
+            // Insert back into runqueue with inrunqueue guard.
+            cpu->runqueue.lock.acquire();
+            if (!__atomic_load_n(&prev->inrunqueue, memory_order_acquire)) {
+                __atomic_store_n(&prev->inrunqueue, true, memory_order_release);
+                cpu->runqueue._insert(&prev->node, vruntimecmp);
+                updateminvruntimeoninsert(cpu, prev);
+            }
+            cpu->runqueue.lock.release();
         }
 
-        // Use idle thread if still no work.
+        bool shouldqueuezombie = false;
+        Thread *zombiethread = NULL;
+
+        // Handle dead thread cleanup.
+        if (prev && prev != cpu->idlethread && prevstate == Thread::state::DEAD) {
+            if (!__atomic_exchange_n(&prev->zombiequeued, true, memory_order_acq_rel)) {
+                shouldqueuezombie = true;
+                zombiethread = prev; // Save reference for zombie queueing.
+            }
+        }
+
+        // Save prev reference for migration re-enable AFTER thread selection.
+        // We must not enable migration before nextthread() because that would allow the thread to be stolen.
+        Thread *prevformigration = (prev && prev != cpu->idlethread) ? prev : NULL;
+
+        cpu->setint(true);
+        // Reap zombies.
+        reapzombies();
+        cpu->setint(false);
+
+        // 7. Select next thread.
+        Thread *next = nextthread();
         if (!next) {
             next = cpu->idlethread;
-        }
-
-        assert(next != NULL, "Next thread is NULL.\n");
-
-        if (next != cpu->idlethread) {
-            enum Thread::state nstate = (enum Thread::state)__atomic_load_n(&next->tstate, memory_order_acquire);
-            if (nstate == Thread::state::DEAD) {
-                // Thread was killed after we selected it. Queue for cleanup and use idle thread.
-                queuezombie(next);
-                next = cpu->idlethread;
-            } else if (nstate == Thread::state::RUNNING) {
-                next = cpu->idlethread;
-            } else if (nstate != Thread::state::SUSPENDED && nstate != Thread::state::READY) {
-                next = cpu->idlethread;
+#ifdef TSTATE_DEBUG
+            cpu->idlecount++;
+            // After 1000 consecutive idle selections (~10 seconds), dump state for debugging.
+            if (cpu->idlecount == 1000) {
+                NUtil::printf("[sched] CPU%lu: 1000 consecutive idle selections elapsed, dumping thread state:\n", cpu->id);
+                dumpthreads();
             }
+        } else {
+            cpu->idlecount = 0; // Reset on non-idle selection.
+        }
+#else
+        }
+#endif
+
+        if (prevformigration && prevformigration != next) {
+            prevformigration->enablemigrate(); // Safe to re-enable now.
         }
 
-        // Update CPU tracking.
-        if (prev) {
-            prev->lastcid = cpu->id;
+        // 8. Handle migration re-enable.
+        if (next->rescheduling) {
+            __atomic_store_n(&next->rescheduling, false, memory_order_release);
+            next->enablemigrate();
         }
+
+        // 9. Update CPU tracking.
+        __atomic_store_n(&next->lastcid, next->cid, memory_order_release);
         __atomic_store_n(&next->cid, cpu->id, memory_order_release);
 
-        // Perform context switch if needed.
-        if (prev != next) {
-            bool needswap = !prev || (prev->process->addrspace != next->process->addrspace);
+        // 10. Context switch if needed.
+        if (next != cpu->currthread) {
+            bool needswap = !cpu->currthread || (cpu->currthread->process != next->process);
 
-            cpu->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
+            if (shouldqueuezombie && zombiethread) {
+                queuezombie(zombiethread);
+            }
+
+
+            // Reset quantum deadline and re-arm timer before switch.
+            cpu->quantumdeadline = now + (TSC::hz / 1000) * QUANTUMMS;
             Timer::rearm();
 
             __atomic_store_n(&cpu->inschedule, false, memory_order_release);
+            switchthread(next, needswap);
 
-            switchthread(next, needswap); // Swap to context. THIS SHOULD NEVER RETURN!
+            // XXX: There are STILL niche cases where we can end up back here for no good reason. Typically while in the middle of a system call that blocks on a waitqueue.
 
-            // If we reach here, ctx_swap returned unexpectedly - this indicates severe corruption.
-            panic("FATAL: switchthread() returned! Context corruption detected.\n");
-        }
+            // Print current register state.
+            uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0;
+            uint64_t rsi = 0, rdi = 0, rsp = 0, rbp = 0;
+            uint64_t r8 = 0, r9 = 0, r10 = 0, r11 = 0;
+            uint64_t r12 = 0, r13 = 0, r14 = 0, r15 = 0;
+            asm volatile("mov %%rax, %0" : "=r"(rax));
+            asm volatile("mov %%rbx, %0" : "=r"(rbx));
+            asm volatile("mov %%rcx, %0" : "=r"(rcx));
+            asm volatile("mov %%rdx, %0" : "=r"(rdx));
+            asm volatile("mov %%rsi, %0" : "=r"(rsi));
+            asm volatile("mov %%rdi, %0" : "=r"(rdi));
+            asm volatile("mov %%rsp, %0" : "=r"(rsp));
+            asm volatile("mov %%rbp, %0" : "=r"(rbp));
+            asm volatile("mov %%r8, %0" : "=r"(r8));
+            asm volatile("mov %%r9, %0" : "=r"(r9));
+            asm volatile("mov %%r10, %0" : "=r"(r10));
+            asm volatile("mov %%r11, %0" : "=r"(r11));
+            asm volatile("mov %%r12, %0" : "=r"(r12));
+            asm volatile("mov %%r13, %0" : "=r"(r13));
+            asm volatile("mov %%r14, %0" : "=r"(r14));
+            asm volatile("mov %%r15, %0" : "=r"(r15));
 
-        __atomic_store_n(&next->tstate, Thread::state::RUNNING, memory_order_release); // Set state.
+            NUtil::printf("[sched] BUG: Returned to scheduler interrupt handler unexpectedly!\n");
+            NUtil::printf(" Registers after switch: RAX=%#018lx RBX=%#018lx RCX=%#018lx RDX=%#018lx\n",
+                rax, rbx, rcx, rdx);
+            NUtil::printf(" RSI=%#018lx RDI=%#018lx RSP=%#018lx RBP=%#018lx\n",
+                rsi, rdi, rsp, rbp);
+            NUtil::printf(" R8=%#018lx R9=%#018lx R10=%#018lx R11=%#018lx\n",
+                r8, r9, r10, r11);
+            NUtil::printf(" R12=%#018lx R13=%#018lx R14=%#018lx R15=%#018lx\n",
+                r12, r13, r14, r15);
 
-        cpu->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
-        Timer::rearm();
+            // Print "current thread" context.
+            Thread *curr = CPU::get()->currthread;
+            NUtil::printf(" Current thread after switch: %p (pid=%lu tid=%lu)\n",
+                curr,
+                curr->process ? curr->process->id : 0,
+                curr->id);
+            // Print its registers.
+            rax = curr->ctx.rax;
+            rbx = curr->ctx.rbx;
+            rcx = curr->ctx.rcx;
+            rdx = curr->ctx.rdx;
+            rsi = curr->ctx.rsi;
+            rdi = curr->ctx.rdi;
+            rsp = curr->ctx.rsp;
+            rbp = curr->ctx.rbp;
+            r8 = curr->ctx.r8;
+            r9 = curr->ctx.r9;
+            r10 = curr->ctx.r10;
+            r11 = curr->ctx.r11;
+            r12 = curr->ctx.r12;
+            r13 = curr->ctx.r13;
+            r14 = curr->ctx.r14;
+            r15 = curr->ctx.r15;
+            NUtil::printf(" Saved context: RAX=%#018lx RBX=%#018lx RCX=%#018lx RDX=%#018lx\n",
+                rax, rbx, rcx, rdx);
+            NUtil::printf(" RSI=%#018lx RDI=%#018lx RSP=%#018lx RBP=%#018lx\n",
+                rsi, rdi, rsp, rbp);
+            NUtil::printf(" R8=%#018lx R9=%#018lx R10=%#018lx R11=%#018lx\n",
+                r8, r9, r10, r11);
+            NUtil::printf(" R12=%#018lx R13=%#018lx R14=%#018lx R15=%#018lx\n",
+                r12, r13, r14, r15);
 
-        __atomic_store_n(&cpu->inschedule, false, memory_order_release);
-
-        cpu->setint(true);
-    }
-
-
-    static size_t pidcounter = 0; // Because kernel process is the first process made, it'll be PID0. The first user process (init) will be PID1!
-    Process *kprocess = NULL; // Kernel process.
-    NArch::IRQSpinlock pidtablelock;
-    NLib::KVHashMap<size_t, Process *> *pidtable = NULL;
-
-    void Process::init(struct VMM::addrspace *space, NFS::VFS::FileDescriptorTable *fdtable) {
-        // Each new process should be initialised with an atomically incremented PID.
-        this->id = __atomic_fetch_add(&pidcounter, 1, memory_order_seq_cst);
-        this->addrspace = space;
-        this->addrspace->lock.acquire();
-        this->addrspace->ref++; // Reference address space.
-        this->addrspace->lock.release();
-
-        // Initialize signal state to defaults (no pending, all handlers SIG_DFL).
-        this->signalstate.pending = 0;
-        for (size_t i = 0; i < NSIG; i++) {
-            this->signalstate.actions[i].handler = SIG_DFL;
-            this->signalstate.actions[i].mask = 0;
-            this->signalstate.actions[i].flags = 0;
-            this->signalstate.actions[i].restorer = NULL;
-        }
-
-        if (space == &VMM::kspace) {
-            this->kernel = true; // Mark process as a kernel process if it uses the kernel address space.
-        } else { // Only userspace threads should bother creating file descriptor tables.
-            if (!fdtable) {
-                this->fdtable = new NFS::VFS::FileDescriptorTable();
-            } else {
-                this->fdtable = fdtable; // Inherit from a forked file descriptor table we were given.
-            }
-        }
-    }
-
-    void Process::zombify(void) {
-        this->lock.acquire();
-
-        if (this->fdtable) {
-            delete this->fdtable;
-        }
-
-        if (this->cwd) {
-            if (this->cwd->fs) {
-                this->cwd->fs->fsunref();  // Release filesystem reference from cwd
-            }
-            this->cwd->unref(); // Unreference current working directory (so it isn't marked busy).
-        }
-
-        if (this->root) {
-            if (this->root->fs) {
-                this->root->fs->fsunref();  // Release filesystem reference from root
-            }
-            this->root->unref(); // Unreference root directory.
-        }
-
-        this->addrspace->lock.acquire();
-        this->addrspace->ref--;
-        size_t ref = this->addrspace->ref;
-        this->addrspace->lock.release();
-
-        if (ref == 0) {
-            delete this->addrspace;
-        }
-
-        this->pstate = Process::state::ZOMBIE;
-
-        Process *parent = this->parent;
-
-        // Release our lock before waking parent and sending SIGCHLD to avoid deadlock.
-        this->lock.release();
-
-        if (parent) {
-            // Wake parent's exit wait queue so it can reap us.
-            // WARNING: After wake(), parent may delete us on another CPU.
-            // Do not access 'this' after wake()!
-            parent->exitwq.wake();
-
-            // Send SIGCHLD to parent per POSIX: signal sent when child terminates.
-            signalproc(parent, SIGCHLD);
-        }
-    }
-
-    Process::~Process(void) {
-        this->lock.acquire();
-
-        pidtablelock.acquire();
-        pidtable->remove(this->id);
-        pidtablelock.release();
-
-        if (this->pgrp) {
-            // XXX: Orphan process groups if we're the leader.
-
-            this->pgrp->lock.acquire();
-            this->pgrp->procs.remove([](Process *p, void *arg) {
-                return p == ((Process *)arg);
-            }, (void *)this);
-
-            if (this->pgrp->procs.empty()) {
-                if (this->session) {
-                    this->session->lock.acquire();
-                    this->session->pgrps.remove([](ProcessGroup *pg, void *arg) {
-                        return pg == ((ProcessGroup *)arg);
-                    }, (void *)this->pgrp);
-                    this->session->lock.release();
-
-                    if (this->session->pgrps.empty()) {
-                        delete this->session;
-                    }
-                }
-                this->pgrp->lock.release();
-                delete this->pgrp;
-                this->pgrp = NULL;
-                this->session = NULL;
-            } else {
-                this->pgrp->lock.release();
-            }
-
-
-        }
-
-        if (this->parent) {
-            this->parent->lock.acquire();
-            this->parent->children.remove([](Process *p, void *arg) {
-                return p == ((Process *)arg);
-            }, (void *)this);
-            this->parent->lock.release();
-            // Note: SIGCHLD was already sent in zombify() when child terminated.
-        }
-
-        pidtablelock.acquire();
-        NSched::Process **pinitproc = pidtable->find(1); // Get init process.
-        assert(pinitproc, "Failed to find init process during process destruction.\n");
-        Process *initproc = *pinitproc;
-        pidtablelock.release();
-
-        if (children.size() && this != initproc) {
-            NLib::DoubleList<Process *>::Iterator it = this->children.begin();
-            for (; it.valid(); it.next()) {
-                Process *child = *(it.get());
-                child->lock.acquire();
-
-                initproc->lock.acquire();
-                child->parent = initproc; // Reparent to init.
-                initproc->children.push(child);
-                initproc->lock.release();
-
-                // Notify init of reparenting, so it can reap if needed.
-                signalproc(initproc, SIGCHLD);
-
-                child->lock.release();
-            }
-        }
-
-        this->lock.release();
-    }
-
-    // Request that a specific thread be rescheduled.
-    void reschedule(Thread *thread) {
-        // Prevent migration during the reschedule operation.
-        thread->disablemigrate();
-        __atomic_store_n(&thread->rescheduling, true, memory_order_release);
-
-        // Read the CID after setting rescheduling flag to ensure consistency.
-        NArch::CPU::readmb();
-        size_t targetcid = __atomic_load_n(&thread->cid, memory_order_acquire);
-
-        // Bounds check the CPU ID.
-        if (targetcid >= NArch::SMP::awakecpus) {
-            thread->enablemigrate();
-            return;
-        }
-
-        struct CPU::cpulocal *targetcpu = NArch::SMP::cpulist[targetcid];
-        if (targetcpu) {
-            // Send IPI to trigger reschedule on the target CPU.
-            APIC::sendipi(targetcpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
-        }
-    }
-
-    // Voluntarily yield the CPU to another thread.
-    // The current thread will be placed back in the runqueue.
-    void yield(void) {
-        struct CPU::cpulocal *cpu = CPU::get();
-        Thread *self = cpu->currthread;
-
-        // Safety checks: cannot yield from idle thread or if scheduler not initialized.
-        if (!initialised || self == cpu->idlethread) {
-            return;
-        }
-
-        // Check if thread is dead before attempting to yield.
-        enum Thread::state currentstate = (enum Thread::state)__atomic_load_n(&self->tstate, memory_order_acquire);
-        if (currentstate == Thread::state::DEAD) {
-            for (;;) {
-                asm volatile(
-                    "sti\n\t"
-                    "int $0xfe\n\t"
-                    "cli\n\t"
-                    : : : "memory"
-                );
-            }
-            __builtin_unreachable();
-        }
-
-        // Disable interrupts to prevent races during yield setup.
-        bool oldint = cpu->setint(false);
-
-        // Mark that this thread is requesting a reschedule.
-        __atomic_store_n(&self->rescheduling, true, memory_order_release);
-
-        // Full memory barrier to ensure rescheduling flag is visible before IPI.
-        NArch::CPU::writemb();
-        NArch::CPU::readmb();
-
-        // Trigger scheduler via synchronous interrupt (means we can interrupt while interrupts are disabled!).
-        asm volatile(
-            "sti\n\t"
-            "int $0xfe\n\t"
-            : : : "memory"
-        );
-
-        while (__atomic_load_n(&self->rescheduling, memory_order_acquire)) {
-            asm volatile("pause" : : : "memory");
-        }
-
-        // Restore original interrupt state.
-        cpu->setint(oldint);
-    }
-
-    struct sleepstate { // Simple helper struct that avoids UAF.
-        WaitQueue wq;
-        bool completed; // Set to true when thread wakes (either by timer or signal).
-        NArch::Spinlock lock;
-    };
-
-    // Timer callback for sleep().
-    static void sleepwork(void *arg) {
-        struct sleepstate *state = (struct sleepstate *)arg;
-
-        state->lock.acquire();
-        if (!state->completed) { // Only bother waking if not already completed (interrupted by signal).
-            state->completed = true;
-            state->lock.release();
-            state->wq.wakeone(); // Wake the sleeping thread.
+            __builtin_unreachable(); // Don't even THINK about it.
         } else {
-            // Thread was interrupted and marked completed. We can't assume it's still around, so just cleanup.
-            state->lock.release();
-            delete state;
+            if (prevformigration) {
+                prevformigration->enablemigrate(); // Safe to re-enable now.
+            }
+
+            // Queue zombie if needed (edge case: thread dying but still selected).
+            if (shouldqueuezombie && zombiethread) {
+                assertarg(false, "Thread %p (pid=%lu tid=%lu) was marked DEAD but is trying to continue!\n", zombiethread, zombiethread->process ? zombiethread->process->id : 0, zombiethread->id);
+            }
+
+            // 11. Continue execution of the same thread.
+            Thread *curr = cpu->currthread;
+            if (curr && curr->tstate == Thread::state::SUSPENDED) {
+                setthreadstate(curr, Thread::state::RUNNING, "sched:continue");
+            }
+
+            // 12. Reset quantum deadline and re-arm timer (same thread continues).
+            cpu->quantumdeadline = now + (TSC::hz / 1000) * QUANTUMMS;
+            Timer::rearm();
+
+            __atomic_store_n(&cpu->inschedule, false, memory_order_release);
         }
     }
 
-    int sleep(uint64_t ms) {
-        if (ms == 0) {
-            return 0;
-        }
-
-        // Allocate sleep state on heap so it survives even if we wake early.
-        struct sleepstate *state = new sleepstate();
-        state->completed = false;
-
-        NSys::Timer::timerlock();
-        NSys::Timer::create(sleepwork, state, ms);
-        NSys::Timer::timerunlock();
-
-        // Wait interruptibly. If a signal arrives, this will return -EINTR.
-        int ret = state->wq.waitinterruptible();
-
-        // Mark that we've completed (either by signal or timer).
-        state->lock.acquire();
-        if (!state->completed) {
-            // Mark completed so timer callback knows to cleanup.
-            state->completed = true;
-            state->lock.release();
-        } else {
-            // Timer woke us up normally. We cleanup.
-            state->lock.release();
-            delete state;
-        }
-
-        return ret;
-    }
-
-    void Mutex::acquire(void) {
-        Thread *current = NArch::CPU::get()->currthread;
-        assert(current != NArch::CPU::get()->idlethread, "Mutex acquire on idle thread.\n");
-
-        while (true) {
-#ifdef __x86_64__
-            // Try to acquire the lock with a simple atomic exchange.
-            if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) {
-                break; // Got the lock (it was previously unlocked).
-            }
-#endif
-
-            // Lock is contended, wait on the waitqueue.
-            this->waitqueue.waitinglock.acquire();
-
-            // Double-check the lock is still held after acquiring waitqueue lock.
-#ifdef __x86_64__
-            if (__atomic_exchange_n(&this->locked, 1, memory_order_acquire) == 0) {
-                this->waitqueue.waitinglock.release();
-                break; // Got the lock.
-            }
-#endif
-
-            // Use the WaitQueue's wait mechanism with lock already held.
-            this->waitqueue.wait(true);
-        }
-
-        __atomic_add_fetch(&current->locksheld, 1, memory_order_seq_cst);
-    }
-
-    void Mutex::release(void) {
-        Thread *current = NArch::CPU::get()->currthread;
-        __atomic_sub_fetch(&current->locksheld, 1, memory_order_seq_cst);
-#ifdef __x86_64__
-        __atomic_store_n(&this->locked, 0, memory_order_release);
-#endif
-
-        // Wake one waiting thread, if any (next in line).
-        this->waitqueue.wakeone();
-    }
-
-    void exit(int status, int sig) {
-        // Thread exit.
-
-        Process *proc = NArch::CPU::get()->currthread->process;
-
-        if (!proc->kernel) { // Only perform process exit logic on user threads.
-
-            if (proc->id == 1) {
-                panic("Init got obliterated (either by itself or someone else).\n");
-            }
-
-            termothers(proc); // Terminate other threads in this process.
-
-            {
-                NLib::ScopeIRQSpinlock guard(&proc->lock);
-                if (sig != 0) {
-                    // If we're exiting due to a signal, encode that in exit status.
-                    proc->exitstatus = (sig & 0x7f);
-                } else { // Normal exit.
-                    proc->exitstatus = (status & 0xff) << 8;
-                }
-            }
-
-            if (proc->fdtable) {
-                proc->fdtable->closeall(); // Close so we can be done with files asap.
-            }
-        }
-
-        __atomic_store_n(&CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release); // Kill ourselves. We will NOT be rescheduled.
-        CPU::writemb();
-
-        yield(); // Yield back to scheduler, so the thread never gets rescheduled.
-
-        assert(false, "Exiting thread was rescheduled!");
-    }
-
-    void Thread::init(Process *proc, size_t stacksize, void *entry, void *arg) {
-        this->process = proc;
-
-        proc->lock.acquire();
-        proc->threads.push(this);
-        proc->lock.release();
-
-        __atomic_add_fetch(&proc->threadcount, 1, memory_order_seq_cst); // Add to thread count.
-
-        // Initialise stack within HHDM, from page allocated memory. Stacks need to be unique for each thread.
-        this->stack = (uint8_t *)hhdmoff((void *)((uintptr_t)PMM::alloc(stacksize)));
-        assert(this->stack, "Failed to allocate thread stack.\n");
-
-        this->stacktop = (uint8_t *)((uintptr_t)this->stack + stacksize); // Determine stack top.
-
-        this->stacksize = stacksize;
-
-        // Allocate thread ID.
-        this->id = __atomic_fetch_add(&this->process->tidcounter, 1, memory_order_seq_cst);
-
-        // Initialize per-thread signal mask to 0 (no signals blocked).
-        this->blocked = 0;
-
-        // Zero context.
-        NLib::memset(&this->ctx, 0, sizeof(this->ctx));
-
-        // Initialise context:
-#ifdef __x86_64__
-        uint64_t code = this->process->kernel ? 0x08 : 0x23;
-        uint64_t data = this->process->kernel ? 0x10 : 0x1b;
-        this->ctx.cs = code; // Kernel Code.
-
-        this->ctx.ds = data; // Kernel Data.
-        this->ctx.es = data; // Ditto.
-        this->ctx.ss = data; // Ditto.
-
-        this->ctx.rsp = (uint64_t)this->stacktop;
-        this->ctx.rip = (uint64_t)entry;
-        this->ctx.rdi = (uint64_t)arg; // Pass argument in through RDI (System V ABI first argument).
-
-        this->ctx.rflags = 0x202; // Enable interrupts.
-
-        if (!this->process->kernel) {
-            this->fctx.fpustorage = PMM::alloc(CPU::get()->fpusize);
-            assert(this->fctx.fpustorage, "Failed to allocate thread's FPU storage.\n");
-            this->fctx.fpustorage = NArch::hhdmoff(this->fctx.fpustorage); // Refer to via HHDM offset.
-            NLib::memset(this->fctx.fpustorage, 0, CPU::get()->fpusize); // Clear memory.
-
-            if (CPU::get()->hasxsave) {
-                uint64_t cr0 = CPU::rdcr0();
-                asm volatile("clts");
-                // Initialise region.
-                asm volatile("xsave (%0)" : : "r"(this->fctx.fpustorage), "a"(0xffffffff), "d"(0xffffffff));
-                CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
-            }
-        }
-#endif
-    }
-
-    void Thread::destroy(void) {
-        // Free FPU storage if allocated.
-#ifdef __x86_64__
-        if (!this->process->kernel && this->fctx.fpustorage) {
-            PMM::free(hhdmsub(this->fctx.fpustorage), CPU::get()->fpusize);
-            this->fctx.fpustorage = NULL;
-        }
-#endif
-
-        PMM::free(hhdmsub(this->stack), this->stacksize); // Free stack.
-
-        this->process->lock.acquire();
-        this->process->threads.remove([](Thread *t, void *arg) {
-            return t == ((Thread *)arg);
-        }, (void *)this);
-        this->process->lock.release();
-
-        size_t remaining = __atomic_sub_fetch(&this->process->threadcount, 1, memory_order_seq_cst);
-        if (remaining == 0) {
-            // Zombify the process if this was the last thread.
-            this->process->zombify();
-        }
-    }
-
-    // Schedule a thread for execution on the most idle CPU.
-    void schedulethread(Thread *thread) {
-        // Attempt to transition thread from current state to SUSPENDED state.
-        enum Thread::state expected = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-        while (true) {
-            // Check for states that prevent scheduling.
-            if (expected == Thread::state::DEAD) {
-                return; // Thread is dead, do not schedule.
-            }
-
-            if (expected == Thread::state::SUSPENDED) {
-                return; // Thread is already in a runqueue, do not double-enqueue.
-            }
-
-            if (expected == Thread::state::RUNNING) {
-                return; // Thread is currently running, do not re-enqueue.
-            }
-
-            if (expected != Thread::state::WAITING &&
-                expected != Thread::state::WAITINGINT &&
-                expected != Thread::state::PAUSED &&
-                expected != Thread::state::READY) {
-                return; // Unknown state, refuse to schedule.
-            }
-
-            if (__atomic_compare_exchange_n(&thread->tstate, &expected, Thread::state::SUSPENDED, false, memory_order_acq_rel, memory_order_acquire)) {
-                break; // Successfully transitioned to SUSPENDED.
-            }
-        }
-
-        // Full memory barrier to ensure state transition is visible.
-        NArch::CPU::writemb();
-
-        // Find the most idle CPU for this thread.
-        struct CPU::cpulocal *cpu = getidlest();
-        if (!cpu) {
-            cpu = CPU::get(); // Fallback to current CPU.
-        }
-
-        // Set CPU ID before enqueueing to ensure consistency.
-        __atomic_store_n(&thread->cid, cpu->id, memory_order_release);
-
-        // Memory barrier before insertion.
-        NArch::CPU::writemb();
-
-        // Enqueue the thread.
-        enqueuethread(cpu, thread);
-        updateload(cpu);
-
-        if (cpu != CPU::get()) { // Only cause IPI if it's not us.
-            NArch::CPU::readmb();
-            if (cpu->runqueue.count() <= 1) { // Only force CPU to wake up if it wasn't already loaded with work (it'd be silly to wake up busy CPUs just for them to likely *not* reschedule our work).
-                APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
-            }
-        }
-    }
-
+    // Idle thread function.
     static void idlework(void) {
         for (;;) {
             asm volatile("hlt");
@@ -1079,43 +735,38 @@ namespace NSched {
     }
 
     void entry(void) {
-        Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework); // Create new idle thread, of the kernel process.
-        CPU::get()->idlethread = idlethread; // Assign to this CPU.
+        Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework);
+        CPU::get()->idlethread = idlethread;
 
-        // Mark idle thread specially - it should never be in a runqueue.
         idlethread->tstate = Thread::state::RUNNING;
 
-        CPU::get()->schedstack = (uint8_t *)PMM::alloc(16 * PAGESIZE);
+        CPU::get()->schedstack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
 
         CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
 
-        CPU::get()->currthread = idlethread; // We start as the idle thread, even though we might not actually be running it.
+        CPU::get()->currthread = idlethread;
 
-        CPU::get()->lastschedts = TSC::query(); // Initialise timestamp.
+        CPU::get()->lastschedts = TSC::query();
 
-        Interrupts::regisr(0xfe, schedule, true); // Register the scheduling interrupt. Mark as needing EOI, because it's through the LAPIC.
-
-        await(); // Jump into scheduler.
+        // Register the scheduling interrupt on this CPU.
+        Interrupts::regisr(0xfe, schedule, true);
+        await();
     }
 
-    bool initialised; // Is the scheduler working?
-
+    // BSP scheduler setup.
     void setup(void) {
         pidtable = new NLib::KVHashMap<size_t, Process *>();
 
-        // Create PID 0 for kernel threading. Uses kernel address space so that the process has access to the entire memory map.
         kprocess = new Process(&VMM::kspace);
         pidtable->insert(kprocess->id, kprocess);
 
         Thread *idlethread = new Thread(kprocess, DEFAULTSTACKSIZE, (void *)idlework);
-        idlethread->tstate = Thread::state::RUNNING; // Idle thread is always "running".
+        idlethread->tstate = Thread::state::RUNNING;
 
-        CPU::get()->schedstack = (uint8_t *)PMM::alloc(16 * PAGESIZE); // Allocate scheduler stack within HHDM, point to the top of the stack for normal stack operation.
-
+        CPU::get()->schedstack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
-
         CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
 
@@ -1123,143 +774,222 @@ namespace NSched {
         CPU::get()->currthread = idlethread;
         CPU::get()->lastschedts = TSC::query();
 
-        Interrupts::regisr(0xfe, schedule, true); // Register the scheduling interrupt. Mark as needing EOI, because it's through the LAPIC.
+        // Register the scheduling interrupt on this CPU.
+        Interrupts::regisr(0xfe, schedule, true);
 
-        initialised = true; // Mark the scheduler as ready.
+        initialised = true;
+    }
+
+    // Schedule a thread onto a CPU's runqueue.
+    void schedulethread(Thread *thread) {
+        // Guard: Don't insert if already in a runqueue.
+        if (__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
+            return; // Already queued, nothing to do.
+        }
+
+        // Determine target CPU.
+        struct CPU::cpulocal *target;
+
+        if (thread->gettargetmode() == Thread::target::STRICT) {
+            // Strict targeting REFUSES to let the scheduler choose another CPU.
+            target = SMP::cpulist[thread->gettarget()];
+        } else {
+            // Prefer last CPU (cache affinity), otherwise use idlest.
+            size_t lastcid = __atomic_load_n(&thread->lastcid, memory_order_acquire);
+            if (lastcid < SMP::awakecpus) {
+                target = SMP::cpulist[lastcid];
+            } else {
+                target = getidlest();
+            }
+            if (!target) target = CPU::get();
+        }
+
+        // Normalize vruntime to target's minvruntime (lock-free read).
+        uint64_t targetmin = __atomic_load_n(&target->minvruntime, memory_order_acquire);
+        uint64_t curvrt = thread->getvruntime();
+        if (curvrt < targetmin) {
+            // Prevent newly woken threads from starving existing ones.
+            thread->setvruntimeabs(targetmin);
+        }
+
+        // Set thread state.
+        setthreadstate(thread, Thread::state::SUSPENDED, "schedulethread");
+        __atomic_store_n(&thread->cid, target->id, memory_order_release);
+
+        // Insert into runqueue with inrunqueue guard.
+        target->runqueue.lock.acquire();
+
+        // Double-check inrunqueue under lock (another CPU might have beaten us).
+        if (!__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
+            __atomic_store_n(&thread->inrunqueue, true, memory_order_release);
+            target->runqueue._insert(&thread->node, vruntimecmp);
+            updateminvruntimeoninsert(target, thread);
+        }
+
+        target->runqueue.lock.release();
+
+        // Wake idle CPU if needed.
+        if (target != CPU::get() && target->currthread == target->idlethread) {
+            APIC::sendipi(target->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+        }
+    }
+
+    // Voluntarily relinquish the CPU.
+    void yield(void) {
+        struct CPU::cpulocal *cpu = CPU::get();
+        Thread *thread = cpu->currthread;
+
+        // Thanks, twin. For this, you get a little bit of a bonus! Encourages I/O work to yield.
+        uint64_t bonus = (TSC::hz / 1000) * QUANTUMMS / 2; // Half a quantum.
+        uint64_t curvrt = thread->getvruntime();
+        if (curvrt > bonus) {
+            // Subtract bonus from current vruntime (slightly more appealing to the scheduler).
+            thread->setvruntimeabs(curvrt - bonus);
+        }
+
+        // Trigger scheduler interrupt via software interrupt.
+        asm volatile("int $0xfe");
+    }
+
+    // Sleep for a given number of milliseconds.
+    int sleep(uint64_t ms) {
+        if (ms == 0) {
+            yield();
+            return 0;
+        }
+
+        WaitQueue wq;
+        volatile bool expired = false;
+
+        // Timer state passed to callback.
+        struct sleepstate {
+            volatile bool *exp;
+            WaitQueue *wq;
+        };
+
+        struct sleepstate state = { &expired, &wq };
+
+        // Timer callback to wake the waitqueue.
+        auto callback = [](void *arg) {
+            struct sleepstate *st = (struct sleepstate *)arg;
+            *st->exp = true;
+            st->wq->wake();
+        };
+
+        NSys::Timer::create(callback, (void *)&state, ms);
+
+        int ret;
+        waiteventinterruptible(&wq, expired, ret);
+
+        return ret;
+    }
+
+    // Force reschedule of a specific thread.
+    void reschedule(Thread *thread) {
+        thread->disablemigrate();
+        __atomic_store_n(&thread->rescheduling, true, memory_order_release);
+
+        size_t targetcid = __atomic_load_n(&thread->cid, memory_order_acquire);
+
+        if (targetcid == CPU::get()->id) {
+            // Self-reschedule. The scheduler will clear rescheduling and re-enable migration.
+            asm volatile("int $0xfe");
+        } else if (targetcid < SMP::awakecpus) {
+            // Send IPI to target CPU. The scheduler on that CPU will handle cleanup.
+            APIC::sendipi(SMP::cpulist[targetcid]->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+        } else {
+            // Cleanup weird CID state.
+            __atomic_store_n(&thread->rescheduling, false, memory_order_release);
+            thread->enablemigrate();
+        }
+    }
+
+    // Terminate all other threads in a process except the calling thread.
+    void termothers(Process *proc) {
+        Thread *current = CPU::get()->currthread;
+
+        // Collect threads to terminate while holding lock.
+        NLib::SingleList<Thread *> toexit;
+
+        proc->lock.acquire();
+
+        auto it = proc->threads.begin();
+        while (it.valid()) {
+            Thread *thread = *it.get();
+            it.next();
+
+            if (thread == current) continue;
+            toexit.push(thread);
+        }
+
+        proc->lock.release();
+
+        // Now process each thread without holding proc->lock.
+        while (!toexit.empty()) {
+            Thread *thread = toexit.pop();
+
+            // Disable migration to stabilize cid for this thread.
+            thread->disablemigrate();
+
+            enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+            // Remove from waitqueue if present (do this regardless of state).
+            thread->waitingonlock.acquire();
+            WaitQueue *wq = thread->waitingon;
+            thread->waitingonlock.release();
+
+            if (wq) {
+                wq->dequeue(thread);
+            }
+
+            // Mark dead.
+            setthreadstate(thread, Thread::state::DEAD, "termothers");
+
+            // Handle based on original state.
+            if (state == Thread::state::RUNNING) {
+                // Thread is/was running. Get cid while migration is disabled.
+                size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
+
+                thread->enablemigrate();
+
+                // Send IPI to force that CPU to reschedule and handle the dead thread.
+                if (cid < SMP::awakecpus && cid != CPU::get()->id) {
+                    APIC::sendipi(SMP::cpulist[cid]->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
+                }
+            } else { // Simply remove from runqueue if needed.
+                size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
+                if (cid < SMP::awakecpus && __atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
+                    struct CPU::cpulocal *cpu = SMP::cpulist[cid];
+                    cpu->runqueue.lock.acquire();
+                    if (__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
+                        cpu->runqueue._erase(&thread->node);
+                        __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+                        updateminvruntime(cpu);
+                    }
+                    cpu->runqueue.lock.release();
+                }
+
+                thread->enablemigrate();
+
+                // Force reschedule to ensure cleanup happens.
+                reschedule(thread);
+            }
+        }
     }
 
     void await(void) {
         CPU::get()->setint(false);
 
-        CPU::get()->quantumdeadline = TSC::query() + TSC::hz / 1000 * QUANTUMMS; // Set quantum deadline based on TSC.
+        // Set initial quantum deadline.
+        CPU::get()->quantumdeadline = TSC::query() + (TSC::hz / 1000) * QUANTUMMS;
         CPU::get()->preemptdisabled = false; // Enable preemption.
-        Timer::rearm();
+        Timer::rearm(); // Arm timer so we get scheduled.
 
+        // Enable interrupts outside of critical section.
         CPU::get()->setint(true);
 
         for (;;) {
             asm volatile("hlt");
         }
     }
-
-    extern "C" __attribute__((no_caller_saved_registers)) void sched_savesysstate(struct NArch::CPU::context *state) {
-        NArch::CPU::get()->currthread->sysctx = state;
-        NArch::CPU::get()->intstatus = true;
-    }
-
-
-
-
-
-    void handlelazyfpu(void) {
-#ifdef __x86_64__
-        // Lazily restore FPU context on-demand. This will also get the scheduler to store changes to our context when we swap tasks.
-
-        uint64_t cr0 = CPU::rdcr0();
-        if (cr0 & (1 << 3)) {
-            asm volatile("clts"); // Clear TS.
-
-            Thread *curr = CPU::get()->currthread;
-            if (curr && curr->fctx.fpustorage) {
-                CPU::restorefctx(&curr->fctx);
-                curr->fctx.mathused = true;
-            }
-            return;
-        }
-#endif
-        assert(false, "Invalid FPU lazy load trigger!\n");
-    }
-
-    // Mark a thread as dead and remove it from any wait structures.
-    static void markdeadandremove(Thread *thread) {
-        // Atomically mark the thread as dead using exchange.
-        enum Thread::state oldstate = (enum Thread::state)__atomic_exchange_n(
-            &thread->tstate, Thread::state::DEAD, memory_order_acq_rel);
-
-        // Clear any pending wait state.
-        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
-
-        // If thread was already dead, nothing more to do.
-        if (oldstate == Thread::state::DEAD) {
-            return;
-        }
-
-        // Memory barrier to ensure state change is visible.
-        NArch::CPU::writemb();
-
-        // If thread was waiting on a waitqueue, dequeue it.
-        if (oldstate == Thread::state::WAITING || oldstate == Thread::state::WAITINGINT) {
-            thread->waitingonlock.acquire();
-            WaitQueue *wq = thread->waitingon;
-            thread->waitingon = NULL;  // Clear it to prevent double-dequeue attempts
-            thread->waitingonlock.release();
-
-            if (wq) {
-                // dequeue() acquires waitinglock internally.
-                wq->dequeue(thread);
-            }
-
-            // The dequeue already handled cleanup; queue for deletion.
-            queuezombie(thread);
-        } else if (oldstate == Thread::state::SUSPENDED) {
-            // Thread is in a runqueue. The scheduler will find it marked DEAD and clean it up. Send IPI to ensure timely cleanup.
-            size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
-            if (cid < NArch::SMP::awakecpus) {
-                struct CPU::cpulocal *cpu = NArch::SMP::cpulist[cid];
-                if (cpu) {
-                    APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
-                }
-            }
-        } else if (oldstate == Thread::state::RUNNING) {
-            // Thread is currently running on a CPU.
-            thread->waitingonlock.acquire();
-            WaitQueue *wq = thread->waitingon;
-            thread->waitingon = NULL;  // Clear to prevent double-dequeue
-            thread->waitingonlock.release();
-
-            if (wq) {
-                wq->dequeue(thread);
-            }
-
-            // Send IPI to force reschedule.
-            size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
-            if (cid < NArch::SMP::awakecpus) {
-                struct CPU::cpulocal *cpu = NArch::SMP::cpulist[cid];
-                if (cpu) {
-                    APIC::sendipi(cpu->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
-                }
-            }
-        } else if (oldstate == Thread::state::READY || oldstate == Thread::state::PAUSED) {
-            // Thread was not in any queue, safe to queue for deletion.
-            queuezombie(thread);
-        }
-    }
-
-    // Terminate all threads in a process except the calling thread.
-    void termothers(Process *proc) {
-        Thread *me = NArch::CPU::get()->currthread;
-
-        // First pass: mark all other threads as dead.
-        proc->lock.acquire();
-        NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
-        for (; it.valid(); it.next()) {
-            Thread *thread = *(it.get());
-            if (thread != me) {
-                markdeadandremove(thread);
-            }
-        }
-        proc->lock.release();
-
-        // Wait for all other threads to be cleaned up.
-        size_t spins = 0;
-        while (__atomic_load_n(&proc->threadcount, memory_order_acquire) > 1) {
-            if (++spins > 100) { // If we spent too long waiting, yield.
-                yield();
-                spins = 0;
-            } else {
-                asm volatile("pause"); // Start by just pausing, so we can immediately start working after
-            }
-        }
-    }
-
 }

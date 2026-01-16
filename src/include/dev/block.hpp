@@ -2,6 +2,7 @@
 #define _DEV__BLOCK_HPP
 
 #include <dev/dev.hpp>
+#include <sched/event.hpp>
 
 // Forward declaration for page cache support.
 namespace NMem {
@@ -11,6 +12,9 @@ namespace NMem {
 }
 
 namespace NDev {
+
+    // Forward declaration for bioreq.
+    class BlockDevice;
 
     // MBR partition entry structure.
     struct mbrpartentry {
@@ -60,14 +64,60 @@ namespace NDev {
         PARTTYPE_GPT    = 2
     };
 
-    // I/O context flags for block device operations.
-    enum IOContext {
-        IO_DIRECT     = 0,        // Direct I/O, bypass cache (default)
-        IO_METADATA   = (1 << 0), // Metadata read/write, safe to cache
-        IO_FILEDATA   = (1 << 1), // File data from readpage/writepage, MUST use direct I/O
-        IO_RAW        = (1 << 2), // Raw device access from userspace, safe to cache
+
+    // Async I/O request structure.
+    struct bioreq {
+        enum opcode {
+            BIO_READ,
+            BIO_WRITE
+        };
+
+        BlockDevice *dev = NULL;
+        enum opcode op;
+        uint64_t lba; // Starting LBA.
+        size_t count; // Number of blocks.
+        void *buffer = NULL;
+        size_t bufsize = 0;
+
+        NSched::WaitQueue wq;
+        volatile bool submitted = false; // Has the I/O been submitted?
+        volatile bool completed = false; // Has the I/O completed?
+        volatile int status = 0; // Status code (zero means success).
+
+        void *udata; // Driver-specific private data.
+        void *ddata; // Driver-specific data for tracking pending I/O.
+
+        void (*callback)(struct bioreq *req) = NULL; // Callback to call on completion.
+
+        struct bioreq *next = NULL; // Next request in batch (for batch async I/O).
+
+        void init(BlockDevice *dev, enum opcode op, uint64_t lba, size_t count, void *buffer, size_t bufsize) {
+            this->dev = dev;
+            this->op = op;
+            this->lba = lba;
+            this->count = count;
+            this->buffer = buffer;
+            this->bufsize = bufsize;
+            this->udata = NULL;
+            this->next = NULL;
+        }
     };
 
+    // I/O context flags for block device operations.
+    enum IOContext {
+        IO_DIRECT     = 0,        // Direct I/O, bypass cache (default, used by readpage/writepage when writing filedata from readpage/writepage methods).
+        IO_METADATA   = (1 << 0), // Metadata read/write, safe to cache.
+        IO_RAW        = (1 << 1), // Raw device access from userspace (eg. read from /dev/nvme0n1), safe to cache.
+    };
+
+    // Block devices are also fairly complicated.
+    // Generally speaking, the driver should implement a BlockDevice subclass
+    // that implements readblock() and writeblock() methods (and optionally readblocks()/writeblocks() for better performance).
+    // The BlockDevice class implements higher-level readbytes() and writebytes() methods that handle
+    // unaligned reads/writes and context-aware caching via page cache.
+    // Partitions should be handled by creating PartitionBlockDevice instances that wrap a parent custom BlockDevice subclass.
+
+    // Block device base class.
     class BlockDevice : public Device {
         protected:
             NMem::RadixTree *pagecache = NULL; // Device-level page cache.
@@ -79,6 +129,8 @@ namespace NDev {
             BlockDevice(uint64_t id, DevDriver *driver) : Device(id, driver) { }
             ~BlockDevice();
 
+            // Block-wise read/write methods.
+
             // Read block-wise from device. Must be implemented by driver.
             virtual ssize_t readblock(uint64_t lba, void *buf) = 0;
             // Write block-wise to device. Must be implemented by driver.
@@ -87,17 +139,37 @@ namespace NDev {
             virtual ssize_t readblocks(uint64_t lba, size_t count, void *buf);
             virtual ssize_t writeblocks(uint64_t lba, size_t count, const void *buf);
 
+
+            // Byte-wise read/write wrapping block I/O.
+
             // Read/write raw bytes from block device with context-aware caching.
             // CRITICAL: Never call with IO_METADATA from within readpage/writepage!
             virtual ssize_t readbytes(void *buf, size_t count, off_t offset, int fdflags, IOContext ctx = IO_DIRECT);
             virtual ssize_t writebytes(const void *buf, size_t count, off_t offset, int fdflags, IOContext ctx = IO_DIRECT);
 
-            // Direct I/O methods (bypass page cache) - used internally and by page I/O.
+            // Direct I/O methods (bypass page cache), used internally and by page I/O.
             ssize_t readbytesdirect(void *buf, size_t count, off_t offset);
             ssize_t writebytesdirect(const void *buf, size_t count, off_t offset);
 
+            // Page cache I/O methods (use page cache), used internally and by metadata/raw I/O.
             ssize_t readbytespagecache(void *buf, size_t count, off_t offset);
             ssize_t writebytespagecache(const void *buf, size_t count, off_t offset);
+
+
+            // Async I/O methods.
+            virtual int submitbio(struct bioreq *req);
+            virtual int waitbio(struct bioreq *req);
+            virtual int cancelbio(struct bioreq *req);
+
+            virtual int submitbiobatch(struct bioreq **reqs, size_t count);
+            virtual int waitbiobatch(struct bioreq **reqs, size_t count);
+
+            virtual int readblocks_async(uint64_t lba, size_t count, void *buf, struct bioreq **outreq);
+            virtual int writeblocks_async(uint64_t lba, size_t count, const void *buf, struct bioreq **outreq);
+
+
+
+            // Page I/O implementations.
 
             // Read a page from device into page cache entry.
             int readpagedata(void *pagebuf, off_t pageoffset);

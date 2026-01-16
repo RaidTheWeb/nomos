@@ -142,6 +142,14 @@ namespace NSched {
         child->session = current->session;
         child->pgrp = current->pgrp;
 
+        // Increment reference counts for inherited pgrp/session.
+        if (child->session) {
+            child->session->ref();
+        }
+        if (child->pgrp) {
+            child->pgrp->ref();
+        }
+
         // Add to process group with proper locking.
         {
             NLib::ScopeIRQSpinlock pgrpguard(&child->pgrp->lock);
@@ -156,12 +164,30 @@ namespace NSched {
                 return p == ((Process *)arg);
             }, (void *)child);
             child->pgrp->lock.release();
+
             current->children.remove([](Process *p, void *arg) {
                 return p == ((Process *)arg);
             }, (void *)child);
+
             if (child->cwd) {
                 child->cwd->unref();
             }
+
+            if (child->root) {
+                if (child->root->fs) {
+                    child->root->fs->fsunref();
+                }
+                child->root->unref();
+            }
+
+            if (child->session) {
+                child->session->unref();
+            }
+
+            if (child->pgrp) {
+                child->pgrp->unref();
+            }
+
             pidtable->remove(child->id);
             delete child;
             SYSCALL_RET(-ENOMEM);
@@ -222,34 +248,50 @@ namespace NSched {
             delete session;
             SYSCALL_RET(-ENOMEM);
         }
+        session->ref();
+
         pgrp->id = current->id;
         pgrp->procs.push(current);
         pgrp->session = session;
+        pgrp->ref(); // Reference for current->pgrp
 
         session->pgrps.push(pgrp);
 
-        // Remove from old process group and clean up if empty.
+        // Release references to old pgrp and session.
+        Session *oldsession = current->session;
+        if (oldsession) {
+            oldsession->unref();
+        }
+        oldpgrp->unref();
+
+        // Remove from old process group and clean up if empty and no refs.
         bool shoulddeleteoldpgrp = false;
-        Session *oldsession = NULL;
+        bool shoulddeleteoldsession = false;
         {
             NLib::ScopeIRQSpinlock oldpgrpguard(&oldpgrp->lock);
             oldpgrp->procs.remove([](Process *p, void *arg) {
                 return p == ((Process *)arg);
             }, (void *)current);
 
-            if (oldpgrp->procs.empty()) {
+            if (oldpgrp->procs.empty() && oldpgrp->getrefcount() == 0) {
                 shoulddeleteoldpgrp = true;
-                oldsession = oldpgrp->session;
                 if (oldsession) {
                     NLib::ScopeIRQSpinlock sessionguard(&oldsession->lock);
                     oldsession->pgrps.remove([](ProcessGroup *pg, void *arg) {
                         return pg == ((ProcessGroup *)arg);
                     }, (void *)oldpgrp);
+
+                    if (oldsession->pgrps.empty() && oldsession->getrefcount() == 0) {
+                        shoulddeleteoldsession = true;
+                    }
                 }
             }
         }
         if (shoulddeleteoldpgrp) {
             delete oldpgrp;
+        }
+        if (shoulddeleteoldsession) {
+            delete oldsession;
         }
 
         current->pgrp = pgrp;
@@ -335,6 +377,7 @@ namespace NSched {
             }
 
             newpgrp = gleader->pgrp;
+            newpgrp->ref(); // Take reference for target->pgrp
         } else {
             if (!target->session) { // Must have a session to create a new process group.
                 SYSCALL_RET(-EPERM);
@@ -347,6 +390,7 @@ namespace NSched {
             }
             newpgrp->id = pgid;
             newpgrp->session = target->session;
+            newpgrp->ref(); // Reference for target->pgrp
 
             // Add to session's process group list.
             NLib::ScopeIRQSpinlock sessionguard(&target->session->lock);
@@ -358,14 +402,15 @@ namespace NSched {
         bool shoulddeleteoldpgrp = false;
         if (target->pgrp) {
             oldpgrp = target->pgrp;
+            oldpgrp->unref(); // Release reference from target->pgrp
             {
                 NLib::ScopeIRQSpinlock oldpgrpguard(&oldpgrp->lock);
                 oldpgrp->procs.remove([](Process *p, void *arg) {
                     return p == ((Process *)arg);
                 }, (void *)target);
 
-                // If old process group is now empty and it's not the new one, clean it up.
-                if (oldpgrp->procs.empty() && oldpgrp != newpgrp) {
+                // If old process group is now empty, has no refs, and it's not the new one, clean it up.
+                if (oldpgrp->procs.empty() && oldpgrp->getrefcount() == 0 && oldpgrp != newpgrp) {
                     shoulddeleteoldpgrp = true;
                     Session *oldsession = oldpgrp->session;
                     if (oldsession) {
@@ -514,7 +559,6 @@ namespace NSched {
             // Blocking wait.
             int ret;
 
-            // Manually expand the macro to add debugging.
             ret = 0;
             while (true) {
                 zombie = findchild(current, pid, true);
@@ -790,7 +834,6 @@ namespace NSched {
             state->wq->wakeone();
         }
 
-        delete state; // Timer is responsible for cleaning up the wait state.
     }
 
     extern "C" ssize_t sys_futex(int *ptr, int op, int expected, struct timespec *timeout) {
@@ -879,6 +922,8 @@ namespace NSched {
                     bool timerfired = state->timerfired;
                     state->lock.release();
 
+                    delete state;
+
                     if (timerfired && ret == 0) {
                         // Timer woke us, this is a timeout.
                         ret = -ETIMEDOUT;
@@ -949,9 +994,7 @@ namespace NSched {
         SYSCALL_LOG("sys_exitthread().\n");
 
         // Mark ourselves as dead and yield.
-        NArch::CPU::get()->setint(false);
-        __atomic_store_n(&NArch::CPU::get()->currthread->tstate, Thread::state::DEAD, memory_order_release);
-        NArch::CPU::get()->setint(true);
+        NSched::setthreadstate(NArch::CPU::get()->currthread, Thread::state::DEAD, "sys_exitthread");
         yield();
 
         __builtin_unreachable();

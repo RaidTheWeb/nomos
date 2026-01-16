@@ -24,9 +24,23 @@ namespace NFS {
         // Root inode number.
         #define EXT4_ROOTINO 2
 
+        // Extent cache entry for avoiding repeated extent tree traversals (lame and dumb).
+        struct extentcacheentry {
+            uint64_t logicalstart;      // First logical block in extent.
+            uint64_t physstart;         // First physical block in extent.
+            uint32_t len;               // Number of blocks in extent.
+            bool valid;                 // Entry is valid.
+        };
+
         class Ext4Node : public VFS::INode {
             private:
                 NLib::HashMap<Ext4Node *> children; // Track loaded child inodes for cleanup.
+
+                // Extent cache for recent lookups (simple LRU-ish).
+                static constexpr size_t EXTENT_CACHESIZE = 4;
+                struct extentcacheentry extentcache[EXTENT_CACHESIZE] = {};
+                size_t extentcacheidx = 0; // Round-robin insertion index.
+                NArch::Spinlock extentcachelock; // Protects extent cache access.
             public:
                 Ext4FileSystem *ext4fs; // Owning filesystem (typed).
                 struct inode diskino; // On-disk inode structure.
@@ -56,6 +70,14 @@ namespace NFS {
 
                 // Map a logical file block to a physical disk block.
                 uint64_t getphysblock(uint64_t logicalblk);
+
+                // Map a logical file block to physical block and return contiguous run length.
+                uint64_t getextentrun(uint64_t logicalblk, uint64_t *runlen);
+
+                // Extent cache helpers.
+                bool lookupcachedextent(uint64_t logicalblk, uint64_t *physblk, uint64_t *runlen);
+                void cacheextent(uint64_t logicalstart, uint64_t physstart, uint32_t len);
+                void invalidateextentcache(void);
 
                 // Read indirect block pointer for legacy (non-extent) inodes.
                 uint64_t getindirectblock(uint64_t logicalblk);
@@ -147,6 +169,15 @@ namespace NFS {
 
                 // Write a page from page cache to disk.
                 int writepage(NMem::CachePage *page) override;
+
+                // Write multiple contiguous pages to disk in a single I/O.
+                int writepages(NMem::CachePage **pages, size_t count) override;
+
+                // Get the backing block device for async readahead.
+                NDev::BlockDevice *getblockdevice(void) override;
+
+                // Map a page offset to device LBA for async readahead.
+                uint64_t getpagelba(off_t pageoffset) override;
         };
 
         class Ext4FileSystem : public VFS::IFileSystem {
@@ -194,33 +225,6 @@ namespace NFS {
                 // Write a group descriptor back to disk.
                 int writegroupdesc(uint32_t group);
 
-                // Calculate inode checksum over a full inode buffer.
-                uint32_t calcinodecsum(uint32_t ino, void *inodebuf, size_t inodesize);
-
-                // Calculate group descriptor checksum.
-                uint16_t calcgroupdesccsum(uint32_t group);
-
-                // Calculate superblock checksum.
-                uint32_t calcsuperblocksum(void);
-
-                // Check if metadata checksums are enabled.
-                bool hasmetadatacsum(void);
-
-                // Get checksum seed (computed or from superblock).
-                uint32_t getcsumseed(void);
-
-                // Calculate block bitmap checksum.
-                uint32_t calcblockbitmapcsum(uint32_t group, const void *bitmap);
-
-                // Calculate inode bitmap checksum.
-                uint32_t calcinodebitmapcsum(uint32_t group, const void *bitmap);
-
-                // Update block bitmap checksum in group descriptor.
-                void updateblockbitmapcsum(uint32_t group, const void *bitmap);
-
-                // Update inode bitmap checksum in group descriptor.
-                void updateinodebitmapcsum(uint32_t group, const void *bitmap);
-
                 // Count free blocks in a bitmap.
                 uint32_t countfreeblocks(uint32_t group, const void *bitmap);
 
@@ -233,14 +237,11 @@ namespace NFS {
                 // Set padding bits in block bitmap (bits beyond blockspergroup).
                 void setblockbitmappadding(void *bitmap);
 
-                // Calculate directory block checksum.
-                uint32_t calcdirblkcsum(uint32_t ino, uint32_t gen, const void *blk, size_t size);
-
-                // Set directory block checksum in the block's tail.
-                void setdirblkcsum(uint32_t ino, uint32_t gen, void *blk);
-
                 // Allocate a block from a specific block group.
                 uint64_t allocblock(uint32_t prefgroup = 0);
+
+                // Allocate multiple contiguous blocks from a specific block group.
+                uint64_t allocblocks(uint32_t prefgroup, uint32_t count, uint32_t *allocated);
 
                 // Free a previously allocated block.
                 int freeblock(uint64_t blknum);

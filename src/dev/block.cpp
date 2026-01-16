@@ -126,30 +126,47 @@ namespace NDev {
             return;
         }
 
-        // Iterate and remove all pages.
-        cache->foreach([](NMem::CachePage *page, void *ctx) -> bool {
-            (void)ctx;
-            page->pagelock();
+        // Use collect-then-process pattern to avoid blocking on pagelock while holding treelock.
+        static constexpr size_t BATCHSIZE = 32;
+        NMem::CachePage *batch[BATCHSIZE];
+        off_t resumeindex = 0;
+        size_t count;
 
-            // Remove from global cache.
-            if (NMem::pagecache) {
-                NMem::pagecache->removepage(page);
+        // Collect all pages (no filter needed).
+        while ((count = cache->foreachcollect(batch, BATCHSIZE, NULL, NULL, &resumeindex)) > 0) {
+            // Process pages outside of treelock.
+            for (size_t i = 0; i < count; i++) {
+                NMem::CachePage *page = batch[i];
+                page->pagelock();
+
+                // Remove from radix tree.
+                off_t index = page->offset / NArch::PAGESIZE;
+                cache->remove(index);
+
+                // Remove from global cache.
+                if (NMem::pagecache) {
+                    NMem::pagecache->removepage(page);
+                }
+
+                // Free physical page.
+                if (page->pagemeta) {
+                    page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                    page->pagemeta->cacheentry = NULL;
+                    page->pagemeta->unref();
+                }
+                if (page->physaddr) {
+                    NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+                }
+
+                page->pageunlock();
+                page->unref();  // Release ref from foreachcollect.
+                delete page;
             }
 
-            // Free physical page.
-            if (page->pagemeta) {
-                page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
-                page->pagemeta->cacheentry = NULL;
-                page->pagemeta->unref();
+            if (resumeindex < 0) {
+                break;
             }
-            if (page->physaddr) {
-                NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
-            }
-
-            page->pageunlock();
-            delete page;
-            return true;
-        }, NULL);
+        }
 
         delete cache;
         this->pagecache = NULL;
@@ -228,41 +245,65 @@ namespace NDev {
         uint8_t *dest = (uint8_t *)buf;
         ssize_t totalread = 0;
 
-        while (count > 0) {
+        size_t blkoff = offset % this->blksize;
+        if (blkoff != 0) {
+            // Read unaligned beginning block.
             uint64_t lba = offset / this->blksize;
-            size_t blkoff = offset % this->blksize;
-            size_t toread = this->blksize - blkoff;
-            if (toread > count) {
-                toread = count;
+            size_t toread = MIN(this->blksize - blkoff, count);
+
+            uint8_t *blkbuf = new uint8_t[this->blksize];
+            if (!blkbuf) {
+                return -ENOMEM;
             }
 
-            // Read block into temporary buffer if not block-aligned.
-            if (blkoff != 0 || toread < this->blksize) {
-                uint8_t *blkbuf = new uint8_t[this->blksize];
-                if (!blkbuf) {
-                    return totalread > 0 ? totalread : -ENOMEM;
-                }
-
-                ssize_t res = this->readblock(lba, blkbuf);
-                if (res < 0) {
-                    delete[] blkbuf;
-                    return totalread > 0 ? totalread : res;
-                }
-
-                NLib::memcpy(dest, blkbuf + blkoff, toread);
+            ssize_t res = this->readblock(lba, blkbuf);
+            if (res < 0) {
                 delete[] blkbuf;
-            } else {
-                // Block-aligned read, directly into destination.
-                ssize_t res = this->readblock(lba, dest);
-                if (res < 0) {
-                    return totalread > 0 ? totalread : res;
-                }
+                return res;
             }
+
+            NLib::memcpy(dest, blkbuf + blkoff, toread);
+            delete[] blkbuf;
 
             dest += toread;
             offset += toread;
             count -= toread;
             totalread += toread;
+        }
+
+        size_t fullblocks = count / this->blksize;
+        if (fullblocks > 0) {
+            // Read full blocks.
+            ssize_t res = this->readblocks(offset / this->blksize, fullblocks, dest);
+            if (res < 0) {
+                return totalread > 0 ? totalread : res;
+            }
+            size_t bytesread = fullblocks * this->blksize;
+            dest += bytesread;
+            offset += bytesread;
+            count -= bytesread;
+            totalread += bytesread;
+        }
+
+        if (count > 0) {
+            // Read unaligned ending block.
+            uint64_t lba = offset / this->blksize;
+
+            uint8_t *blkbuf = new uint8_t[this->blksize];
+            if (!blkbuf) {
+                return totalread > 0 ? totalread : -ENOMEM;
+            }
+
+            ssize_t res = this->readblock(lba, blkbuf);
+            if (res < 0) {
+                delete[] blkbuf;
+                return totalread > 0 ? totalread : res;
+            }
+
+            NLib::memcpy(dest, blkbuf, count);
+            delete[] blkbuf;
+
+            totalread += count;
         }
 
         return totalread;
@@ -277,47 +318,71 @@ namespace NDev {
         const uint8_t *src = (const uint8_t *)buf;
         ssize_t totalwritten = 0;
 
-        while (count > 0) {
+        size_t blkoff = offset % this->blksize;
+        if (blkoff != 0) {
+            // Write unaligned beginning block.
             uint64_t lba = offset / this->blksize;
-            size_t blkoff = offset % this->blksize;
-            size_t towrite = this->blksize - blkoff;
-            if (towrite > count) {
-                towrite = count;
+            size_t towrite = MIN(this->blksize - blkoff, count);
+            uint8_t *blkbuf = new uint8_t[this->blksize];
+            if (!blkbuf) {
+                return -ENOMEM;
             }
-
-            // Write block from temporary buffer if not block-aligned.
-            if (blkoff != 0 || towrite < this->blksize) {
-                uint8_t *blkbuf = new uint8_t[this->blksize];
-                if (!blkbuf) {
-                    return totalwritten > 0 ? totalwritten : -ENOMEM;
-                }
-
-                // Read-modify-write for partial block.
-                ssize_t res = this->readblock(lba, blkbuf);
-                if (res < 0) {
-                    // If read fails, zero the block.
-                    NLib::memset(blkbuf, 0, this->blksize);
-                }
-
-                NLib::memcpy(blkbuf + blkoff, (void *)src, towrite);
-                res = this->writeblock(lba, blkbuf);
+            // Read existing block data.
+            ssize_t res = this->readblock(lba, blkbuf);
+            if (res < 0) {
                 delete[] blkbuf;
-
-                if (res < 0) {
-                    return totalwritten > 0 ? totalwritten : res;
-                }
-            } else {
-                // Block-aligned write, directly from source.
-                ssize_t res = this->writeblock(lba, src);
-                if (res < 0) {
-                    return totalwritten > 0 ? totalwritten : res;
-                }
+                return res;
             }
-
+            NLib::memcpy(blkbuf + blkoff, (void *)src, towrite);
+            // Write updated block back.
+            res = this->writeblock(lba, blkbuf);
+            if (res < 0) {
+                delete[] blkbuf;
+                return res;
+            }
+            delete[] blkbuf;
             src += towrite;
             offset += towrite;
             count -= towrite;
             totalwritten += towrite;
+        }
+
+        size_t fullblocks = count / this->blksize;
+        if (fullblocks > 0) {
+            // Write full blocks.
+            ssize_t res = this->writeblocks(offset / this->blksize, fullblocks, src);
+            if (res < 0) {
+                return totalwritten > 0 ? totalwritten : res;
+            }
+            size_t byteswritten = fullblocks * this->blksize;
+            src += byteswritten;
+            offset += byteswritten;
+            count -= byteswritten;
+            totalwritten += byteswritten;
+        }
+
+        if (count > 0) {
+            // Write unaligned ending block.
+            uint64_t lba = offset / this->blksize;
+            uint8_t *blkbuf = new uint8_t[this->blksize];
+            if (!blkbuf) {
+                return totalwritten > 0 ? totalwritten : -ENOMEM;
+            }
+            // Read existing block data.
+            ssize_t res = this->readblock(lba, blkbuf);
+            if (res < 0) {
+                delete[] blkbuf;
+                return totalwritten > 0 ? totalwritten : res;
+            }
+            NLib::memcpy(blkbuf, (void *)src, count);
+            // Write updated block back.
+            res = this->writeblock(lba, blkbuf);
+            if (res < 0) {
+                delete[] blkbuf;
+                return totalwritten > 0 ? totalwritten : res;
+            }
+            delete[] blkbuf;
+            totalwritten += count;
         }
 
         return totalwritten;
@@ -462,37 +527,215 @@ namespace NDev {
         return totalwritten;
     }
 
+    int BlockDevice::cancelbio(struct bioreq *req) {
+        (void)req;
+        return -ENOSYS;
+    }
+
+    // Synchronous fallback for drivers that do not support async I/O.
+    int BlockDevice::submitbio(struct bioreq *req) {
+        ssize_t res;
+        if (req->op == bioreq::BIO_READ) {
+            res = this->readblocks(req->lba, req->count, req->buffer);
+        } else if (req->op == bioreq::BIO_WRITE) {
+            res = this->writeblocks(req->lba, req->count, req->buffer);
+        } else {
+            return -EINVAL;
+        }
+
+        req->status = (res < 0) ? (int)res : 0;
+
+        __atomic_store_n(&req->completed, true, memory_order_release);
+
+        if (req->callback) {
+            req->callback(req);
+        }
+
+        req->wq.wake();
+        return req->status;
+    }
+
+    int BlockDevice::waitbio(struct bioreq *req) {
+        while (!__atomic_load_n(&req->completed, memory_order_acquire)) {
+            req->wq.wait();
+        }
+        return req->status;
+    }
+
+    int BlockDevice::submitbiobatch(struct bioreq **reqs, size_t count) {
+        for (size_t i = 0; i < count; i++) {
+            int res = this->submitbio(reqs[i]);
+            if (res < 0) {
+                return res;
+            }
+        }
+        return 0;
+    }
+
+    int BlockDevice::waitbiobatch(struct bioreq **reqs, size_t count) {
+        // Wait for all requests to complete.
+        int firsterror = 0;
+        for (size_t i = 0; i < count; i++) {
+            int res = this->waitbio(reqs[i]);
+            if (res < 0 && firsterror == 0) {
+                firsterror = res;
+            }
+        }
+        return firsterror;
+    }
+
+    int BlockDevice::readblocks_async(uint64_t lba, size_t count, void *buf, struct bioreq **outreq) {
+        struct bioreq *req = new struct bioreq();
+        if (!req) {
+            return -ENOMEM;
+        }
+
+        req->init(this, bioreq::BIO_READ, lba, count, buf, count * this->blksize);
+
+        int res = this->submitbio(req);
+        if (res < 0) {
+            delete req;
+            return res;
+        }
+
+        *outreq = req;
+        return 0;
+    }
+
+    int BlockDevice::writeblocks_async(uint64_t lba, size_t count, const void *buf, struct bioreq **outreq) {
+        struct bioreq *req = new struct bioreq();
+        if (!req) {
+            return -ENOMEM;
+        }
+
+        req->init(this, bioreq::BIO_WRITE, lba, count, (void *)buf, count * this->blksize);
+
+        int res = this->submitbio(req);
+        if (res < 0) {
+            delete req;
+            return res;
+        }
+
+        *outreq = req;
+        return 0;
+    }
+
+
     int BlockDevice::syncdevice(void) {
+        NUtil::printf("[dev/block]: Syncing block device ID %lu...\n", this->id);
         NMem::RadixTree *cache = this->pagecache;
         if (!cache) {
             return 0;
         }
 
+        // Use collect-then-process pattern to avoid holding treelock during I/O.
+        static constexpr size_t MAXBATCH = 32;
+        NMem::CachePage *collected[MAXBATCH];
+        NMem::CachePage *dirtypages[MAXBATCH];
+        struct bioreq *requests[MAXBATCH];
         int errors = 0;
-        cache->foreach([](NMem::CachePage *page, void *ctx) -> bool {
-            int *errp = (int *)ctx;
-            BlockDevice *dev = (BlockDevice *)((void **)ctx)[1];
-            if (page->testflag(NMem::PAGE_DIRTY)) {
-                if (page->trypagelock()) {
-                    page->setflag(NMem::PAGE_WRITEBACK);
-                    int err = dev->writepagedata(page->data(), page->offset);
-                    page->clearflag(NMem::PAGE_WRITEBACK);
 
-                    if (err < 0) {
-                        page->errorcount++;
-                        if (page->errorcount >= 10) {
-                            page->setflag(NMem::PAGE_ERROR);
-                        }
-                        (*errp)++;
-                    } else {
-                        page->markclean();
-                        page->errorcount = 0;
+        off_t resumeindex = 0;
+        size_t count;
+
+        // Filter for dirty pages that are not already being written back.
+        auto dirtyfilter = [](NMem::CachePage *page, void *) -> bool {
+            return page->testflag(NMem::PAGE_DIRTY) && !page->testflag(NMem::PAGE_WRITEBACK);
+        };
+
+        // Iterate in batches, releasing treelock between batches.
+        while ((count = cache->foreachcollect(collected, MAXBATCH, dirtyfilter, nullptr, &resumeindex)) > 0) {
+            size_t submitted = 0;
+
+            // Try-lock and submit I/O (NO treelock held).
+            for (size_t i = 0; i < count; i++) {
+                NMem::CachePage *page = collected[i];
+
+                // Try to lock the page. If we can't, skip it (another thread has it).
+                if (!page->trypagelock()) {
+                    page->unref();
+                    continue;
+                }
+
+                // Re-check dirty flag after acquiring page lock (may have been cleaned).
+                if (!page->testflag(NMem::PAGE_DIRTY)) {
+                    page->pageunlock();
+                    page->unref();
+                    continue;
+                }
+
+                page->setflag(NMem::PAGE_WRITEBACK);
+
+                // Calculate LBA for this page.
+                size_t blocksperpage = NArch::PAGESIZE / this->blksize;
+                if (blocksperpage == 0) {
+                    blocksperpage = 1;
+                }
+                uint64_t lba = page->offset / this->blksize;
+
+                // Create async write request.
+                struct bioreq *req = new struct bioreq();
+                if (!req) {
+                    page->clearflag(NMem::PAGE_WRITEBACK);
+                    page->pageunlock();
+                    page->unref();
+                    errors++;
+                    continue;
+                }
+
+                req->init(this, bioreq::BIO_WRITE, lba, blocksperpage, page->data(), NArch::PAGESIZE);
+
+                // Submit async.
+                int res = this->submitbio(req);
+                if (res < 0) {
+                    delete req;
+                    page->clearflag(NMem::PAGE_WRITEBACK);
+                    page->errorcount++;
+                    if (page->errorcount >= 10) {
+                        page->setflag(NMem::PAGE_ERROR);
                     }
                     page->pageunlock();
+                    page->unref();
+                    errors++;
+                    continue;
+                }
+
+                dirtypages[submitted] = page;
+                requests[submitted] = req;
+                submitted++;
+            }
+
+            // Await completion.
+            if (submitted > 0) {
+                this->waitbiobatch(requests, submitted);
+
+                // Process completed requests.
+                for (size_t i = 0; i < submitted; i++) {
+                    NMem::CachePage *pg = dirtypages[i];
+                    struct bioreq *rq = requests[i];
+
+                    pg->clearflag(NMem::PAGE_WRITEBACK);
+                    if (rq->status < 0) {
+                        pg->errorcount++;
+                        if (pg->errorcount >= 10) {
+                            pg->setflag(NMem::PAGE_ERROR);
+                        }
+                        errors++;
+                    } else {
+                        pg->markclean();
+                        pg->errorcount = 0;
+                    }
+                    pg->pageunlock();
+                    pg->unref();
+                    delete rq;
                 }
             }
-            return true;
-        }, (void *[]){ &errors, this });
+
+            // If resumeindex is -1, we've finished iterating.
+            if (resumeindex < 0) {
+                break;
+            }
+        }
 
         return errors;
     }

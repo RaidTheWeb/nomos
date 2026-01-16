@@ -336,40 +336,56 @@ namespace NSched {
                 SYSCALL_RET(-ESRCH); // No process group.
             }
 
+            // Take a reference to prevent deletion while we use it.
+            pg->ref();
+
             int uid = current->euid;
             int gid = current->egid;
             current->lock.release();
 
-            NLib::ScopeIRQSpinlock guard(&pg->lock);
+            {
+                NLib::ScopeIRQSpinlock guard(&pg->lock);
 
-            NLib::DoubleList<Process *>::Iterator it = pg->procs.begin();
-            while (it.valid()) {
-                Process *proc = *it.get();
-                proc->lock.acquire();
-                if (uid != 0 && uid != proc->uid && uid != proc->suid) {
+                NLib::DoubleList<Process *>::Iterator it = pg->procs.begin();
+                while (it.valid()) {
+                    Process *proc = *it.get();
+                    proc->lock.acquire();
+                    if (uid != 0 && uid != proc->uid && uid != proc->suid) {
+                        proc->lock.release();
+                        it.next();
+                        continue;
+                    }
                     proc->lock.release();
-                    it.next();
-                    continue;
-                }
-                proc->lock.release();
-                signalproc(proc, sig); // Send signal.
+                    signalproc(proc, sig); // Send signal.
 
-                it.next();
+                    it.next();
+                }
             }
+
+            pg->unref();
         } else if (pid == -1) { // Send to all processes we have permission to send to.
             // XXX: Figure out how the hell to do this efficiently.
             // This would basically be what is used when shutting down the system.
             SYSCALL_RET(-ENOSYS); // Not implemented.
         } else if (pid < -1) { // Send to specific process group.
+            NLib::ScopeIRQSpinlock pidguard(&pidtablelock);
+
             Process **ptarget = pidtable->find(-pid); // PID is negative, so invert to get PGID.
             if (!ptarget || !*ptarget) {
                 SYSCALL_RET(-ESRCH); // No such process group.
             }
 
-            ProcessGroup *pg = (*ptarget)->pgrp; // Leader process gives us the process group.
+            Process *target = *ptarget;
+            target->lock.acquire();
+            ProcessGroup *pg = target->pgrp; // Leader process gives us the process group.
             if (!pg) {
+                target->lock.release();
                 SYSCALL_RET(-ESRCH); // No such process group.
             }
+
+            // Take a reference to prevent deletion while we use it.
+            pg->ref();
+            target->lock.release();
 
             Process *current = NArch::CPU::get()->currthread->process;
             current->lock.acquire();
@@ -377,21 +393,24 @@ namespace NSched {
             int gid = current->egid;
             current->lock.release();
 
-            NLib::ScopeIRQSpinlock guard(&pg->lock);
+            {
+                NLib::ScopeIRQSpinlock guard(&pg->lock);
 
-            NLib::DoubleList<Process *>::Iterator it = pg->procs.begin();
-            while (it.valid()) {
-                Process *proc = *it.get();
-                proc->lock.acquire();
-                if (uid != 0 && uid != proc->uid && uid != proc->suid) {
+                NLib::DoubleList<Process *>::Iterator it = pg->procs.begin();
+                while (it.valid()) {
+                    Process *proc = *it.get();
+                    proc->lock.acquire();
+                    if (uid != 0 && uid != proc->uid && uid != proc->suid) {
+                        proc->lock.release();
+                        it.next();
+                        continue;
+                    }
                     proc->lock.release();
+                    signalproc(proc, sig); // Send signal.
                     it.next();
-                    continue;
                 }
-                proc->lock.release();
-                signalproc(proc, sig); // Send signal.
-                it.next();
             }
+            pg->unref();
         } else {
             SYSCALL_RET(-EINVAL);
         }
@@ -768,6 +787,7 @@ namespace NSched {
     }
 
     int signalproc(Process *proc, uint8_t sig) {
+        NUtil::printf("[sched/signal] Sending signal %u to process %lu.\n", sig, proc->id);
         if (!proc || sig <= 0 || sig >= NSIG) {
             return -EINVAL;
         }
@@ -832,13 +852,9 @@ namespace NSched {
             if (wq) {
                 // Dequeue from waitqueue first.
                 if (wq->dequeue(towake)) {
-                    // Check the thread state again after dequeue.
                     enum Thread::state state = (enum Thread::state)__atomic_load_n(&towake->tstate, memory_order_acquire);
-                    if (state == Thread::WAITINGINT) {
+                    if (state != Thread::state::DEAD) {
                         NSched::schedulethread(towake);
-                    } else {
-                        // Thread is still RUNNING, just clear pending wait state.
-                        __atomic_store_n(&towake->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
                     }
                 }
             } else {
@@ -856,7 +872,9 @@ namespace NSched {
             return -EINVAL;
         }
 
+        NUtil::printf("[sched/signal] Sending signal %u to process group %lu.\n", sig, pgrp->id);
         NLib::ScopeIRQSpinlock guard(&pgrp->lock);
+        NUtil::printf("[sched/signal] Process group has %u processes.\n", pgrp->procs.size());
 
         // Signal all processes in the group.
         NLib::DoubleList<Process *>::Iterator it = pgrp->procs.begin();
@@ -922,13 +940,9 @@ namespace NSched {
         if (needschedule) {
             if (wq) {
                 if (wq->dequeue(thread)) {
-                    // Check the thread state again after dequeue.
                     enum Thread::state state = (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
-                    if (state == Thread::WAITINGINT) {
+                    if (state != Thread::state::DEAD) {
                         NSched::schedulethread(thread);
-                    } else {
-                        // Thread is still RUNNING, just clear pending wait state.
-                        __atomic_store_n(&thread->pendingwaitstate, Thread::pendingwait::PENDING_NONE, memory_order_release);
                     }
                 }
             } else {

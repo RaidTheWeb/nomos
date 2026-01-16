@@ -353,7 +353,7 @@ namespace NMem {
                 stack[sp].node = (RadixTreeNode *)node->slots[slot];
                 stack[sp].slot = 0;
             } else {
-                // Leaf - call callback.
+                // Leaf, call callback.
                 CachePage *page = (CachePage *)node->slots[slot];
                 if (!callback(page, ctx)) {
                     return;
@@ -361,6 +361,111 @@ namespace NMem {
                 stack[sp].slot++;
             }
         }
+    }
+
+    size_t RadixTree::foreachcollect(CachePage **out, size_t maxcount, bool (*filter)(CachePage *, void *), void *ctx, off_t *resumeindex) {
+        NLib::ScopeIRQSpinlock guard(&this->treelock);
+
+        if (!this->root || maxcount == 0) {
+            if (resumeindex) {
+                *resumeindex = -1;
+            }
+            return 0;
+        }
+
+        size_t collected = 0;
+        off_t startindex = resumeindex ? *resumeindex : 0;
+        if (startindex < 0) {
+            startindex = 0;
+        }
+
+        // Simple recursive traversal using stack.
+        struct stackentry {
+            RadixTreeNode *node;
+            size_t slot;
+            off_t baseindex; // Base index for this node level.
+        };
+        stackentry stack[16];
+        int sp = 0;
+
+        stack[sp].node = this->root;
+        stack[sp].slot = 0;
+        stack[sp].baseindex = 0;
+
+        while (sp >= 0) {
+            RadixTreeNode *node = stack[sp].node;
+            size_t slot = stack[sp].slot;
+            off_t baseindex = stack[sp].baseindex;
+
+            // Find next non-null slot.
+            while (slot < RADIXTREESLOTS && !node->slots[slot]) {
+                slot++;
+            }
+
+            if (slot >= RADIXTREESLOTS) {
+                // Done with this node.
+                sp--;
+                if (sp >= 0) {
+                    stack[sp].slot++;
+                }
+                continue;
+            }
+
+            stack[sp].slot = slot;
+
+            // Calculate index contribution from this slot.
+            size_t shift = node->height * RADIXTREESHIFT;
+            off_t slotindex = baseindex + ((off_t)slot << shift);
+
+            if (node->height > 0) {
+                // Check if we can skip this entire subtree (all indices < startindex).
+                off_t subtreemax = slotindex + ((off_t)1 << shift) - 1;
+                if (subtreemax < startindex) {
+                    stack[sp].slot++;
+                    continue;
+                }
+
+                // Descend.
+                sp++;
+                stack[sp].node = (RadixTreeNode *)node->slots[slot];
+                stack[sp].slot = 0;
+                stack[sp].baseindex = slotindex;
+            } else {
+                // Leaf level.
+                off_t pageindex = slotindex;
+
+                // Skip if before resume point.
+                if (pageindex < startindex) {
+                    stack[sp].slot++;
+                    continue;
+                }
+
+                CachePage *page = (CachePage *)node->slots[slot];
+
+                // Apply filter if provided.
+                if (!filter || filter(page, ctx)) {
+                    // Take a reference before returning.
+                    page->ref();
+                    out[collected++] = page;
+
+                    if (collected >= maxcount) {
+                        // Set resume index to next page.
+                        if (resumeindex) {
+                            *resumeindex = pageindex + 1;
+                        }
+                        return collected;
+                    }
+                }
+
+                stack[sp].slot++;
+            }
+        }
+
+        // Finished iterating, no more pages.
+        if (resumeindex) {
+            *resumeindex = -1;
+        }
+        return collected;
     }
 
     PageCache::PageCache(void) { }
@@ -543,8 +648,12 @@ namespace NMem {
             }
         }
 
-        // Remove from LRU.
-        removefromlru(page);
+        // Remove from LRU (requires cachelock).
+        {
+            NLib::ScopeIRQSpinlock guard(&this->cachelock);
+            removefromlru(page);
+            this->totalpages--;
+        }
 
         // Free the physical page.
         if (page->pagemeta) {
@@ -559,8 +668,6 @@ namespace NMem {
         if (page->inode) {
             page->inode->unref();
         }
-
-        this->totalpages--;
 
         delete page;
         return 0;
@@ -816,44 +923,78 @@ namespace NMem {
     }
 
     int PageCache::syncall(void) {
-        // Write back all dirty pages.
-        // This is a simplified version that walks the LRU lists.
-
-        NLib::ScopeIRQSpinlock guard(&this->cachelock);
-
+        // Write back all dirty pages using collect-then-process pattern.
         int errors = 0;
 
-        // Walk active list.
-        CachePage *page = this->activehead;
-        while (page) {
-            CachePage *next = page->lrunext;
-            if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                if (page->trypagelock()) {
-                    int err = writebackpage(page);
-                    page->pageunlock();
-                    if (err < 0) {
-                        errors++;
-                    }
-                }
-            }
-            page = next;
-        }
+        static constexpr size_t MAXBATCH = 64;
+        CachePage *batch[MAXBATCH];
+        size_t count;
 
-        // Walk inactive list.
-        page = this->inactivehead;
-        while (page) {
-            CachePage *next = page->lrunext;
-            if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                if (page->trypagelock()) {
-                    int err = writebackpage(page);
-                    page->pageunlock();
-                    if (err < 0) {
-                        errors++;
+        // Collect dirty pages from active list.
+        do {
+            count = 0;
+            {
+                NLib::ScopeIRQSpinlock guard(&this->cachelock);
+
+                CachePage *page = this->activehead;
+                while (page && count < MAXBATCH) {
+                    CachePage *next = page->lrunext;
+                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                        page->ref();
+                        batch[count++] = page;
                     }
+                    page = next;
                 }
             }
-            page = next;
-        }
+
+            // Process batch outside of lock.
+            for (size_t i = 0; i < count; i++) {
+                CachePage *page = batch[i];
+                if (page->trypagelock()) {
+                    if (page->testflag(PAGE_DIRTY)) {
+                        int err = writebackpage(page);
+                        if (err < 0) {
+                            errors++;
+                        }
+                    }
+                    page->pageunlock();
+                }
+                page->unref();
+            }
+        } while (count >= MAXBATCH);
+
+        // Collect dirty pages from inactive list.
+        do {
+            count = 0;
+            {
+                NLib::ScopeIRQSpinlock guard(&this->cachelock);
+
+                CachePage *page = this->inactivehead;
+                while (page && count < MAXBATCH) {
+                    CachePage *next = page->lrunext;
+                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                        page->ref();
+                        batch[count++] = page;
+                    }
+                    page = next;
+                }
+            }
+
+            // Process batch outside of lock.
+            for (size_t i = 0; i < count; i++) {
+                CachePage *page = batch[i];
+                if (page->trypagelock()) {
+                    if (page->testflag(PAGE_DIRTY)) {
+                        int err = writebackpage(page);
+                        if (err < 0) {
+                            errors++;
+                        }
+                    }
+                    page->pageunlock();
+                }
+                page->unref();
+            }
+        } while (count >= MAXBATCH);
 
         return errors;
     }
@@ -869,35 +1010,70 @@ namespace NMem {
                 break;
             }
 
-            // Write back dirty pages.
+            // Write back dirty pages using collect-then-process pattern.
             size_t written = 0;
+
+            static constexpr size_t BATCHSIZE = 32;
+            CachePage *batch[BATCHSIZE];
+            size_t count;
+
+            // Collect from active list.
             {
                 NLib::ScopeIRQSpinlock guard(&this->cachelock);
 
+                count = 0;
                 CachePage *page = this->activehead;
-                while (page && written < MAXWRITEBACKPERCYCLE) {
+                while (page && count < BATCHSIZE && written + count < MAXWRITEBACKPERCYCLE) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                        if (page->trypagelock()) {
-                            writebackpage(page);
-                            page->pageunlock();
-                            written++;
-                        }
+                        page->ref();
+                        batch[count++] = page;
                     }
                     page = next;
                 }
+            }
 
-                page = this->inactivehead;
-                while (page && written < MAXWRITEBACKPERCYCLE) {
-                    CachePage *next = page->lrunext;
-                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                        if (page->trypagelock()) {
+            // Process active batch outside of lock.
+            for (size_t i = 0; i < count; i++) {
+                CachePage *page = batch[i];
+                if (page->trypagelock()) {
+                    if (page->testflag(PAGE_DIRTY)) {
+                        writebackpage(page);
+                        written++;
+                    }
+                    page->pageunlock();
+                }
+                page->unref();
+            }
+
+            // Collect from inactive list if we haven't hit the limit.
+            if (written < MAXWRITEBACKPERCYCLE) {
+                {
+                    NLib::ScopeIRQSpinlock guard(&this->cachelock);
+
+                    count = 0;
+                    CachePage *page = this->inactivehead;
+                    while (page && count < BATCHSIZE && written + count < MAXWRITEBACKPERCYCLE) {
+                        CachePage *next = page->lrunext;
+                        if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                            page->ref();
+                            batch[count++] = page;
+                        }
+                        page = next;
+                    }
+                }
+
+                // Process inactive batch outside of lock.
+                for (size_t i = 0; i < count; i++) {
+                    CachePage *page = batch[i];
+                    if (page->trypagelock()) {
+                        if (page->testflag(PAGE_DIRTY)) {
                             writebackpage(page);
-                            page->pageunlock();
                             written++;
                         }
+                        page->pageunlock();
                     }
-                    page = next;
+                    page->unref();
                 }
             }
 
@@ -940,22 +1116,48 @@ namespace NMem {
     }
 
     size_t PageCache::shrink(size_t count) {
-        NLib::ScopeIRQSpinlock guard(&this->cachelock);
-
+        // Use collect-then-process pattern to avoid holding cachelock during I/O.
+        static constexpr size_t BATCHSIZE = 16;
+        CachePage *batch[BATCHSIZE];
         size_t freed = 0;
 
         while (freed < count) {
-            CachePage *victim = selectvictim();
-            if (!victim) {
-                break;
+            size_t collected = 0;
+
+            // Collect victim pages.
+            {
+                NLib::ScopeIRQSpinlock guard(&this->cachelock);
+                while (collected < BATCHSIZE && freed + collected < count) {
+                    CachePage *victim = selectvictim();
+                    if (!victim) {
+                        break;
+                    }
+                    victim->ref();
+                    batch[collected++] = victim;
+                }
             }
 
-            if (victim->trypagelock()) {
-                int err = evictpage(victim);
-                if (err == 0) {
-                    freed++;
+            if (collected == 0) {
+                break; // We can't free any more pages.
+            }
+
+            // Evict collected pages outside of lock.
+            for (size_t i = 0; i < collected; i++) {
+                CachePage *page = batch[i];
+                if (page->trypagelock()) {
+                    int err = evictpage(page);
+                    if (err == 0) {
+                        freed++;
+                        // Page is now deleted.
+                    } else {
+                        // Eviction failed, page still valid.
+                        page->pageunlock();
+                        page->unref();
+                    }
+                } else {
+                    // Couldn't lock page, skip it.
+                    page->unref();
                 }
-                // Note: evictpage deletes the page, so no unlock needed.
             }
         }
 
@@ -1046,7 +1248,7 @@ namespace NMem {
             int errors;
         };
 
-        invalidatectx ctx = { this, 0 };
+        struct invalidatectx ctx = { this, 0 };
 
         // We need to collect pages first since we can't modify tree during iteration.
         while (true) {
@@ -1121,13 +1323,14 @@ namespace NMem {
     void initpagecache(void) {
         pagecache = new PageCache();
         if (pagecache) {
-            pagecache->init(16384, 256); // 16k pages, but TRY to keep at least 256 free.
+            //pagecache->init(16384, 256); // 16k pages, but TRY to keep at least 256 free.
+            pagecache->init(__SIZE_MAX__, 0); // Unlimited pages. XXX: Figure out how to actually manage this. Right now, it'll just keep claiming until OOM (and that's the only time we'll ever reclaim).
         }
     }
 
     void startpagecachethread(void) {
         if (pagecache) {
-            //pagecache->startwritebackthread();
+            pagecache->startwritebackthread();
         }
     }
 

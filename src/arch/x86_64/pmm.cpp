@@ -414,7 +414,7 @@ done:
                 }
 
                 if (*prev != buddy) {
-                    break; // The buddy has canary but is not in freelist - don't merge!
+                    break; // The buddy has canary but is not in freelist. Don't merge!
                 }
 
                 *prev = buddy->next; // Remove buddy from freelist (we're merging with it upwards).

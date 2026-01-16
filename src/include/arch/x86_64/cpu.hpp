@@ -6,6 +6,7 @@
 #include <arch/x86_64/sync.hpp>
 #include <lib/string.hpp>
 #include <sched/sched.hpp>
+#include <sched/workqueue.hpp>
 #include <stdint.h>
 #include <sys/random.hpp>
 
@@ -147,10 +148,14 @@ namespace NArch {
 
             struct tlblocal tlblocal;
 
-            uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
+            volatile uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
             NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.
             size_t schedintr = 1; // Incremented every scheduler interrupt. Used for time-based calculations, as we can approximate a scheduled * NSched::QUANTUMMS = milliseconds conversion.
             uint64_t quantumdeadline = 0; // TSC deadline for quantum expiry.
+            volatile uint64_t minvruntime = 0; // Minimum virtual runtime on this CPU. Used for scheduling decisions.
+#ifdef TSTATE_DEBUG
+            volatile uint64_t idlecount = 0; // Count of consecutive idle thread selections.
+#endif
 
             size_t fpusize = 0; // Size of FPU storage. Determines how FPU storage will be allocated when needed.
             bool hasxsave = false; // Does this CPU support XSAVE? (AVX-* systems).
@@ -160,6 +165,9 @@ namespace NArch {
             bool hasrdseed = false; // Does this CPU support RDSEED?
             NSys::Random::EntropyPool *entropypool = NULL; // Per-CPU entropy pool.
             size_t intcntr = 0; // Count of interrupts handled, for random seeding rate limiting.
+
+            NSched::WorkerPool *workpool = NULL; // Per-CPU worker pool.
+            NSched::WorkerPool *prioworkpool = NULL; // Per-CPU high-priority worker pool.
 
             bool preemptdisabled = true; // Is preemption disabled on this CPU?
             volatile bool inschedule = false; // Is this CPU currently in the scheduler? Prevents nested scheduler invocations.

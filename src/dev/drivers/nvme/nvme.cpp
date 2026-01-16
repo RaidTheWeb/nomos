@@ -39,6 +39,7 @@ namespace NDev {
     }
 
     static NVMEDriver *instance = NULL;
+    static NSched::WorkQueue *nvmeworkqueue = NULL;
 
     // Convert a controller ID, namespace ID and partition ID into a block device minor number.
     static inline uint32_t nsblktominor(uint32_t cid, uint32_t nsid, uint32_t pid) {
@@ -60,6 +61,8 @@ namespace NDev {
 
     NVMEDriver::NVMEDriver(void) {
         instance = this;
+
+        nvmeworkqueue = new NSched::WorkQueue("nvme_iocomplete", NSched::WQ_UNBOUND);
     }
 
     NVMEDriver::~NVMEDriver(void) {
@@ -336,6 +339,11 @@ namespace NDev {
                 __atomic_store_n(&pending->status, 0, memory_order_release);
                 pending->submittsc = 0; // Will be set at submission time.
 
+                // Clear callback/bio pointers to prevent stale values from previous I/O.
+                pending->callback = NULL;
+                pending->bio = NULL;
+                pending->udata = NULL;
+
                 // Atomically update the next CID hint (best-effort, races are tolerable).
                 __atomic_store_n(&sq->nextcid, (slot + 1) % QUEUESIZE, memory_order_release);
                 *outcid = slot;
@@ -373,6 +381,32 @@ namespace NDev {
         int status = __atomic_load_n(&pending->status, memory_order_acquire);
         __atomic_store_n(&pending->inuse, false, memory_order_release);
         return status ? -1 : 0;
+    }
+
+    // Worker function to handle I/O completions via callbacks.
+    static void completionwork(struct NSched::work *work) {
+        struct nvmepending *pending = (struct nvmepending *)work->udata;
+        assert(pending != NULL, "No pending pointer in NVMe completion work item.");
+
+        if (pending->bio && pending->bio->callback) {
+            // Call the block I/O callback.
+            pending->bio->callback(pending->bio);
+        }
+
+        if (pending->callback) {
+            // Call the nvme callback.
+            pending->callback(pending);
+        }
+
+        pending->wq.wakeone();
+    }
+
+    static void queuecompletion(struct nvmepending *pending) {
+        // Pass pending to work item.
+        NSched::initwork(&pending->work, completionwork, pending);
+
+        // Queue the work item (we REALLY don't want to handle callbacks in interrupt context).
+        nvmeworkqueue->queue(&pending->work);
     }
 
     // I/O completion queue interrupt handler.
@@ -438,7 +472,13 @@ namespace NDev {
 
                         __atomic_store_n(&pending->status, cqe->sc, memory_order_release);
                         __atomic_store_n(&pending->done, true, memory_order_release);
-                        pending->wq.wakeone();
+
+                        if (pending->callback || (pending->bio && pending->bio->callback)) {
+                            // We'll need to queue work so that the callback doesn't run in interrupt context (problematic).
+                            queuecompletion(pending);
+                        } else {
+                            pending->wq.wakeone();
+                        }
                     }
 
 advancecq:
@@ -545,6 +585,148 @@ retry:
         }
 
         return result;
+    }
+
+    int NVMEDriver::iorequest_async(struct nvmectrl *ctrl, uint16_t qid, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size, struct nvmepending **pending) {
+        struct nvmequeue *sq = &ctrl->iosq[qid];
+
+        // Allocate a pending slot first.
+        uint16_t cid;
+        struct nvmepending *localpending;
+
+        int retries = 0;
+        while (allocpending(ctrl, qid, &cid, &localpending) != 0) {
+            if (retries++ > 100) {
+                NUtil::printf("[dev/nvme]: No pending slots available.\n");
+                return -1;
+            }
+            NSched::yield();
+        }
+
+        int queueretries = 0;
+retry:
+        // Lock the submission queue for the submission phase.
+        sq->qlock.acquire();
+        uint32_t tail = sq->tail;
+        uint32_t nexttail = (tail + 1) % sq->size;
+
+        // Check if queue is full using atomic read (head is updated by ISR).
+        uint32_t sqhead = __atomic_load_n(&sq->head, memory_order_acquire);
+        if (nexttail == sqhead) {
+            sq->qlock.release();
+
+            // Keep the same pending slot, just retry submission.
+            if (queueretries++ > 1000) {
+                NUtil::printf("[dev/nvme]: Queue full after 1000 retries.\n");
+                __atomic_store_n(&localpending->inuse, false, memory_order_release);
+                return -1;
+            }
+            NSched::yield();
+            goto retry;
+        }
+
+        struct nvmesqe *cmd = &((struct nvmesqe *)sq->entries)[tail];
+        NLib::memset(cmd, 0, sizeof(struct nvmesqe));
+
+        cmd->op = opcode;
+        cmd->nsid = nsid;
+        cmd->cid = cid;
+        cmd->psdt = 0;
+        cmd->fuse = 0;
+
+        cmd->cdw10 = (uint32_t)(lba & 0xffffffff);
+        cmd->cdw11 = (uint32_t)((lba >> 32) & 0xffffffff);
+        cmd->cdw12 = (sectors - 1) & 0xffff;
+
+        if (setupprps(cmd, buffer, size) != 0) {
+            sq->qlock.release();
+            __atomic_store_n(&localpending->inuse, false, __ATOMIC_RELEASE);
+            return -1;
+        }
+
+        uintptr_t prplistaddr = (size > 2 * PAGESIZE) ? cmd->prp2 : 0;
+
+        // Record submission timestamp for timeout detection before ringing doorbell.
+        __atomic_store_n(&localpending->submittsc, NArch::TSC::query(), memory_order_release);
+
+#ifdef __x86_64__
+        asm volatile("sfence" ::: "memory");
+#endif
+
+        sq->tail = nexttail;
+        write32(&ctrl->pcibar, SUBQUEUEDB(qid, ctrl->caps.stride), sq->tail);
+
+        sq->qlock.release();
+
+        // No further handling, just pass the pending structure to the BIO API.
+
+        *pending = localpending;
+        return 0;
+    }
+
+    int NVMEDriver::waitpending(struct nvmepending *pending) {
+        return waitio(pending);
+    }
+
+    int NVMEDriver::waitmultiple(struct nvmepending **pendings, size_t count) {
+        uint64_t hz = NArch::TSC::hz;
+        uint64_t deadline = NArch::TSC::query() + (IOTIMEOUTUS * hz) / 1000000;
+
+        size_t remaining = count;
+        bool *done = new bool[count];
+        if (!done) {
+            return -ENOMEM;
+        }
+        for (size_t i = 0; i < count; i++) {
+            done[i] = false;
+        }
+
+        int firsterror = 0;
+
+        while (remaining > 0) {
+            uint64_t now = NArch::TSC::query();
+            if (now > deadline) {
+                // Mark remaining as timed out.
+                for (size_t i = 0; i < count; i++) {
+                    if (!done[i]) {
+                        __atomic_store_n(&pendings[i]->inuse, false, memory_order_release);
+                    }
+                }
+                delete[] done;
+                return -ETIMEDOUT;
+            }
+
+            bool anycompleted = false;
+            for (size_t i = 0; i < count; i++) {
+                if (done[i]) {
+                    continue;
+                }
+                if (__atomic_load_n(&pendings[i]->done, memory_order_acquire)) {
+                    done[i] = true;
+                    remaining--;
+                    anycompleted = true;
+
+                    int status = __atomic_load_n(&pendings[i]->status, memory_order_acquire);
+                    __atomic_store_n(&pendings[i]->inuse, false, memory_order_release);
+                    if (status != 0 && firsterror == 0) {
+                        firsterror = -EIO;
+                    }
+                }
+            }
+
+            if (!anycompleted && remaining > 0) {
+                // Wait on first incomplete request's wait queue.
+                for (size_t i = 0; i < count; i++) {
+                    if (!done[i]) {
+                        pendings[i]->wq.wait();
+                        break;
+                    }
+                }
+            }
+        }
+
+        delete[] done;
+        return firsterror;
     }
 
     // Initialise an NVMe namespace.
@@ -862,8 +1044,7 @@ retry:
 
         dmafree(nsids, PAGESIZE);
 
-        NUtil::printf("[dev/nvme]: Controller initialisation complete (%u active namespace(s)).\n",
-                      ctrl->activenscount);
+        NUtil::printf("[dev/nvme]: Controller initialisation complete (%u active namespace(s)).\n", ctrl->activenscount);
     }
 
     static struct reginfo info = {

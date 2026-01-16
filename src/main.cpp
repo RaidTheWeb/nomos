@@ -28,6 +28,7 @@
 #include <mm/vmalloc.hpp>
 #include <util/kprint.hpp>
 #include <sched/sched.hpp>
+#include <sched/workqueue.hpp>
 #include <stddef.h>
 #include <sys/elf.hpp>
 
@@ -95,6 +96,9 @@ void kpostarch(void) {
     NMem::initpagecache(); // Initialise global page cache.
     NMem::startpagecachethread(); // Start writeback thread now that scheduler is running.
 
+    NSched::WorkerPool::init(); // Initialise worker pools on all CPUs.
+    NSched::WorkQueue::init(); // Initialise system workqueues.
+
     for (NDev::regentry *entry = (NDev::regentry *)NDev::__drivers_start; (uintptr_t)entry < (uintptr_t)NDev::__drivers_end; entry++) {
         if (entry->magic == NDev::MAGIC && entry->info->stage == NDev::reginfo::STAGE1) {
             NUtil::printf("[nomos]: Discovered stage 1 driver: %s of type %s.\n", entry->info->name, entry->info->type == NDev::reginfo::GENERIC ? "GENERIC" : "MATCHED");
@@ -145,11 +149,14 @@ void kpostarch(void) {
     NSched::ProcessGroup *pgrp = new NSched::ProcessGroup();
     pgrp->id = proc->id;
     pgrp->procs.push(proc);
+    pgrp->ref(); // Reference for proc->pgrp
 
     // SESSION
     NSched::Session *session = new NSched::Session();
     session->id = proc->id;
+    session->ctty = 0; // No controlling terminal initially
     session->pgrps.push(pgrp);
+    session->ref(); // Reference for proc->session
 
     pgrp->session = session;
 

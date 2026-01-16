@@ -94,7 +94,7 @@ namespace NSys {
                 { auxvtype::EUID, info->euid },
                 { auxvtype::GID, info->gid },
                 { auxvtype::EGID, info->egid },
-                { 0, 0 } // NULL entry terminator - MUST BE LAST
+                { 0, 0 } // NULL entry terminator, MUST BE LAST.
             };
             size_t auxvsize = sizeof(auxv);
 

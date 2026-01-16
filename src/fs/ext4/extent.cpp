@@ -230,38 +230,18 @@ namespace NFS {
             uint32_t inogroup = (this->attr.st_ino - 1) / this->ext4fs->sb.inodespergroup;
             uint64_t physblk = 0;
 
-            // Allocate blocks one at a time.
-            // XXX: Could definitely optimize to allocate contiguously.
-            for (uint16_t i = 0; i < len; i++) {
-                this->metalock.release();
-                uint64_t blk = this->ext4fs->allocblock(inogroup);
-                this->metalock.acquire();
+            // Use batch allocation for contiguous blocks.
+            uint32_t allocated = 0;
+            this->metalock.release();
+            physblk = this->ext4fs->allocblocks(inogroup, len, &allocated);
+            this->metalock.acquire();
 
-                if (blk == 0) { // Failure!
-                    // Free any blocks we already allocated.
-                    for (uint16_t j = 0; j < i; j++) {
-                        this->metalock.release();
-                        this->ext4fs->freeblock(physblk + j);
-                        this->metalock.acquire();
-                    }
-                    return 0;
-                }
-
-                if (i == 0) {
-                    physblk = blk;
-                } else if (blk != physblk + i) {
-                    // Free the non-contiguous block and retry with len=1.
-                    this->metalock.release();
-                    this->ext4fs->freeblock(blk);
-                    this->metalock.acquire();
-                    len = i;
-                    break;
-                }
-            }
-
-            if (len == 0) {
+            if (physblk == 0 || allocated == 0) {
                 return 0;
             }
+
+            // Update len to reflect what we actually got.
+            len = (uint16_t)allocated;
 
             // Handle deep extent trees (depth >= 1).
             if (hdr->depth != 0) {

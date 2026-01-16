@@ -186,7 +186,21 @@ namespace NSched {
                 DEAD // Thread has exited and is awaiting cleanup.
             };
 
-            // Pending wait state - set before yield, consumed by scheduler after context save.
+            // Get string name of thread state for debugging.
+            static const char *statename(enum state s) {
+                switch (s) {
+                    case READY: return "READY";
+                    case SUSPENDED: return "SUSPENDED";
+                    case WAITING: return "WAITING";
+                    case WAITINGINT: return "WAITINGINT";
+                    case PAUSED: return "PAUSED";
+                    case RUNNING: return "RUNNING";
+                    case DEAD: return "DEAD";
+                    default: return "UNKNOWN";
+                }
+            }
+
+            // Pending wait state. Set before yield, consumed by scheduler after context save.
             // This prevents the race where a thread is woken before its context is saved.
             enum pendingwait {
                 PENDING_NONE, // No pending wait.
@@ -194,13 +208,23 @@ namespace NSched {
                 PENDING_WAITINT // Wants to enter WAITINGINT state (interruptible).
             };
 
+            // Get string name of pending wait state for debugging.
+            static const char *pendingwaitname(enum pendingwait pw) {
+                switch (pw) {
+                    case PENDING_NONE: return "PENDING_NONE";
+                    case PENDING_WAIT: return "PENDING_WAIT";
+                    case PENDING_WAITINT: return "PENDING_WAITINT";
+                    default: return "UNKNOWN";
+                }
+            }
+
             struct NArch::CPU::context ctx; // CPU working context (save state).
             struct NArch::CPU::extracontext xctx; // CPU extra context (save state).
             struct NArch::CPU::fpucontext fctx; // CPU fpu context (save state).
             struct NArch::CPU::context *sysctx; // Syscall context (not real context, but provides original values before system call).
         private:
             enum target targetmode = target::RELAXED;
-            uint16_t target = 0xffff; // Target CPU affinity (ideal).
+            uint32_t target = 0xffffffff; // Target CPU (for strict mode), ignored for relaxed mode.
 
             uint64_t vruntime = 0; // Virtual runtime of this thread.
             int nice = 0; // -20 to +19, used for virtual runtime weighting. Lower values mean higher priority.
@@ -217,8 +241,19 @@ namespace NSched {
             volatile size_t cid = 0; // Current CPU ID. What CPU owns this right now? Access atomically.
             volatile size_t lastcid = 0; // Last CPU ID. What CPU owned it before? Access atomically.
 
+            volatile bool inrunqueue = false; // Is the thread currently in a runqueue? Access atomically.
+            volatile bool wokenbeforewait = false; // Set by wake() to prevent scheduler from transitioning to WAITING if wake raced ahead.
+
             volatile bool migratedisabled = false; // Outright prevent migration of this thread.
             volatile size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
+
+#ifdef TSTATE_DEBUG
+
+            // Debug state tracking.
+            volatile uint64_t laststatetransition = 0; // TSC timestamp of last state change.
+            volatile enum state laststate = state::READY; // Previous state (for debugging).
+            volatile const char *laststateloc = NULL; // Source location of last state transition.
+#endif
 
             NLib::sigset_t blocked = 0; // Signals blocked in this thread.
             NArch::IRQSpinlock waitingonlock; // Lock for waitingon property.
@@ -266,16 +301,30 @@ namespace NSched {
                 return __atomic_load_n(&this->vruntime, memory_order_acquire);
             }
 
-            void setaffinity(uint16_t target) {
+            // Set vruntime to a specific value (used for normalization and bonuses).
+            void setvruntimeabs(uint64_t newvrt) {
+                __atomic_store_n(&this->vruntime, newvrt, memory_order_release);
+            }
+
+            void setaffinity(uint32_t target) {
                 this->target = target;
+            }
+
+            uint32_t gettarget(void) {
+                return this->target;
             }
 
             void settmode(enum target mode) {
                 this->targetmode = mode;
             }
 
+            enum target gettargetmode(void) {
+                return this->targetmode;
+            }
+
             void savectx(struct NArch::CPU::context *ctx) {
                 this->ctx = *ctx; // Copy context over old context. Updating it.
+                NArch::CPU::mb();
             }
 
             void savexctx(void) {
@@ -333,6 +382,9 @@ namespace NSched {
     // Terminate all other threads in a process except the calling thread.
     void termothers(Process *proc);
 
+    // Mark a thread as dead and remove it from waitqueues/runqueues.
+    void markdeadandremove(Thread *thread);
+
     class Mutex {
         private:
             volatile uint32_t locked;
@@ -353,6 +405,14 @@ namespace NSched {
 
     // Scheduler initialisation (on BSP).
     void setup(void);
+
+#ifdef TSTATE_DEBUG
+
+    void dumpthreads(void);
+    void dumpthread(Thread *thread);
+
+#endif
+    void setthreadstate(Thread *thread, Thread::state newstate, const char *loc);
 }
 
 #endif

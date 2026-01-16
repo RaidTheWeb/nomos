@@ -39,7 +39,7 @@ namespace NMem {
         PAGE_SWAPCACHE  = (1 << 7)      // Page is in swap cache (reserved for future).
     };
 
-    // LRU list membership tracking.
+    // LRU list membership tracking (pretty easy way to quickly determine which list a page belongs to).
     enum lrulist {
         LRU_NONE = 0,
         LRU_ACTIVE = 1,
@@ -144,6 +144,9 @@ namespace NMem {
 
             // Iterate over all pages in the tree calling the callback.
             void foreach(bool (*callback)(CachePage *, void *), void *ctx);
+
+            // Collect pages matching a filter into an output array. Takes a ref on each collected page before releasing the lock.
+            size_t foreachcollect(CachePage **out, size_t maxcount, bool (*filter)(CachePage *, void *), void *ctx, off_t *resumeindex);
     };
 
     // Global page cache manager.
@@ -151,11 +154,11 @@ namespace NMem {
         private:
             NArch::IRQSpinlock cachelock; // Global cache lock.
 
-            CachePage *activehead = NULL; // Active (recently used) pages.
+            CachePage *activehead = NULL; // Active (recently used) pages (LRU_ACTIVE).
             CachePage *activetail = NULL;
             size_t activecount = 0;
 
-            CachePage *inactivehead = NULL; // Inactive (candidates for eviction).
+            CachePage *inactivehead = NULL; // Inactive (candidates for eviction) (LRU_INACTIVE).
             CachePage *inactivetail = NULL;
             size_t inactivecount = 0;
 

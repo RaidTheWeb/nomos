@@ -5,6 +5,7 @@
 #include <dev/pci.hpp>
 
 #include <sched/event.hpp>
+#include <sched/workqueue.hpp>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -284,6 +285,12 @@ namespace NDev {
         volatile int status; // Status code. Written by ISR, read after done=true.
         volatile bool inuse; // Are we using this slot? Accessed atomically.
         volatile uint64_t submittsc; // TSC timestamp when submitted, for timeout detection.
+
+        void (*callback)(struct nvmepending *) = NULL; // Optional callback function for async completions.
+        void *udata = NULL; // User data pointer for the callback.
+
+        struct NSched::work work; // Work item for async completions.
+        struct bioreq *bio = NULL; // Associated block I/O request, if any.
     };
 
     struct nvmectrl {

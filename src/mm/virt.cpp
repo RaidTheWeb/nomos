@@ -167,7 +167,7 @@ namespace NMem {
                 root->flags = successor->flags;
                 root->backingfile = successor->backingfile;
                 root->fileoffset = successor->fileoffset;
-                // Don't copy maxend or height - they'll be recalculated
+                // Don't copy maxend or height, they'll be recalculated
 
                 // Recursively remove the successor from right subtree
                 root->right = this->remove(root->right, successor->start);

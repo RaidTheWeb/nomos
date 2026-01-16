@@ -11,6 +11,7 @@
 #include <lib/signal.hpp>
 #include <mm/ucopy.hpp>
 #include <sched/sched.hpp>
+#include <sched/jobctrl.hpp>
 #include <std/stddef.h>
 
 namespace NDev {
@@ -292,9 +293,12 @@ namespace NDev {
                     // Note: Some implementations also clear outbuffer here.
                 }
 
-                if (this->fpgrp) {
-                    // Signal the foreground process group.
-                    NSched::signalpgrp(this->fpgrp, signal);
+                {
+                    NLib::ScopeSpinlock guard(&this->ctrllock);
+                    if (this->fpgrp) {
+                        // Signal the foreground process group.
+                        NSched::signalpgrp(this->fpgrp, signal);
+                    }
                 }
                 return;
             }
@@ -457,54 +461,57 @@ namespace NDev {
         // 1. SIGTTIN is ignored → return EIO
         // 2. SIGTTIN is blocked → return EIO
         // 3. Process group is orphaned → return EIO
-        if (this->fpgrp && proc->pgrp && proc->pgrp != this->fpgrp) {
-            // Check if process is in the same session as the TTY.
-            if (this->session && proc->session == this->session) {
-                bool orphaned = true;
-                proc->pgrp->lock.acquire();
-                NLib::DoubleList<NSched::Process *>::Iterator it = proc->pgrp->procs.begin();
-                for (; it.valid(); it.next()) {
-                    NSched::Process *member = *it.get();
-                    if (!member) {
-                        continue;
-                    }
-                    member->lock.acquire();
-                    NSched::Process *parent = member->parent;
-                    if (parent) {
-                        parent->lock.acquire();
-                        // Parent exists, in same session, different pgrp?
-                        if (parent->session == proc->session && parent->pgrp != proc->pgrp) {
-                            orphaned = false;
+        {
+            NLib::ScopeSpinlock ctrlguard(&this->ctrllock);
+            if (this->fpgrp && proc->pgrp && proc->pgrp != this->fpgrp) {
+                // Check if process is in the same session as the TTY.
+                if (this->session && proc->session == this->session) {
+                    bool orphaned = true;
+                    proc->pgrp->lock.acquire();
+                    NLib::DoubleList<NSched::Process *>::Iterator it = proc->pgrp->procs.begin();
+                    for (; it.valid(); it.next()) {
+                        NSched::Process *member = *it.get();
+                        if (!member) {
+                            continue;
                         }
-                        parent->lock.release();
+                        member->lock.acquire();
+                        NSched::Process *parent = member->parent;
+                        if (parent) {
+                            parent->lock.acquire();
+                            // Parent exists, in same session, different pgrp?
+                            if (parent->session == proc->session && parent->pgrp != proc->pgrp) {
+                                orphaned = false;
+                            }
+                            parent->lock.release();
+                        }
+                        member->lock.release();
+                        if (!orphaned) {
+                            break;
+                        }
                     }
-                    member->lock.release();
-                    if (!orphaned) {
-                        break;
-                    }
-                }
-                proc->pgrp->lock.release();
+                    proc->pgrp->lock.release();
 
-                if (orphaned) {
-                    // Orphaned process group: return EIO without sending signal.
+                    if (orphaned) {
+                        // Orphaned process group: return EIO without sending signal.
+                        return -EIO;
+                    }
+
+                    // Check if SIGTTIN is ignored or blocked (per-thread).
+                    NSched::Thread *thread = NArch::CPU::get()->currthread;
+                    proc->lock.acquire();
+                    bool ignored = (NSched::gethandler(&proc->signalstate, SIGTTIN) == SIG_IGN);
+                    bool blocked = NSched::isblocked(&thread->blocked, SIGTTIN);
+                    proc->lock.release();
+
+                    if (ignored || blocked) {
+                        // SIGTTIN is ignored or blocked: return EIO without sending signal.
+                        return -EIO;
+                    }
+
+                    // Send SIGTTIN to the background process group.
+                    NSched::signalpgrp(proc->pgrp, SIGTTIN);
                     return -EIO;
                 }
-
-                // Check if SIGTTIN is ignored or blocked (per-thread).
-                NSched::Thread *thread = NArch::CPU::get()->currthread;
-                proc->lock.acquire();
-                bool ignored = (NSched::gethandler(&proc->signalstate, SIGTTIN) == SIG_IGN);
-                bool blocked = NSched::isblocked(&thread->blocked, SIGTTIN);
-                proc->lock.release();
-
-                if (ignored || blocked) {
-                    // SIGTTIN is ignored or blocked: return EIO without sending signal.
-                    return -EIO;
-                }
-
-                // Send SIGTTIN to the background process group.
-                NSched::signalpgrp(proc->pgrp, SIGTTIN);
-                return -EIO;
             }
         }
 
@@ -1123,8 +1130,28 @@ notspecial:
                             }
 
                             // Set up the controlling terminal.
-                            tty->tty->session = proc_session;
-                            tty->tty->fpgrp = proc->pgrp;
+                            {
+                                NLib::ScopeSpinlock ctrlguard(&tty->tty->ctrllock);
+
+                                // Release old references.
+                                if (tty->tty->session) {
+                                    tty->tty->session->unref();
+                                }
+                                if (tty->tty->fpgrp) {
+                                    tty->tty->fpgrp->unref();
+                                }
+
+                                // Set new values and take references.
+                                tty->tty->session = proc_session;
+                                tty->tty->fpgrp = proc->pgrp;
+
+                                if (tty->tty->session) {
+                                    tty->tty->session->ref();
+                                }
+                                if (tty->tty->fpgrp) {
+                                    tty->tty->fpgrp->ref();
+                                }
+                            }
                             proc_session->ctty = tty->id;
 
                             // Store TTY device ID in process structure directly.
@@ -1140,8 +1167,11 @@ notspecial:
                             }
 
                             int pgid = 0;
-                            if (tty->tty->fpgrp) {
-                                pgid = (int)tty->tty->fpgrp->id;
+                            {
+                                NLib::ScopeSpinlock ctrlguard(&tty->tty->ctrllock);
+                                if (tty->tty->fpgrp) {
+                                    pgid = (int)tty->tty->fpgrp->id;
+                                }
                             }
 
                             ret = NMem::UserCopy::copyto((void *)arg, &pgid, sizeof(pgid));
@@ -1176,19 +1206,28 @@ notspecial:
                             NSched::Process *caller = NArch::CPU::get()->currthread->process;
 
                             // The caller must be in the same session as the TTY.
-                            if (!tty->tty->session || !caller->session || caller->session != tty->tty->session) {
-                                tty->devlock.release();
-                                return -ENOTTY;
-                            }
+                            {
+                                NLib::ScopeSpinlock ctrlguard(&tty->tty->ctrllock);
+                                if (!tty->tty->session || !caller->session || caller->session != tty->tty->session) {
+                                    tty->devlock.release();
+                                    return -ENOTTY;
+                                }
 
-                            // The target process group must be in the same session as the TTY.
-                            if (!target->session || target->session != tty->tty->session) {
-                                tty->devlock.release();
-                                return -EPERM;
-                            }
+                                // The target process group must be in the same session as the TTY.
+                                if (!target->session || target->session != tty->tty->session) {
+                                    tty->devlock.release();
+                                    return -EPERM;
+                                }
 
-                            // Accept the requested process group as the foreground pgrp.
-                            tty->tty->fpgrp = target;
+                                // Release old reference.
+                                if (tty->tty->fpgrp) {
+                                    tty->tty->fpgrp->unref();
+                                }
+
+                                // Accept the requested process group as the foreground pgrp.
+                                tty->tty->fpgrp = target;
+                                tty->tty->fpgrp->ref();
+                            }
                             tty->devlock.release();
                             return 0;
                         }

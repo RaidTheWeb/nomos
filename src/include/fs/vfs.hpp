@@ -17,6 +17,16 @@ namespace NMem {
     class CachePage;
 }
 
+// Forward declaration for block device (used by readahead).
+namespace NDev {
+    class BlockDevice;
+}
+
+// Forward declaration for workqueue (used by VFS readahead).
+namespace NSched {
+    class WorkQueue;
+}
+
 namespace NFS {
 
     namespace VFS {
@@ -342,6 +352,14 @@ namespace NFS {
                 }
         };
 
+
+        // Since things have gotten a little complex, here's what is basically going on :
+        // The read() from a file is implemented by the filesystem's read() method, which reads data from disk into a buffer,
+        // stuff like RAMFS override this to read from memory, and DEVFS overrides to pass to a driver.
+        // However, certain filesystems (like ext4) override to read via the page cache (accessing a node's readcached() method).
+        // Filesystems that actually make use of readcached HAVE to implement readpage() to implement reading a full page into cache.
+        // Same sort of deal with write() and writecached().
+
         // Generic VFS node interface.
         class INode {
             protected:
@@ -364,7 +382,14 @@ namespace NFS {
                 INode *redirect = NULL;
 
                 NMem::RadixTree *pagecache = NULL;
+
+                // Read-ahead state for sequential access optimization (lock-free).
+                volatile off_t ralastoffset = -1; // Last read offset (for sequential detection).
+                volatile size_t rasize = 0; // Current read-ahead size in pages.
             public:
+                static constexpr size_t RA_INITPAGES = 4; // Initial prefetch (16KB).
+                static constexpr size_t RA_MAXPAGES = 32; // Max prefetch (128KB).
+
                 IFileSystem *fs;
 
                 enum syncmode {
@@ -544,6 +569,9 @@ namespace NFS {
                 // Sync all dirty cached pages for this inode.
                 int synccache(void);
 
+                // Trigger read-ahead for sequential access patterns.
+                void readahead(off_t offset);
+
                 // Read data through the page cache.
                 ssize_t readcached(void *buf, size_t count, off_t offset);
 
@@ -554,8 +582,21 @@ namespace NFS {
 
                 // Read page, but we can override it for speeding up page-wise reads.
                 virtual int readpage(NMem::CachePage *page);
+                // Read multiple contiguous pages.
+                virtual int readpages(NMem::CachePage **pages, size_t count);
                 // Write page, but we can override it for speeding up page-wise writes.
                 virtual int writepage(NMem::CachePage *page);
+                // Write multiple contiguous dirty pages.
+                virtual int writepages(NMem::CachePage **pages, size_t count);
+
+                // Get the backing block device for this inode (for readahead bio submission).
+                virtual NDev::BlockDevice *getblockdevice(void) { return NULL; }
+
+                // Map a page offset to an LBA for async bio submission.
+                virtual uint64_t getpagelba(off_t pageoffset) {
+                    (void)pageoffset;
+                    return 0;
+                }
         };
 
         class VFS;
@@ -656,6 +697,8 @@ namespace NFS {
                 NLib::DoubleList<struct mntpoint> mounts;
 
                 NLib::HashMap<fsfactory_t *> filesystems;
+
+                NSched::WorkQueue *readaheadwq;
             private:
 
                 INode *root = NULL;
@@ -663,7 +706,7 @@ namespace NFS {
                 struct mntpoint *_findmount(Path *path);
                 struct mntpoint *_findmountbynode(INode *node);
             public:
-                VFS(void) { };
+                VFS(void);
 
                 struct mntpoint *findmount(Path *path);
                 struct mntpoint *findmountbynode(INode *node);

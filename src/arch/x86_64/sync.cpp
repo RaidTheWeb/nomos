@@ -60,7 +60,7 @@ namespace NArch {
                 CPU::get()->irqstatestack[depth] = oldstate;
                 CPU::get()->irqstackdepth = depth + 1;
             }
-            // If stack overflows, we just lose the state - interrupts stay disabled.
+            // If stack overflows, we just lose the state, and interrupts stay disabled.
         } else {
             asm volatile("cli");
         }
