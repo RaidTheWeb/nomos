@@ -45,6 +45,7 @@ namespace NMem {
             // File-backing information for demand paging.
             NFS::VFS::INode *backingfile; // Backing file, NULL for anonymous memory.
             off_t fileoffset; // Offset into the backing file.
+            size_t filemapsize; // Size of file-backed portion (bytes from offset to EOF). Pages beyond this get SIGBUS per POSIX.
         };
 
         // Helper function for the height of a node, NULL nodes have a default 0 height.

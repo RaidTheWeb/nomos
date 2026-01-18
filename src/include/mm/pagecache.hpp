@@ -22,7 +22,23 @@ namespace NDev {
     class BlockDevice;
 }
 
+namespace NArch {
+    namespace VMM {
+        struct addrspace;
+    }
+}
+
 namespace NMem {
+
+    // Represents a single VMA mapping to a cached page.
+    struct vmamapping {
+        NArch::VMM::addrspace *space;   // Address space containing mapping.
+        uintptr_t virtaddr;             // Virtual address in that space.
+        vmamapping *next;               // Next mapping in list.
+        vmamapping *prev;               // Previous mapping in list.
+
+        vmamapping(NArch::VMM::addrspace *s, uintptr_t v) : space(s), virtaddr(v), next(NULL), prev(NULL) {}
+    };
 
     // Forward declarations.
     class PageCache;
@@ -66,6 +82,10 @@ namespace NMem {
             CachePage *lrunext = NULL;
             CachePage *lruprev = NULL;
 
+
+            // List of VMA mappings to this page.
+            struct vmamapping *mappingshead = NULL;
+
             // Wait queue for I/O completion.
             NSched::WaitQueue waitq;
 
@@ -98,6 +118,17 @@ namespace NMem {
 
             void ref(void);
             void unref(void);
+
+            // Add a mapping from an address space to this cached page.
+            void addmapping(NArch::VMM::addrspace *space, uintptr_t virtaddr);
+            // Remove a specific mapping from this page.
+            void removemapping(NArch::VMM::addrspace *space, uintptr_t virtaddr);
+            // Remove all mappings (used during page eviction). Returns number removed.
+            size_t unmapall(void);
+            // Check if this page has any mappings.
+            bool hasmappings(void) const {
+                return mappingshead != NULL;
+            }
     };
 
     // Radix tree node for page lookup.

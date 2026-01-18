@@ -78,8 +78,6 @@ namespace NSys {
                 execpathsize = NLib::strlen(execpath) + 1;
             }
 
-            // XXX: Integrate with /dev/random entropy "pool" at some point.
-
             struct auxv auxv[] = {
                 { auxvtype::PHDR, phdraddr },
                 { auxvtype::PHENT, elfhdr->phsize },
@@ -308,6 +306,12 @@ namespace NSys {
                         goto fail;
                     }
 
+                    NUtil::printf("[elf]: Loading segment %u: vaddr=0x%lx, fsize=0x%lx, msize=0x%lx, doff=0x%lx\n",
+                        i, vaddr, phdrs[i].fsize, phdrs[i].msize, phdrs[i].doff
+                    );
+
+                    // XXX: VMalloc instead? We really don't *need* fully contiguous physical memory here.
+                    // XXX: Better yet, implement page mapping without allocation, and allocate pages on-demand when accessed.
                     void *phys = NArch::PMM::alloc(NLib::alignup(phdrs[i].msize + misalign, NArch::PAGESIZE)); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
                     if (!phys) {
                         goto fail;
@@ -335,14 +339,12 @@ namespace NSys {
 
                     // Read file data if there is any.
                     if (phdrs[i].fsize > 0) {
-                        NUtil::printf("Loading segment %lu: vaddr=0x%lx, phys=0x%lx, fsize=0x%lx, msize=0x%lx, flags=0x%x\n", i, vaddr, (uintptr_t)phys, phdrs[i].fsize, phdrs[i].msize, phdrs[i].flags);
                         if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
                             // Failed. Unmap and free.
                             NArch::VMM::unmaprange(space, vaddr, phdrs[i].msize);
                             NArch::PMM::free(phys, phdrs[i].msize + misalign);
                             goto fail;
                         }
-                        NUtil::printf("Loaded segment %lu: vaddr=0x%lx, phys=0x%lx, fsize=0x%lx, msize=0x%lx, flags=0x%x\n", i, vaddr, (uintptr_t)phys, phdrs[i].fsize, phdrs[i].msize, phdrs[i].flags);
                     }
 
                     if (phdrs[i].msize > phdrs[i].fsize) {

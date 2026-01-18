@@ -787,7 +787,7 @@ namespace NSched {
     }
 
     int signalproc(Process *proc, uint8_t sig) {
-        NUtil::printf("[sched/signal] Sending signal %u to process %lu.\n", sig, proc->id);
+        NUtil::printf("[sched/signal] Sending %s to process %lu.\n", NLib::strsig(sig), proc->id);
         if (!proc || sig <= 0 || sig >= NSIG) {
             return -EINVAL;
         }
@@ -872,7 +872,7 @@ namespace NSched {
             return -EINVAL;
         }
 
-        NUtil::printf("[sched/signal] Sending signal %u to process group %lu.\n", sig, pgrp->id);
+        NUtil::printf("[sched/signal] Sending %s to process group %lu.\n", NLib::strsig(sig), pgrp->id);
         NLib::ScopeIRQSpinlock guard(&pgrp->lock);
         NUtil::printf("[sched/signal] Process group has %u processes.\n", pgrp->procs.size());
 

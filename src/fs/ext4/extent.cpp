@@ -214,7 +214,7 @@ namespace NFS {
 
         // Allocate a new extent for the file.
         uint64_t Ext4Node::allocextent(uint64_t logicalblk, uint16_t len) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!(this->diskino.flags & EXT4_EXTENTSFL)) {
                 // Handle legacy indirect blocks.

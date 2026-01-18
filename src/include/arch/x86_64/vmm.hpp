@@ -6,12 +6,13 @@
 #include <arch/x86_64/pmm.hpp>
 #include <lib/sync.hpp>
 #include <mm/virt.hpp>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
 namespace NArch {
 
-    // Invalid a single page, based on virtual address.
+    // Invalidate a single page, based on virtual address.
     static inline void invlpg(uintptr_t addr) {
         asm volatile("invlpg (%0)" : : "r"(addr) : "memory");
     }
@@ -103,6 +104,32 @@ namespace NArch {
         static const uint64_t ADDRMASK2MB = 0x000FFFFFFFE00000; // Bitmask for addresses from 2MB page table entries.
         static const uint64_t ADDRMASK1GB = 0x000FFFFFC0000000; // Bitmask for addresses from 1GB page table entries.
 
+        // TLB shootdown types.
+        enum shootdowntype : uint8_t {
+            SHOOTDOWN_NONE,
+            SHOOTDOWN_SINGLE,   // Invalidate single page.
+            SHOOTDOWN_RANGE,    // Invalidate range of pages.
+            SHOOTDOWN_FULL      // Full TLB flush.
+        };
+
+        // Global shootdown request structure.
+        struct shootdownreq {
+            enum shootdowntype type;
+            uintptr_t start;
+            uintptr_t end;
+            volatile size_t generation;     // Incremented on each new request.
+            volatile size_t acks;           // Number of CPUs that have processed.
+            size_t targetcpus;              // Number of CPUs that must acknowledge.
+        };
+
+        extern NArch::IRQSpinlock shootdownlock;
+        extern struct shootdownreq shootdownreq;
+
+        static const size_t SHOOTDOWN_RANGETHRESHOLD = 32; // Threshold for when we should use a full TLB flush instead of a range shootdown (in pages).
+
+        // Perform a TLB shootdown across all CPUs.
+        void doshootdown(enum shootdowntype type, uintptr_t start, uintptr_t end);
+
         struct pagetable {
             uint64_t entries[PAGESIZE / sizeof(uint64_t)]; // Define access to every entry within a page table (512 entries for 4096 byte pages).
         } __attribute__((aligned(PAGESIZE))); // This will be dynamically allocated on a page-by-page basis with the PMM.
@@ -128,8 +155,8 @@ namespace NArch {
         // (Unlocked) Resolve page table entry of a virtual address.
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt);
 
-        // (Unlocked) Map a virtual address with an entry.
-        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags);
+        // (Unlocked) Map a virtual address with an entry. If shootdown is false, the caller is responsible for doing TLB shootdown.
+        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool shootdown = true);
 
         bool _remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags);
 

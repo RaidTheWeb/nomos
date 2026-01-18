@@ -7,7 +7,6 @@ namespace NArch {
     namespace CPU {
 
         static struct cpulocal bspinst;
-        struct tlbglobal tlbglobal;
 
         struct cpulocal *getbsp(void) {
             return &bspinst;
@@ -206,18 +205,9 @@ namespace NArch {
                 CPU::get()->hasrdseed = true;
             }
 
+            // Initialize TLB shootdown generation tracking for this CPU.
             struct cpulocal *local = CPU::get();
-
-            __atomic_store_n(&local->tlblocal.pending, false, memory_order_seq_cst);
-
-            local->tlblocal.type = TLBSHOOTDOWN_NONE;
-            local->tlblocal.start = 0;
-            local->tlblocal.end = 0;
-            __atomic_store_n(&local->tlblocal.completion, 0, memory_order_seq_cst);
-
-            if (local == CPU::getbsp()) {
-                __atomic_store_n(&tlbglobal.activereqs, 0, memory_order_seq_cst);
-            }
+            __atomic_store_n(&local->tlbgeneration, 0, memory_order_seq_cst);
         }
     }
 }

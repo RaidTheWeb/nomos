@@ -2005,6 +2005,7 @@ namespace NFS {
             tgtbuf[tgtlen] = '\0';
             fstbuf[fstlen] = '\0';
 
+            NUtil::printf("Mounting %s on %s as %s with flags %lx and data %p\n", srcbuf, tgtbuf, fstbuf, flags, data);
             // Perform the mount operation.
             res = vfs->mount(srcbuf, tgtbuf, fstbuf, flags, data);
             delete[] srcbuf;

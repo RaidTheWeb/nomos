@@ -18,7 +18,7 @@ namespace NFS {
         VFS *vfs = NULL;
 
         NMem::RadixTree *INode::getpagecache(void) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
             if (!this->pagecache) {
                 this->pagecache = new NMem::RadixTree();
             }
@@ -295,6 +295,25 @@ namespace NFS {
             NMem::CachePage *pages[32]; // Pages being read ahead (max 32).
         };
 
+        // Callback for async readahead I/O completion.
+        static void readaheadbiocomplete(struct NDev::bioreq *req) {
+            NMem::CachePage *page = (NMem::CachePage *)req->udata;
+
+            if (req->status == 0) {
+                page->setflag(NMem::PAGE_UPTODATE);
+                page->clearflag(NMem::PAGE_ERROR);
+            } else {
+                page->setflag(NMem::PAGE_ERROR);
+                page->errorcount++;
+            }
+
+            // Release page lock (was held since getorcacheepage).
+            page->pageunlock();
+
+            // Free the bioreq.
+            delete req;
+        }
+
         // Worker function that performs the actual readahead I/O.
         static void readaheadworker(struct NSched::work *w) {
             struct readaheadwork *ctx = (struct readaheadwork *)w;
@@ -312,6 +331,14 @@ namespace NFS {
 
             size_t blksize = blkdev->blksize;
             size_t blocksperpage = NArch::PAGESIZE / blksize;
+
+            // Check if block device supports native async I/O.
+            bool asyncio = blkdev->hasasyncio();
+
+            // If using sync fallback, limit pages to avoid blocking worker too long.
+            if (!asyncio && npages > 4) {
+                npages = 4;
+            }
 
             for (size_t i = 0; i < npages; i++) {
                 off_t pageoff = rastart + i * NArch::PAGESIZE;
@@ -337,24 +364,33 @@ namespace NFS {
                     continue;
                 }
 
-                // This may do I/O (extent tree lookup) but we're in workqueue context now.
-                uint64_t lba = inode->getpagelba(pageoff);
+                // Try to get LBA from extent cache only (non-blocking). If not cached, skip this page to avoid blocking on extent tree I/O.
+                bool needsio = false;
+                uint64_t lba = inode->getpagelbacached(pageoff, &needsio);
+                if (needsio) {
+                    page->pageunlock();
+                    continue;
+                }
+
                 if (lba == 0) {
+                    // Hole in file.
                     NLib::memset(page->data(), 0, NArch::PAGESIZE);
                     page->setflag(NMem::PAGE_UPTODATE);
                     page->pageunlock();
                     continue;
                 }
 
-                ssize_t res = blkdev->readblocks(lba, blocksperpage, page->data());
-                if (res >= 0) {
-                    page->setflag(NMem::PAGE_UPTODATE);
-                    page->clearflag(NMem::PAGE_ERROR);
-                } else {
+                struct NDev::bioreq *req = new NDev::bioreq();
+                req->init(blkdev, NDev::bioreq::BIO_READ, lba, blocksperpage, page->data(), NArch::PAGESIZE);
+                req->callback = readaheadbiocomplete;
+                req->udata = page; // Store page for completion callback.
+
+                int res = blkdev->submitbio(req);
+                if (res < 0) {
                     page->setflag(NMem::PAGE_ERROR);
-                    page->errorcount++;
+                    page->pageunlock();
+                    delete req;
                 }
-                page->pageunlock();
             }
 
             // Release inode reference and free work context.
@@ -445,7 +481,7 @@ namespace NFS {
             // Check file size and adjust count to not read past EOF.
             uint64_t filesize;
             {
-                NLib::ScopeSpinlock guard(&this->metalock);
+                NLib::ScopeIRQSpinlock guard(&this->metalock);
                 filesize = this->attr.st_size;
             }
 
@@ -678,7 +714,7 @@ namespace NFS {
                 // Ensure we have permission to mount here.
                 NSched::Process *proc = NArch::CPU::get()->currthread->process;
                 proc->lock.acquire();
-                bool access = this->checkaccess(mntnode, R_OK | X_OK, proc->euid, proc->egid);
+                bool access = this->checkaccess(mntnode, O_RDONLY | O_EXEC, proc->euid, proc->egid);
                 proc->lock.release();
                 if (!access) {
                     delete[] path;
@@ -1706,7 +1742,7 @@ namespace NFS {
         }
 
         VFS::VFS(void) : mountlock(), mounts(), root(NULL) {
-            this->readaheadwq = new NSched::WorkQueue("readahead", NSched::WQ_UNBOUND);
+            this->readaheadwq = new NSched::WorkQueue("readahead", NSched::WQ_UNBOUND | NSched::WQ_INTENSIVE); // Mark as intensive, because it can be blocking on sync fallback.
         }
     }
 }

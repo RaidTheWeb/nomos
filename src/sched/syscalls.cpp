@@ -817,7 +817,7 @@ namespace NSched {
         WaitQueue *wq;
         bool timerfired;
         bool threadwoke;
-        NArch::Spinlock lock;
+        NArch::IRQSpinlock lock;
     };
 
     // Timer callback for futex timeout.

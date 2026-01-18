@@ -169,10 +169,67 @@ namespace NFS {
         #define EXT4_TINDBLOCK (EXT4_DINDBLOCK + 1)
         #define EXT4_NBLOCKS (EXT4_TINDBLOCK + 1)
 
-        // Feature flags for checksums.
+        // Compatible feature flags (can mount read-write even if unknown).
+        #define EXT4_FEATURECOMPATDIRPREALLOC   0x0001
+        #define EXT4_FEATURECOMPATIMAGIC        0x0002
+        #define EXT4_FEATURECOMPATHASJOURNAL    0x0004
+        #define EXT4_FEATURECOMPATEXTATTR       0x0008
+        #define EXT4_FEATURECOMPATRESIZEINODE   0x0010
+        #define EXT4_FEATURECOMPATDIRINDEX      0x0020
+        #define EXT4_FEATURECOMPATSPARSESUPER2  0x0200
+
+        // Incompatible feature flags (must understand to mount).
+        #define EXT4_FEATUREINCOMPATCOMPRESSION 0x0001
+        #define EXT4_FEATUREINCOMPATFILETYPE    0x0002
+        #define EXT4_FEATUREINCOMPATRECOVER     0x0004
+        #define EXT4_FEATUREINCOMPATJOURNALDEV  0x0008
+        #define EXT4_FEATUREINCOMPATMETABG      0x0010
+        #define EXT4_FEATUREINCOMPATEXTENTS     0x0040
+        #define EXT4_FEATUREINCOMPAT64BIT       0x0080
+        #define EXT4_FEATUREINCOMPATMMP         0x0100
+        #define EXT4_FEATUREINCOMPATFLEXBG      0x0200
+        #define EXT4_FEATUREINCOMPATEAINODE     0x0400
+        #define EXT4_FEATUREINCOMPATDIRDATA     0x1000
+        #define EXT4_FEATUREINCOMPATCSUMSEED    0x2000
+        #define EXT4_FEATUREINCOMPATLARGEDIR    0x4000
+        #define EXT4_FEATUREINCOMPATINLINEDATA  0x8000
+        #define EXT4_FEATUREINCOMPATENCRYPT     0x10000
+
+        // Read-only compatible feature flags (must mount read-only if unknown).
+        #define EXT4_FEATUREROCOMPATSPARSESUPER 0x0001
+        #define EXT4_FEATUREROCOMPATLARGEFILE   0x0002
+        #define EXT4_FEATUREROCOMPATBTREEDIR    0x0004
+        #define EXT4_FEATUREROCOMPATHUGEFILE    0x0008
+        #define EXT4_FEATUREROCOMPATGDTCSUM     0x0010
+        #define EXT4_FEATUREROCOMPATDIRNLINK    0x0020
+        #define EXT4_FEATUREROCOMPATEXTRAISIZE  0x0040
+        #define EXT4_FEATUREROCOMPATQUOTA       0x0100
+        #define EXT4_FEATUREROCOMPATBIGALLOC    0x0200
         #define EXT4_FEATUREROCOMPATMETADATACSUM 0x0400
-        #define EXT4_FEATUREROCOMPATGDTCSUM 0x0010
-        #define EXT4_FEATUREINCOMPATCSUMSEED 0x2000
+        #define EXT4_FEATUREROCOMPATREADONLY    0x1000
+        #define EXT4_FEATUREROCOMPATPROJECT     0x2000
+
+        // Bitmasks for supported features.
+        #define EXT4_SUPPORTEDINCOMPAT ( \
+            EXT4_FEATUREINCOMPATFILETYPE | \
+            EXT4_FEATUREINCOMPATEXTENTS | \
+            EXT4_FEATUREINCOMPAT64BIT | \
+            EXT4_FEATUREINCOMPATFLEXBG | \
+            EXT4_FEATUREINCOMPATCSUMSEED)
+
+        #define EXT4_SUPPORTEDROCOMPAT ( \
+            EXT4_FEATUREROCOMPATSPARSESUPER | \
+            EXT4_FEATUREROCOMPATLARGEFILE | \
+            EXT4_FEATUREROCOMPATHUGEFILE | \
+            EXT4_FEATUREROCOMPATEXTRAISIZE | \
+            EXT4_FEATUREROCOMPATMETADATACSUM | \
+            EXT4_FEATUREROCOMPATGDTCSUM | \
+            EXT4_FEATUREROCOMPATDIRNLINK)
+
+        // Inode flags.
+        #define EXT4_HUGEFILEFL     0x00040000  // Huge file (blocks in fs units, not 512-byte).
+        #define EXT4_EXTENTSFL      0x00080000  // Inode uses extents.
+        #define EXT4_INLINEDATAFL   0x10000000  // Inode has inline data.
 
         struct inode {
             uint16_t mode; // File mode.

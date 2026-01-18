@@ -149,7 +149,7 @@ namespace NDev {
 
         class Device {
             public:
-                NArch::Spinlock lock;
+                NArch::IRQSpinlock lock;
                 uint64_t evsupported; // What events do we support?
                 NLib::Bitmap keybit; // What key codes do we support?
 

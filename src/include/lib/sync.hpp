@@ -41,21 +41,6 @@ namespace NLib {
             }
     };
 
-    class ScopeMCSSpinlock {
-        private:
-            NArch::MCSSpinlock *spin;
-        public:
-            ScopeMCSSpinlock(NArch::MCSSpinlock *spin) {
-                this->spin = spin;
-                this->spin->acquire();
-            }
-
-            ~ScopeMCSSpinlock(void) {
-                // Release on object destroy (scope end).
-                this->spin->release();
-            }
-    };
-
     // Bog-standard readers-writer "mutex" implementation. Handles the sleeping of threads under contention.
     class RWLock {
         private:

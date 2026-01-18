@@ -161,6 +161,11 @@ namespace NDev {
             virtual int waitbio(struct bioreq *req);
             virtual int cancelbio(struct bioreq *req);
 
+            // Returns true if the driver implements native async I/O.
+            virtual bool hasasyncio() const {
+                return false;
+            }
+
             virtual int submitbiobatch(struct bioreq **reqs, size_t count);
             virtual int waitbiobatch(struct bioreq **reqs, size_t count);
 
@@ -219,6 +224,19 @@ namespace NDev {
 
             ssize_t writeblocks(uint64_t lba, size_t count, const void *buffer) override {
                 return this->parent->writeblocks(lba + this->startlba, count, buffer);
+            }
+
+            int submitbio(struct bioreq *req) override {
+                req->lba += this->startlba; // Adjust LBA for partition offset.
+                return this->parent->submitbio(req);
+            }
+
+            int waitbio(struct bioreq *req) override {
+                return this->parent->waitbio(req);
+            }
+
+            bool hasasyncio() const override {
+                return this->parent->hasasyncio();
             }
     };
 

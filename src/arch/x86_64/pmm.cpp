@@ -3,6 +3,7 @@
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
+#include <lib/string.hpp>
 #include <lib/sync.hpp>
 #include <mm/pagecache.hpp>
 #include <mm/slab.hpp>
@@ -41,6 +42,7 @@ namespace NArch {
                 }
             }
             NUtil::printf("[arch/x86_64/pmm]: Total usable memory is %lu MiB.\n", usable / 1024 / 1024);
+            NUtil::printf("[arch/x86_64/pmm]: Memory map has %lu entries.\n", NLimine::mmreq.response->entry_count);
 
             size_t bitmaptarget = usable * 30 / 100; // Bitmap allocator is given a 30% split target of total memory.
             size_t buddytarget = usable * 70 / 100; // Buddy allocator gets all the rest.
@@ -153,27 +155,42 @@ namespace NArch {
 
             // Allocate page tracking metadata for all zones.
 
-            zone.meta = (PageMeta *)PMM::alloc((zone.size / PAGESIZE) * sizeof(PageMeta), FLAGS_NOTRACK); // Allocate zone's metadata.
+            size_t buddypages = zone.size / PAGESIZE;
+            size_t buddymetasize = buddypages * sizeof(PageMeta);
+            NUtil::printf("[arch/x86_64/pmm]: Allocating buddy metadata for %lu pages (%lu MiB)...\n", buddypages, buddymetasize / (1024 * 1024));
+
+            zone.meta = (PageMeta *)PMM::alloc(buddymetasize, FLAGS_NOTRACK); // Allocate zone's metadata.
             assert(zone.meta, "Failed to allocate buddy allocator page metadata.\n");
             zone.meta = (PageMeta *)hhdmoff(zone.meta);
 
-            for (size_t i = 0; i < zone.size / PAGESIZE; i++) {
-                zone.meta[i].refcount = 0;
-                zone.meta[i].flags = 0;
-                zone.meta[i].addr = (uintptr_t)hhdmsub((void *)zone.addr) + (i * PAGESIZE);
-            }
+            // Zero metadata quickly.
+            NLib::fastzero(zone.meta, buddymetasize);
+            asm volatile("sfence" : : : "memory");
 
+            NUtil::printf("[arch/x86_64/pmm]: Setting buddy page addresses (%lu pages)...\n", buddypages);
+            uintptr_t buddybaseaddr = (uintptr_t)hhdmsub((void *)zone.addr);
+            for (size_t i = 0; i < buddypages; i++) {
+                zone.meta[i].addr = buddybaseaddr + (i * PAGESIZE);
+            }
+            asm volatile("sfence" : : : "memory");
+
+            NUtil::printf("[arch/x86_64/pmm]: Initialising %lu bitmap zones...\n", numbitmapzones);
             for (size_t i = 0; i < numbitmapzones; i++) {
-                bitmapzones[i].meta = (PageMeta *)PMM::alloc((bitmapzones[i].size / PAGESIZE) * sizeof(PageMeta), FLAGS_NOTRACK); // Allocate zone's metadata.
+                size_t bitmappages = bitmapzones[i].size / PAGESIZE;
+                size_t bitmapmetasize = bitmappages * sizeof(PageMeta);
+
+                bitmapzones[i].meta = (PageMeta *)PMM::alloc(bitmapmetasize, FLAGS_NOTRACK); // Allocate zone's metadata.
                 assert(bitmapzones[i].meta, "Failed to allocate bitmap page metadata.\n");
                 bitmapzones[i].meta = (PageMeta *)hhdmoff(bitmapzones[i].meta);
 
-                for (size_t j = 0; j < bitmapzones[i].size / PAGESIZE; j++) {
-                    bitmapzones[i].meta[j].refcount = 0;
-                    bitmapzones[i].meta[j].flags = 0;
-                    bitmapzones[i].meta[j].addr = (uintptr_t)hhdmsub((void *)bitmapzones[i].addr) + (j * PAGESIZE);
+                NLib::fastzero(bitmapzones[i].meta, bitmapmetasize);
+
+                uintptr_t bitmapbaseaddr = (uintptr_t)hhdmsub((void *)bitmapzones[i].addr);
+                for (size_t j = 0; j < bitmappages; j++) {
+                    bitmapzones[i].meta[j].addr = bitmapbaseaddr + (j * PAGESIZE);
                 }
             }
+            asm volatile("sfence" : : : "memory");
 
 
             // Sanity check:
@@ -490,10 +507,14 @@ done:
             assert(size > bmappages * PAGESIZE, "New bitmap zone too small to hold bitmap.\n");
 
             // Allocate page tracking metadata BEFORE acquiring the lock to avoid deadlock.
-            size_t metasize = ((size - bmappages * PAGESIZE) / PAGESIZE) * sizeof(PageMeta);
+            size_t metapages = (size - bmappages * PAGESIZE) / PAGESIZE;
+            size_t metasize = metapages * sizeof(PageMeta);
             PageMeta *meta = (PageMeta *)PMM::alloc(metasize, FLAGS_NOTRACK);
             assert(meta, "Failed to allocate bitmap page metadata.\n");
             meta = (PageMeta *)hhdmoff(meta);
+
+            // Zero metadata using optimized fastzero
+            NLib::fastzero(meta, metasize);
 
             // Now acquire the lock to update the zone data structures.
             NLib::ScopeIRQSpinlock guard(&alloclock);
@@ -509,10 +530,9 @@ done:
 
             bitmapzones[numbitmapzones].meta = meta;
 
-            for (size_t j = 0; j < bitmapzones[numbitmapzones].size / PAGESIZE; j++) {
-                bitmapzones[numbitmapzones].meta[j].refcount = 0;
-                bitmapzones[numbitmapzones].meta[j].flags = 0;
-                bitmapzones[numbitmapzones].meta[j].addr = (uintptr_t)hhdmsub((void *)bitmapzones[numbitmapzones].addr) + (j * PAGESIZE);
+            uintptr_t zonebaseaddr = (uintptr_t)hhdmsub((void *)bitmapzones[numbitmapzones].addr);
+            for (size_t j = 0; j < metapages; j++) {
+                bitmapzones[numbitmapzones].meta[j].addr = zonebaseaddr + (j * PAGESIZE);
             }
 
             numbitmapzones++;

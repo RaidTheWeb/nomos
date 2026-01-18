@@ -176,7 +176,7 @@ namespace NFS {
         }
 
         ssize_t DevNode::readlink(char *buf, size_t bufsiz) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISLNK(this->attr.st_mode)) {
                 return -EINVAL;
@@ -199,7 +199,7 @@ namespace NFS {
         }
 
         ssize_t DevNode::readdir(void *buf, size_t count, off_t offset) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return -ENOTDIR;
@@ -332,16 +332,15 @@ namespace NFS {
         int DevNode::stat(struct VFS::stat *st) {
 
             if (!this->device) {
-                NLib::ScopeSpinlock guard(&this->metalock);
+                NLib::ScopeIRQSpinlock guard(&this->metalock);
                 *st = this->attr;
                 return 0;
             }
 
             int ret = this->device->driver->stat(this->attr.st_dev, st);
             if (ret == NOSTAT) {
-                this->metalock.acquire();
+                NLib::ScopeIRQSpinlock guard(&this->metalock);
                 *st = this->attr;
-                this->metalock.release();
                 return 0;
             }
             return ret;
@@ -365,7 +364,7 @@ namespace NFS {
         }
 
         VFS::INode *DevNode::lookup(const char *name) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return NULL;
@@ -382,7 +381,7 @@ namespace NFS {
         }
 
         bool DevNode::add(VFS::INode *node) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false;
@@ -402,7 +401,7 @@ namespace NFS {
         }
 
         bool DevNode::remove(const char *name) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false;

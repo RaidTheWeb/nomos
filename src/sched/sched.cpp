@@ -787,12 +787,25 @@ namespace NSched {
             return; // Already queued, nothing to do.
         }
 
+        enum Thread::state curstate =
+            (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
+
+        if (curstate == Thread::state::RUNNING) {
+            return; // Already running, nothing to do.
+        }
+
         // Determine target CPU.
         struct CPU::cpulocal *target;
 
         if (thread->gettargetmode() == Thread::target::STRICT) {
             // Strict targeting REFUSES to let the scheduler choose another CPU.
-            target = SMP::cpulist[thread->gettarget()];
+            uint32_t targetcpu = thread->gettarget();
+            if (targetcpu < SMP::awakecpus) {
+                target = SMP::cpulist[targetcpu];
+            } else {
+                // Invalid target CPU, fall back to current CPU.
+                target = CPU::get();
+            }
         } else {
             // Prefer last CPU (cache affinity), otherwise use idlest.
             size_t lastcid = __atomic_load_n(&thread->lastcid, memory_order_acquire);
@@ -851,6 +864,32 @@ namespace NSched {
         asm volatile("int $0xfe");
     }
 
+    // Sleep state for heap-allocated timer coordination.
+    struct sleepstate {
+        WaitQueue wq;
+        volatile bool timerfired;
+        volatile bool threadwoke;
+        IRQSpinlock lock;
+    };
+
+    // Either this callback or the main thread will delete the state, never both.
+    static void sleepcallback(void *arg) {
+        struct sleepstate *st = (struct sleepstate *)arg;
+
+        st->lock.acquire();
+        st->timerfired = true;
+        bool threadwoke = st->threadwoke;
+        if (!threadwoke) {
+            st->wq.wake();
+        }
+        st->lock.release();
+
+        if (threadwoke) {
+            // Thread already returned, we are responsible for cleanup.
+            delete st;
+        }
+    }
+
     // Sleep for a given number of milliseconds.
     int sleep(uint64_t ms) {
         if (ms == 0) {
@@ -858,34 +897,39 @@ namespace NSched {
             return 0;
         }
 
-        WaitQueue wq;
-        volatile bool expired = false;
+        // Heap-allocate state so it survives early return from signal.
+        struct sleepstate *state = new struct sleepstate;
+        state->timerfired = false;
+        state->threadwoke = false;
 
-        // Timer state passed to callback.
-        struct sleepstate {
-            volatile bool *exp;
-            WaitQueue *wq;
-        };
-
-        struct sleepstate state = { &expired, &wq };
-
-        // Timer callback to wake the waitqueue.
-        auto callback = [](void *arg) {
-            struct sleepstate *st = (struct sleepstate *)arg;
-            *st->exp = true;
-            st->wq->wake();
-        };
-
-        NSys::Timer::create(callback, (void *)&state, ms);
+        // Properly lock the timer subsystem before creating timer.
+        NSys::Timer::timerlock();
+        NSys::Timer::create(sleepcallback, (void *)state, ms);
+        NSys::Timer::timerunlock();
 
         int ret;
-        waiteventinterruptible(&wq, expired, ret);
+        waiteventinterruptible(&state->wq, state->timerfired, ret);
+
+        // Coordinate with timer callback under lock.
+        state->lock.acquire();
+        state->threadwoke = true;
+        bool timerfired = state->timerfired;
+        state->lock.release();
+
+        if (timerfired) {
+            // Timer already fired, we are responsible for cleanup.
+            delete state;
+        } // Callback will clean up otherwise.
 
         return ret;
     }
 
     // Force reschedule of a specific thread.
     void reschedule(Thread *thread) {
+        if (!thread) {
+            return;
+        }
+
         thread->disablemigrate();
         __atomic_store_n(&thread->rescheduling, true, memory_order_release);
 

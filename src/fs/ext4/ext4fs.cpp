@@ -1,6 +1,7 @@
 #include <dev/block.hpp>
 #include <fs/ext4/defs.hpp>
 #include <fs/ext4/ext4fs.hpp>
+#include <lib/crc32c.hpp>
 #include <lib/string.hpp>
 #include <mm/slab.hpp>
 #include <std/stdatomic.h>
@@ -128,28 +129,39 @@ namespace NFS {
             uint64_t inodetable = ((uint64_t)gd->inodetablehi << 32) | gd->inodetablelo;
 
             // Calculate the offset of this inode within the inode table.
-            uint64_t inodeoff = inodetable * this->blksize + index * this->sb.inodesize;
+            uint64_t inodeoff = inodetable * this->blksize + index * this->inodesize;
 
             // Allocate a buffer for the full on-disk inode size.
-            uint8_t *inodebuf = new uint8_t[this->sb.inodesize];
+            uint8_t *inodebuf = new uint8_t[this->inodesize];
             if (!inodebuf) {
                 return -ENOMEM;
             }
 
             // Read the existing on-disk inode to preserve extra fields.
-            ssize_t res = this->blkdev->readbytes(inodebuf, this->sb.inodesize, inodeoff, 0, NDev::IO_METADATA);
+            ssize_t res = this->blkdev->readbytes(inodebuf, this->inodesize, inodeoff, 0, NDev::IO_METADATA);
             if (res < 0) {
                 delete[] inodebuf;
                 NUtil::printf("[fs/ext4fs]: Failed to read inode %u for update: %d.\n", ino, (int)res);
                 return res;
             }
 
-            // Copy our modified inode struct into the buffer.
-            size_t copysize = this->sb.inodesize < sizeof(struct inode) ? this->sb.inodesize : sizeof(struct inode);
+            // Copy our modified inode struct into the buffer (bounded by on-disk inode size).
+            size_t copysize = this->inodesize < sizeof(struct inode) ? this->inodesize : sizeof(struct inode);
             NLib::memcpy(inodebuf, diskino, copysize);
 
+            // Update inode checksum if checksums are enabled.
+            if (this->haschecksums) {
+                uint32_t csum = this->inodechecksum(ino, (struct inode *)inodebuf);
+                struct inode *inobuf = (struct inode *)inodebuf;
+                inobuf->csumlo = csum & 0xFFFF;
+                if (this->inodesize > 128 && inobuf->extrasize >=
+                    (offsetof(struct inode, csumhi) - offsetof(struct inode, extrasize))) {
+                    inobuf->csumhi = (csum >> 16) & 0xFFFF;
+                }
+            }
+
             // Write the full inode buffer back to disk.
-            res = this->blkdev->writebytes(inodebuf, this->sb.inodesize, inodeoff, 0, NDev::IO_METADATA);
+            res = this->blkdev->writebytes(inodebuf, this->inodesize, inodeoff, 0, NDev::IO_METADATA);
             delete[] inodebuf;
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to write inode %u: %d.\n", ino, (int)res);
@@ -160,6 +172,11 @@ namespace NFS {
         }
 
         int Ext4FileSystem::writesuperblock(void) {
+            // Update superblock checksum if checksums are enabled.
+            if (this->haschecksums) {
+                this->sb.checksum = this->sbchecksum();
+            }
+
             ssize_t res = this->blkdev->writebytes(&this->sb, sizeof(struct superblock), 1024, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to write superblock: %d\n", (int)res);
@@ -171,6 +188,11 @@ namespace NFS {
         int Ext4FileSystem::writegroupdesc(uint32_t group) {
             if (group >= this->numgroups) {
                 return -EINVAL;
+            }
+
+            // Update group descriptor checksum if checksums are enabled.
+            if (this->haschecksums) {
+                this->groupdescs[group].checksum = this->gdchecksum(group, &this->groupdescs[group]);
             }
 
             uint64_t bgdtblock = (this->blksize == 1024) ? 2 : 1;
@@ -371,7 +393,82 @@ namespace NFS {
             return 0;
         }
 
+        void Ext4FileSystem::computecsumseed(void) {
+            // Initialize CRC32c table.
+            NLib::crc32cinit();
+
+            if (this->sb.featincompat & EXT4_FEATUREINCOMPATCSUMSEED) {
+                // Use pre-computed seed from superblock.
+                this->csumseed = this->sb.csumseed;
+            } else {
+                // Compute seed from filesystem UUID.
+                this->csumseed = NLib::crc32cfinal(this->sb.uuid, 16);
+            }
+        }
+
+        uint32_t Ext4FileSystem::sbchecksum(void) {
+            // Superblock checksum covers bytes 0 to 0x3FC (checksum field at offset 0x3FC excluded).
+            return NLib::crc32cfinal(&this->sb, offsetof(struct superblock, checksum));
+        }
+
+        uint16_t Ext4FileSystem::gdchecksum(uint32_t group, struct groupdesc *gd) {
+            // Group descriptor checksum uses the checksum seed.
+            uint32_t crc = NLib::crc32c(~0U, &this->csumseed, sizeof(this->csumseed));
+            crc = NLib::crc32c(crc, &group, sizeof(group));
+
+            // Checksum covers everything except the checksum field itself.
+            uint16_t descsize = this->sb.descsize ? this->sb.descsize : 32;
+            size_t csumoffset = offsetof(struct groupdesc, checksum);
+
+            // Hash bytes before checksum field.
+            crc = NLib::crc32c(crc, gd, csumoffset);
+
+            // Hash bytes after checksum field (if descriptor is larger than 32 bytes).
+            if (descsize > csumoffset + sizeof(gd->checksum)) {
+                size_t remaining = descsize - csumoffset - sizeof(gd->checksum);
+                crc = NLib::crc32c(crc, (uint8_t *)gd + csumoffset + sizeof(gd->checksum), remaining);
+            }
+
+            return ~crc & 0xFFFF;
+        }
+
+        uint32_t Ext4FileSystem::inodechecksum(uint32_t ino, struct inode *diskino) {
+            // Inode checksum uses seed, inode number, and inode generation.
+            uint32_t crc = NLib::crc32c(~0U, &this->csumseed, sizeof(this->csumseed));
+            crc = NLib::crc32c(crc, &ino, sizeof(ino));
+            crc = NLib::crc32c(crc, &diskino->generation, sizeof(diskino->generation));
+
+            // Hash the inode structure, skipping the checksum fields.
+            // csumlo is at a fixed offset, csumhi is in the extended area.
+            size_t csumlooff = offsetof(struct inode, csumlo);
+
+            // Hash bytes before csumlo.
+            crc = NLib::crc32c(crc, diskino, csumlooff);
+            // Skip csumlo (2 bytes) and rsvd (2 bytes).
+            crc = NLib::crc32c(crc, (uint8_t *)diskino + csumlooff + 4, sizeof(struct inode) - csumlooff - 4);
+
+            return ~crc;
+        }
+
+        uint32_t Ext4FileSystem::dirblockchecksum(uint32_t ino, uint32_t gen, void *block, size_t len) {
+            // Directory block checksum uses seed, inode number, and generation.
+            uint32_t crc = NLib::crc32c(~0U, &this->csumseed, sizeof(this->csumseed));
+            crc = NLib::crc32c(crc, &ino, sizeof(ino));
+            crc = NLib::crc32c(crc, &gen, sizeof(gen));
+
+            // Hash block data excluding the dirtail checksum (last 12 bytes).
+            size_t datalen = len - sizeof(struct dirtail);
+            crc = NLib::crc32c(crc, block, datalen);
+
+            return ~crc;
+        }
+
         ssize_t Ext4FileSystem::create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) {
+            // Check if filesystem is read-only.
+            if (this->readonly) {
+                return -EROFS;
+            }
+
             bool isdir = VFS::S_ISDIR(attr.st_mode);
 
             // Allocate a new inode.
@@ -450,6 +547,11 @@ namespace NFS {
         }
 
         int Ext4FileSystem::unlink(VFS::INode *node, VFS::INode *parent) {
+            // Check if filesystem is read-only.
+            if (this->readonly) {
+                return -EROFS;
+            }
+
             Ext4Node *ext4node = (Ext4Node *)node;
             uint32_t ino = node->getattr().st_ino;
             bool isdir = VFS::S_ISDIR(node->getattr().st_mode);
@@ -488,6 +590,11 @@ namespace NFS {
         }
 
         int Ext4FileSystem::rename(VFS::INode *oldparent, VFS::INode *node, VFS::INode *newparent, const char *newname, VFS::INode *target) {
+            // Check if filesystem is read-only.
+            if (this->readonly) {
+                return -EROFS;
+            }
+
             Ext4Node *ext4oldparent = (Ext4Node *)oldparent;
             Ext4Node *ext4node = (Ext4Node *)node;
 
@@ -673,7 +780,7 @@ namespace NFS {
             uint32_t index = (ino - 1) % this->sb.inodespergroup;
 
             if (group >= this->numgroups) {
-                NUtil::printf("[fs/ext4fs]: Inode %u is in invalid group %u\n", ino, group);
+                NUtil::printf("[fs/ext4fs]: Inode %u is in invalid group %u.\n", ino, group);
                 return NULL;
             }
 
@@ -688,7 +795,7 @@ namespace NFS {
             struct inode diskino;
             ssize_t res = this->blkdev->readbytes(&diskino, sizeof(struct inode), inodeoff, 0, NDev::IO_METADATA);
             if (res < 0) {
-                NUtil::printf("[fs/ext4fs]: Failed to read inode %u: %d\n", ino, (int)res);
+                NUtil::printf("[fs/ext4fs]: Failed to read inode %u: %d.\n", ino, (int)res);
                 return NULL;
             }
 
@@ -701,7 +808,16 @@ namespace NFS {
             attr.st_gid = diskino.gid | ((uint32_t)diskino.gidhi << 16);
             attr.st_size = ((uint64_t)diskino.sizethi << 32) | diskino.sizelo;
             attr.st_blksize = this->blksize;
-            attr.st_blocks = ((uint64_t)diskino.blkshi << 32) | diskino.blockslo;
+
+            uint64_t rawblocks = ((uint64_t)diskino.blkshi << 32) | diskino.blockslo;
+            if (this->hugefile() && (diskino.flags & EXT4_HUGEFILEFL)) {
+                // Blocks stored in filesystem block units, convert to 512-byte sectors for VFS.
+                attr.st_blocks = rawblocks * (this->blksize / 512);
+            } else {
+                // Blocks already in 512-byte sectors.
+                attr.st_blocks = rawblocks;
+            }
+
             attr.st_atime = diskino.atime;
             attr.st_mtime = diskino.mtime;
             attr.st_ctime = diskino.ctime;
@@ -745,24 +861,90 @@ namespace NFS {
 
             // Verify magic number.
             if (this->sb.magic != 0xEF53) {
-                NUtil::printf("[fs/ext4fs]: Invalid magic number: 0x%x\n", this->sb.magic);
+                NUtil::printf("[fs/ext4fs]: Invalid magic number: 0x%x.\n", this->sb.magic);
                 devnode->unref();
                 return -EINVAL;
             }
 
-            // Calculate block size.
+            // Validate block size.
+            if (this->sb.logblocksize > 6) {
+                NUtil::printf("[fs/ext4fs]: Invalid block size log: %u (max 6).\n", this->sb.logblocksize);
+                devnode->unref();
+                return -EINVAL;
+            }
             this->blksize = 1024 << this->sb.logblocksize;
+
+            // Store inode size with validation.
+            this->inodesize = this->sb.inodesize;
+            if (this->inodesize < 128) {
+                this->inodesize = 128; // Minimum per spec.
+            }
+
+            // Check for unsupported incompatible features, that we should COMPLETELY avoid mounting without support for.
+            uint32_t unsupportedincompat = this->sb.featincompat & ~EXT4_SUPPORTEDINCOMPAT;
+            if (unsupportedincompat) {
+                NUtil::printf("[fs/ext4fs]: Unsupported incompat features 0x%x.\n", unsupportedincompat);
+
+                // Check for specific dangerous features.
+                if (unsupportedincompat & EXT4_FEATUREINCOMPATMMP) {
+                    NUtil::printf("[fs/ext4fs]: Multi-mount protection requires shared state, cannot mount.\n");
+                }
+                if (unsupportedincompat & EXT4_FEATUREINCOMPATENCRYPT) {
+                    NUtil::printf("[fs/ext4fs]: Encryption not supported.\n");
+                }
+                if (unsupportedincompat & EXT4_FEATUREINCOMPATCOMPRESSION) {
+                    NUtil::printf("[fs/ext4fs]: Compression not supported.\n");
+                }
+
+                devnode->unref();
+                return -EINVAL;
+            }
+
+            // Check for any features that we don't support, and we should mount read-only for.
+            uint32_t unsupportedrocompat = this->sb.featrocompat & ~EXT4_SUPPORTEDROCOMPAT;
+            if (unsupportedrocompat) {
+                NUtil::printf("[fs/ext4fs]: Unsupported ro_compat features: 0x%x, mounting read-only!\n", unsupportedrocompat);
+                this->readonly = true;
+            }
+
+            // Check if journal needs recovery. Safer to avoid mounting in a way that'd let us modify the journal.
+            if (this->sb.featincompat & EXT4_FEATUREINCOMPATRECOVER) {
+                NUtil::printf("[fs/ext4fs]: Journal needs recovery, mounting read-only!\n");
+                this->readonly = true;
+            }
+
+            // Validate group descriptor size for 64-bit mode.
+            uint16_t descsize = this->sb.descsize ? this->sb.descsize : 32;
+            if ((this->sb.featincompat & EXT4_FEATUREINCOMPAT64BIT) && descsize < 64) {
+                NUtil::printf("[fs/ext4fs]: 64-bit mode requires 64-byte descriptors!\n");
+                devnode->unref();
+                return -EINVAL; // Cannot mount.
+            }
 
             // Calculate number of block groups.
             uint64_t totalblocks = ((uint64_t)this->sb.blkcnthi << 32) | this->sb.blkcntlo;
             this->numgroups = (totalblocks + this->sb.blockspergroup - 1) / this->sb.blockspergroup;
 
-            NUtil::printf("[fs/ext4fs]: Mounting %s at %s\n", src, path);
-            NUtil::printf("[fs/ext4fs]: Block size: %u, Groups: %u, Inodes/group: %u\n", this->blksize, this->numgroups, this->sb.inodespergroup);
+            NUtil::printf("[fs/ext4fs]: Mounting %s at %s.\n", src, path);
+            NUtil::printf("[fs/ext4fs]: Block size: %u, Groups: %u, Inodes/group: %u.\n", this->blksize, this->numgroups, this->sb.inodespergroup);
+
+            // Compute checksum seed if checksums are enabled.
+            this->haschecksums = (this->sb.featrocompat & EXT4_FEATUREROCOMPATMETADATACSUM) != 0;
+            if (this->haschecksums) { // Checksums ARE enabled, so we need to get that setup.
+                this->computecsumseed();
+
+                // Validate superblock checksum.
+                uint32_t expectedcsum = this->sbchecksum();
+                if (this->sb.checksum != expectedcsum) {
+                    NUtil::printf("[fs/ext4fs]: Superblock checksum mismatch (got 0x%x, expected 0x%x).\n", this->sb.checksum, expectedcsum);
+                    devnode->unref();
+                    return -EIO;
+                }
+                NUtil::printf("[fs/ext4fs]: Metadata checksums enabled, seed: 0x%x.\n", this->csumseed);
+            }
 
             // Read block group descriptor table.
             uint64_t bgdtblock = (this->blksize == 1024) ? 2 : 1;
-            uint16_t descsize = this->sb.descsize ? this->sb.descsize : 32;
             size_t bgdtsize = this->numgroups * descsize;
 
             this->groupdescs = new struct groupdesc[this->numgroups];
@@ -775,64 +957,18 @@ namespace NFS {
                 return res;
             }
 
-            // Disables metadata checksums if they are enabled, for fsck passing (XXX: Implement checksums properly).
-            if (this->sb.featrocompat & EXT4_FEATUREROCOMPATMETADATACSUM) {
-                NUtil::printf("[fs/ext4fs]: Disabling metadata checksums\n");
-                this->sb.featrocompat &= ~EXT4_FEATUREROCOMPATMETADATACSUM;
-                // Also clear the GDT checksum feature.
-                this->sb.featrocompat &= ~EXT4_FEATUREROCOMPATGDTCSUM;
-                // Clear the checksum seed feature if present.
-                this->sb.featincompat &= ~EXT4_FEATUREINCOMPATCSUMSEED;
-                // Write back the modified superblock.
-                this->writesuperblock();
-
-                // Clear UNINIT flags from all group descriptors (only valid with GDT_CSUM).
-                uint64_t totalfreeblocks = 0;
-                uint32_t totalfreeinodes = 0;
-
+            // Validate group descriptor checksums if enabled.
+            if (this->haschecksums) { // Checksums ARE enabled, so we need to get that setup.
                 for (uint32_t i = 0; i < this->numgroups; i++) {
-                    struct groupdesc *gd = &this->groupdescs[i];
-                    uint16_t oldflags = gd->flags;
-
-                    gd->flags &= ~0x0003; // Clear INODE_UNINIT and BLOCK_UNINIT
-
-                    // If group had UNINIT flags, recalculate free counts from actual bitmaps.
-                    if (oldflags & 0x0002) { // Had BLOCK_UNINIT
-                        uint64_t bitmapblk = ((uint64_t)gd->blockbitmaphi << 32) | gd->blockbitmaplo;
-                        uint8_t *bitmap = new uint8_t[this->blksize];
-                        if (this->readblock(bitmapblk, bitmap) >= 0) {
-                            uint32_t freecount = this->countfreeblocks(i, bitmap);
-                            gd->freeblkcountlo = freecount & 0xFFFF;
-                            gd->freeblkcounthi = (freecount >> 16) & 0xFFFF;
-                        }
-                        delete[] bitmap;
+                    uint16_t expectedgdcsum = this->gdchecksum(i, &this->groupdescs[i]);
+                    if (this->groupdescs[i].checksum != expectedgdcsum) {
+                        NUtil::printf("[fs/ext4fs]: Group %u descriptor checksum mismatch (got 0x%x, expected 0x%x).\n", i, this->groupdescs[i].checksum, expectedgdcsum);
+                        delete[] this->groupdescs;
+                        this->groupdescs = NULL;
+                        devnode->unref();
+                        return -EIO;
                     }
-
-                    if (oldflags & 0x0001) { // Had INODE_UNINIT
-                        uint64_t bitmapblk = ((uint64_t)gd->inodebitmaphi << 32) | gd->inodebitmaplo;
-                        uint8_t *bitmap = new uint8_t[this->blksize];
-                        if (this->readblock(bitmapblk, bitmap) >= 0) {
-                            uint32_t freecount = this->countfreeinodes(i, bitmap);
-                            gd->freeinodecountlo = freecount & 0xFFFF;
-                            gd->freeinodecounthi = (freecount >> 16) & 0xFFFF;
-                        }
-                        delete[] bitmap;
-                    }
-
-                    // Accumulate totals for superblock update.
-                    uint32_t grpfreeblocks = ((uint32_t)gd->freeblkcounthi << 16) | gd->freeblkcountlo;
-                    uint32_t grpfreeinodes = ((uint32_t)gd->freeinodecounthi << 16) | gd->freeinodecountlo;
-                    totalfreeblocks += grpfreeblocks;
-                    totalfreeinodes += grpfreeinodes;
-
-                    this->writegroupdesc(i);
                 }
-
-                // Update superblock with recalculated totals.
-                this->sb.freeblkcntlo = totalfreeblocks & 0xFFFFFFFF;
-                this->sb.freeblkcnthi = (totalfreeblocks >> 32) & 0xFFFFFFFF;
-                this->sb.freeinodecnt = totalfreeinodes;
-                this->writesuperblock();
             }
 
             // XXX: Loading the root inode means we don't really have backward compatibility with ext3/ext2.

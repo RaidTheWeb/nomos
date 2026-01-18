@@ -56,6 +56,33 @@ namespace NLib {
         return dest;
     }
 
+    void *fastzero(void *dest, size_t n) {
+#ifdef __x86_64__
+        void *ret = dest;
+
+        size_t qwords = n / 8;
+        if (qwords > 0) {
+            asm volatile(
+                "rep stosq"
+                : "+D"(dest), "+c"(qwords)
+                : "a"((uint64_t)0)
+                : "memory"
+            );
+        }
+
+        // Handle remaining bytes.
+        uint8_t *pdest = (uint8_t *)dest;
+        size_t remaining = n & 7;
+        while (remaining--) {
+            *pdest++ = 0;
+        }
+#else
+        void *ret = memset(dest, 0, n); // Fallback for non-x86_64 architectures.
+#endif
+
+        return ret;
+    }
+
     void *memmove(void *dest, void *src, size_t n) {
         uint8_t *pdest = (uint8_t *)dest;
         uint8_t *psrc = (uint8_t *)src;
@@ -111,7 +138,8 @@ namespace NLib {
 
     char *strncpy(char *dest, char *src, size_t n) {
         size_t len = strlen(src);
-        memcpy(dest, src, n);
+        size_t tocopy = (len < n) ? len : n;
+        memcpy(dest, src, tocopy);
 
         // Pad remaining bytes.
         if (n > len) {

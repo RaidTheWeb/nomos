@@ -170,7 +170,7 @@ namespace NDev {
             // Job control structures:
             NSched::ProcessGroup *fpgrp = NULL; // Foreground process group.
             NSched::Session *session = NULL;
-            NArch::Spinlock ctrllock;
+            NArch::IRQSpinlock ctrllock;
 
             TTY(void);
 

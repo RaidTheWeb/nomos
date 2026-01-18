@@ -85,7 +85,7 @@ namespace NFS {
                 bool remove(const char *name) override;
                 VFS::INode *resolvesymlink(void) override;
                 bool empty(void) override {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     return this->children.size() == 0;
                 }
         };

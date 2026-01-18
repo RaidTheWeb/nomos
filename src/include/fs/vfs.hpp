@@ -373,7 +373,7 @@ namespace NFS {
                 // However, the file's data and node are only deleted when both st_nlink and refcount reach 0.
                 // This ensures that open file descriptors remain valid even after unlinking.
                 size_t refcount = 0;
-                NArch::Spinlock metalock; // Meta lock for this node.
+                NArch::IRQSpinlock metalock; // Meta lock for this node.
                 struct stat attr;
                 const char *name;
                 INode *parent = NULL;
@@ -443,7 +443,7 @@ namespace NFS {
                     return -EINVAL;
                 }
                 virtual int stat(struct stat *st) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     *st = this->attr;
                     return 0;
                 }
@@ -465,7 +465,7 @@ namespace NFS {
                 virtual bool empty(void) = 0;
 
                 virtual int unlink(uint64_t *nlink = NULL) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     if (this->attr.st_nlink == 0) {
                         return -ENOENT;
                     }
@@ -489,28 +489,28 @@ namespace NFS {
                 }
 
                 void setparent(INode *parent) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     this->parent = parent;
                 }
 
                 INode *getparent(void) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     return this->parent;
                 }
 
                 const char *getname(void) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     return this->name;
                 }
 
                 void setname(const char *newname) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     delete this->name;
                     this->name = NLib::strdup(newname);
                 }
 
                 INode *getredirect(void) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     if (!this->redirect) {
                         return NULL;
                     }
@@ -532,7 +532,7 @@ namespace NFS {
                 }
 
                 void setattr(struct stat attr) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     this->attr = attr;
                 }
 
@@ -595,6 +595,14 @@ namespace NFS {
                 // Map a page offset to an LBA for async bio submission.
                 virtual uint64_t getpagelba(off_t pageoffset) {
                     (void)pageoffset;
+                    return 0;
+                }
+
+                virtual uint64_t getpagelbacached(off_t pageoffset, bool *needsio) {
+                    (void)pageoffset;
+                    if (needsio) {
+                        *needsio = true;
+                    }
                     return 0;
                 }
         };

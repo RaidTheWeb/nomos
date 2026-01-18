@@ -170,7 +170,7 @@ namespace NFS {
                 return this->readcached(buf, count, offset);
             }
 
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             // Get file size (64-bit).
             uint64_t filesize = ((uint64_t)this->diskino.sizethi << 32) | this->diskino.sizelo;
@@ -220,7 +220,7 @@ namespace NFS {
         }
 
         ssize_t Ext4Node::readdir(void *buf, size_t count, off_t offset) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return -ENOTDIR;
@@ -365,7 +365,7 @@ namespace NFS {
         }
 
         ssize_t Ext4Node::readlink(char *buf, size_t bufsiz) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISLNK(this->attr.st_mode)) {
                 return -EINVAL;
@@ -395,7 +395,7 @@ namespace NFS {
         }
 
         VFS::INode *Ext4Node::lookup(const char *name) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return NULL;
@@ -577,7 +577,7 @@ namespace NFS {
             }
 
             if (len < sizeof(this->diskino.block)) { // Short symlinks can be stored inline.
-                NLib::ScopeSpinlock guard(&this->metalock);
+                NLib::ScopeIRQSpinlock guard(&this->metalock);
 
                 // Clear the extent flag since we're using inline storage.
                 this->diskino.flags &= ~EXT4_EXTENTSFL;
@@ -995,6 +995,39 @@ namespace NFS {
             return lba;
         }
 
+        uint64_t Ext4Node::getpagelbacached(off_t pageoffset, bool *needsio) {
+            // Only regular files use page cache readahead.
+            if (!VFS::S_ISREG(this->attr.st_mode)) {
+                if (needsio) *needsio = false;
+                return 0;
+            }
+
+            uint32_t blksize = this->ext4fs->blksize;
+            uint64_t logicalblk = pageoffset / blksize;
+
+            // Try extent cache lookup only (non-blocking).
+            uint64_t physblk = 0;
+            uint64_t runlen = 0;
+            if (!this->lookupcachedextent(logicalblk, &physblk, &runlen)) {
+                // Extent not cached, would need I/O to resolve.
+                if (needsio) *needsio = true;
+                return 0;
+            }
+
+            // Found in cache.
+            if (needsio) *needsio = false;
+
+            if (physblk == 0) {
+                return 0; // Hole.
+            }
+
+            // Convert filesystem block to device LBA.
+            size_t devblksize = this->ext4fs->blkdev->blksize;
+            uint64_t lba = physblk * (blksize / devblksize);
+
+            return lba;
+        }
+
         int Ext4Node::sync(enum VFS::INode::syncmode mode) {
             // Sync dirty pages to disk first (the case for FULL and DATA sync).
             int err = this->synccache();
@@ -1004,7 +1037,7 @@ namespace NFS {
 
             // For full sync, also write back inode metadata.
             if (mode == VFS::INode::SYNC_FULL) {
-                NLib::ScopeSpinlock guard(&this->metalock);
+                NLib::ScopeIRQSpinlock guard(&this->metalock);
                 int res = this->writeback();
                 if (res < 0) {
                     return res;
@@ -1054,7 +1087,7 @@ namespace NFS {
 
         // Atomic commit of metadata changes with timestamp updates.
         int Ext4Node::commitmetadata(bool mtime, bool ctime, bool atime) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
             this->touchtime(mtime, ctime, atime);
             return this->writeback();
         }
@@ -1072,7 +1105,7 @@ namespace NFS {
                 uint64_t oldsize;
                 uint32_t blksize;
                 {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     oldsize = ((uint64_t)this->diskino.sizethi << 32) | this->diskino.sizelo;
                     blksize = this->ext4fs->blksize;
                 }
@@ -1099,7 +1132,7 @@ namespace NFS {
                 if (writtenend > oldsize) { // Grow file size.
                     __atomic_store_n(&this->attr.st_size, writtenend, memory_order_release);
 
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     this->diskino.sizelo = writtenend & 0xFFFFFFFF;
                     this->diskino.sizethi = (writtenend >> 32) & 0xFFFFFFFF;
 
@@ -1115,7 +1148,7 @@ namespace NFS {
                 ssize_t result = this->writecached(buf, count, offset);
 
                 if (result > 0) {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
 
                     // If we got a short write when extending, adjust size back down.
                     uint64_t actualend = offset + result;
@@ -1132,7 +1165,7 @@ namespace NFS {
                 } else if (result < 0 && writtenend > oldsize) {
                     // Write failed completely, restore old size.
                     __atomic_store_n(&this->attr.st_size, oldsize, memory_order_release);
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     this->diskino.sizelo = oldsize & 0xFFFFFFFF;
                     this->diskino.sizethi = (oldsize >> 32) & 0xFFFFFFFF;
                 }
@@ -1141,7 +1174,7 @@ namespace NFS {
             }
 
             // Fallback for non-regular files (shouldn't happen normally). XXX: Disallow?
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
             uint32_t blksize = this->ext4fs->blksize;
             uint8_t *blkbuf = new uint8_t[blksize];
             size_t byteswritten = 0;
@@ -1232,7 +1265,7 @@ namespace NFS {
         }
 
         int Ext4Node::truncate(off_t length) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (length < 0) {
                 return -EINVAL;
@@ -1291,7 +1324,156 @@ namespace NFS {
                         }
                     }
                 } else {
-                    // XXX: Handle freeing indirect blocks.
+                    // NOTE: Jesus Christ, this is egregious.
+
+                    // Handle freeing indirect blocks for legacy (non-extent) inodes.
+                    uint64_t oldblocks = (oldsize + blksize - 1) / blksize;
+                    uint32_t ptrsperblk = blksize / sizeof(uint32_t);
+
+                    // Free direct blocks beyond newblocks.
+                    for (uint64_t blk = newblocks; blk < oldblocks && blk < EXT4_NDIRBLOCKS; blk++) {
+                        if (this->diskino.block[blk] != 0) {
+                            this->ext4fs->freeblock(this->diskino.block[blk]);
+                            this->diskino.block[blk] = 0;
+                        }
+                    }
+
+                    // Handle single indirect block.
+                    uint64_t indirectstart = EXT4_NDIRBLOCKS;
+                    uint64_t indirectend = indirectstart + ptrsperblk;
+                    if (oldblocks > indirectstart && this->diskino.block[EXT4_INDBLOCK] != 0) {
+                        uint8_t *indbuf = new uint8_t[blksize];
+                        if (this->ext4fs->readblock(this->diskino.block[EXT4_INDBLOCK], indbuf) >= 0) {
+                            uint32_t *ptrs = (uint32_t *)indbuf;
+                            bool anyremaining = false;
+
+                            for (uint32_t i = 0; i < ptrsperblk; i++) {
+                                uint64_t logblk = indirectstart + i;
+                                if (logblk >= newblocks && logblk < oldblocks && ptrs[i] != 0) {
+                                    this->ext4fs->freeblock(ptrs[i]);
+                                    ptrs[i] = 0;
+                                }
+                                if (ptrs[i] != 0) {
+                                    anyremaining = true;
+                                }
+                            }
+
+                            if (anyremaining) {
+                                // Write back modified indirect block.
+                                this->ext4fs->writeblock(this->diskino.block[EXT4_INDBLOCK], indbuf);
+                            } else if (newblocks <= indirectstart) {
+                                // Free the indirect block itself.
+                                this->ext4fs->freeblock(this->diskino.block[EXT4_INDBLOCK]);
+                                this->diskino.block[EXT4_INDBLOCK] = 0;
+                            }
+                        }
+                        delete[] indbuf;
+                    }
+
+                    // Handle double indirect block.
+                    uint64_t dindirectstart = indirectend;
+                    uint64_t dindirectend = dindirectstart + ptrsperblk * ptrsperblk;
+                    if (oldblocks > dindirectstart && this->diskino.block[EXT4_DINDBLOCK] != 0) {
+                        uint8_t *dindbuf = new uint8_t[blksize];
+                        uint8_t *indbuf = new uint8_t[blksize];
+
+                        if (this->ext4fs->readblock(this->diskino.block[EXT4_DINDBLOCK], dindbuf) >= 0) {
+                            uint32_t *dptrs = (uint32_t *)dindbuf;
+                            bool anydindremaining = false;
+
+                            for (uint32_t i = 0; i < ptrsperblk; i++) {
+                                if (dptrs[i] == 0) {
+                                    continue;
+                                }
+
+                                uint64_t indbase = dindirectstart + i * ptrsperblk;
+                                if (indbase >= oldblocks) {
+                                    continue;
+                                }
+
+                                if (this->ext4fs->readblock(dptrs[i], indbuf) >= 0) {
+                                    uint32_t *ptrs = (uint32_t *)indbuf;
+                                    bool anyindremaining = false;
+
+                                    for (uint32_t j = 0; j < ptrsperblk; j++) {
+                                        uint64_t logblk = indbase + j;
+                                        if (logblk >= newblocks && logblk < oldblocks && ptrs[j] != 0) {
+                                            this->ext4fs->freeblock(ptrs[j]);
+                                            ptrs[j] = 0;
+                                        }
+                                        if (ptrs[j] != 0) {
+                                            anyindremaining = true;
+                                        }
+                                    }
+
+                                    if (anyindremaining) {
+                                        this->ext4fs->writeblock(dptrs[i], indbuf);
+                                        anydindremaining = true;
+                                    } else if (indbase >= newblocks) {
+                                        this->ext4fs->freeblock(dptrs[i]);
+                                        dptrs[i] = 0;
+                                    } else {
+                                        anydindremaining = true;
+                                    }
+                                }
+                            }
+
+                            if (anydindremaining) {
+                                this->ext4fs->writeblock(this->diskino.block[EXT4_DINDBLOCK], dindbuf);
+                            } else if (newblocks <= dindirectstart) {
+                                this->ext4fs->freeblock(this->diskino.block[EXT4_DINDBLOCK]);
+                                this->diskino.block[EXT4_DINDBLOCK] = 0;
+                            }
+                        }
+
+                        delete[] indbuf;
+                        delete[] dindbuf;
+                    }
+
+                    // Handle triple indirect block (similar pattern, but even more nested).
+                    uint64_t tindirectstart = dindirectend;
+                    if (oldblocks > tindirectstart && this->diskino.block[EXT4_TINDBLOCK] != 0) {
+                        if (newblocks <= tindirectstart) {
+                            // Free entire triple indirect tree.
+                            uint8_t *tindbuf = new uint8_t[blksize];
+                            uint8_t *dindbuf = new uint8_t[blksize];
+                            uint8_t *indbuf = new uint8_t[blksize];
+
+                            if (this->ext4fs->readblock(this->diskino.block[EXT4_TINDBLOCK], tindbuf) >= 0) {
+                                uint32_t *tptrs = (uint32_t *)tindbuf;
+                                for (uint32_t i = 0; i < ptrsperblk; i++) {
+                                    if (tptrs[i] == 0) {
+                                        continue;
+                                    }
+                                    if (this->ext4fs->readblock(tptrs[i], dindbuf) >= 0) {
+                                        uint32_t *dptrs = (uint32_t *)dindbuf;
+                                        for (uint32_t j = 0; j < ptrsperblk; j++) {
+                                            if (dptrs[j] == 0) {
+                                                continue;
+                                            }
+                                            if (this->ext4fs->readblock(dptrs[j], indbuf) >= 0) {
+                                                uint32_t *ptrs = (uint32_t *)indbuf;
+                                                for (uint32_t k = 0; k < ptrsperblk; k++) {
+                                                    if (ptrs[k] != 0) {
+                                                        this->ext4fs->freeblock(ptrs[k]);
+                                                    }
+                                                }
+                                            }
+                                            this->ext4fs->freeblock(dptrs[j]);
+                                        }
+                                    }
+                                    this->ext4fs->freeblock(tptrs[i]);
+                                }
+                            }
+                            this->ext4fs->freeblock(this->diskino.block[EXT4_TINDBLOCK]);
+                            this->diskino.block[EXT4_TINDBLOCK] = 0;
+
+                            delete[] indbuf;
+                            delete[] dindbuf;
+                            delete[] tindbuf;
+                        }
+                        // XXX: Partial triple indirect truncation is not implemented.
+                    }
                 }
             }
 
@@ -1315,7 +1497,7 @@ namespace NFS {
         }
 
         bool Ext4Node::add(VFS::INode *node) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false;
@@ -1481,7 +1663,7 @@ namespace NFS {
         }
 
         bool Ext4Node::remove(const char *name) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false;

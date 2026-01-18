@@ -35,6 +35,7 @@ namespace NMem {
         int copyfrom(void *dest, const void *src, size_t size);
         // Userspace safe copy from kernel to userspace buffer.
         int copyto(void *dest, const void *src, size_t size);
+        ssize_t memset(void *dest, int c, size_t n);
     }
 }
 

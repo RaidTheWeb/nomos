@@ -43,12 +43,16 @@ namespace NSched {
         public:
             const char *name;
             uint32_t flags;
+            WorkerPool *custompool; // Optional custom pool.
 
             WorkQueue(const char *name, uint32_t flags) {
                 this->name = name;
                 flags &= ~WQ_DRAINING;
                 this->flags = flags;
+                this->custompool = NULL;
             }
+
+            WorkQueue(const char *name, uint32_t flags, WorkerPool *pool);
 
             // Queue work, get it done whenever the workqueue feels like it.
             bool queue(struct work *w);

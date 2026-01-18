@@ -23,8 +23,8 @@ namespace NSys {
     struct utsname kutsname = {
         { "Nomos" },
         { "nomos" },
-        { "data" },
-        { "could" },
+        { VERSION },
+        { BUILDDATE },
 #ifdef __x86_64__
         { "x86_64" },
 #else

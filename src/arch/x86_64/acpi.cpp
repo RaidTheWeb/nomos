@@ -1,5 +1,6 @@
 #include <arch/limine/requests.hpp>
 #include <arch/x86_64/acpi.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>

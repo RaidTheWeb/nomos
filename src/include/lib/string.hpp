@@ -10,6 +10,7 @@ extern "C" {
     void *memcpy(void *dest, void *src, size_t n);
     void *memset(void *dest, int c, size_t n);
     void *memmove(void *dest, void *src, size_t n);
+    void *fastzero(void *dest, size_t n);
     int memcmp(void *s1, void *s2, size_t n);
     size_t strlen(const char *str);
     size_t strnlen(const char *str, size_t n);

@@ -7,6 +7,7 @@
 #include <lib/assert.hpp>
 #include <lib/errno.hpp>
 #include <lib/string.hpp>
+#include <mm/pagecache.hpp>
 #include <sys/syscall.hpp>
 #include <util/kprint.hpp>
 #include <sched/sched.hpp>
@@ -23,72 +24,66 @@ namespace NArch {
     namespace VMM {
         struct addrspace kspace;
 
+        // Global TLB shootdown state.
+        NArch::IRQSpinlock shootdownlock;
+        struct shootdownreq shootdownreq = {};
 
-        void waittlbshootdown(uint32_t caller, size_t expected) {
-            uint64_t timeout = 1000000; // Arbitrary number of "cycles" to wait before declaring that the TLB shootdown failed.
-
-            for (size_t i = 0; i < SMP::awakecpus; i++) {
-                if (SMP::cpulist[i]->id == caller) {
-                    continue; // Skip the calling CPU.
-                }
-
-                while (__atomic_load_n(&SMP::cpulist[i]->tlblocal.completion, memory_order_acquire) < expected) {
-                    if (--timeout == 0) {
-                        panic("Timeout on TLB shootdown.");
-                        break;
-                    }
-                    asm volatile ("pause");
+        void doshootdown(enum shootdowntype type, uintptr_t start, uintptr_t end) {
+            if (type == SHOOTDOWN_RANGE) {
+                size_t pages = (end - start) / PAGESIZE;
+                if (pages > SHOOTDOWN_RANGETHRESHOLD) {
+                    type = SHOOTDOWN_FULL; // Convert to full shootdown.
                 }
             }
-        }
 
-        void doshootdown(enum CPU::shootdown type, uintptr_t start, uintptr_t end) {
-            uint32_t caller = 0;
-            if (SMP::initialised && SMP::awakecpus >= 2) {
-
-                caller = CPU::get()->id;
-
-                __atomic_fetch_add(&CPU::tlbglobal.activereqs, 1, memory_order_acquire);
-
-                for (size_t i = 0; i < SMP::awakecpus; i++) {
-                    if (SMP::cpulist[i]->id == caller) {
-                        continue;
-                    }
-
-                    struct CPU::tlblocal *state = &SMP::cpulist[i]->tlblocal;
-
-                    // Wait for previous operation to complete.
-                    while (__atomic_load_n(&state->pending, memory_order_acquire)) {
-                        asm volatile("pause");
-                    }
-
-                    state->type = type;
-                    state->start = start;
-                    state->end = end;
-                    __atomic_store_n(&state->pending, true, memory_order_release);
-                }
-
-                APIC::sendipi(0, 0xfc, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPIOTHER); // Send TLB shootdown to all other CPUs.
-            }
-
-            // Handle for ourselves.
+            // Perform local invalidation first.
             switch (type) {
-                case CPU::TLBSHOOTDOWN_SINGLE:
+                case SHOOTDOWN_SINGLE:
                     invlpg(start);
                     break;
-                case CPU::TLBSHOOTDOWN_FULL:
-                    flushtlb();
-                    break;
-                case CPU::TLBSHOOTDOWN_RANGE:
+                case SHOOTDOWN_RANGE:
                     invlrange(start, end - start);
+                    break;
+                case SHOOTDOWN_FULL:
+                    flushtlb();
                     break;
                 default:
                     break;
             }
 
-            if (SMP::initialised && SMP::awakecpus >= 2) {
-                waittlbshootdown(caller, 1); // Wait for pending TLB shootdown.
-                __atomic_fetch_sub(&CPU::tlbglobal.activereqs, 1, memory_order_release);
+            if (!SMP::initialised || SMP::awakecpus < 2) {
+                return;
+            }
+
+            //  Acquire global shootdown lock (serializes all shootdowns).
+            NLib::ScopeIRQSpinlock guard(&shootdownlock);
+
+            // Set up the global request.
+            size_t newgen = shootdownreq.generation + 1;
+            size_t target = SMP::awakecpus - 1;  // All CPUs except self.
+
+            shootdownreq.type = type;
+            shootdownreq.start = start;
+            shootdownreq.end = end;
+            shootdownreq.targetcpus = target;
+            __atomic_store_n(&shootdownreq.acks, 0, memory_order_release);
+
+            // Generation must be written last with release semantics.
+            asm volatile("" ::: "memory");
+            __atomic_store_n(&shootdownreq.generation, newgen, memory_order_release);
+
+            // Send IPI to all other CPUs.
+            APIC::sendipi(0, 0xfc, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPIOTHER);
+
+            // Wait for all CPUs to acknowledge.
+            uint64_t timeout = 100000000ULL;
+
+            while (__atomic_load_n(&shootdownreq.acks, memory_order_acquire) < target) {
+                asm volatile("pause" ::: "memory");
+                if (--timeout == 0) {
+                    NUtil::printf("TLB shootdown timeout: %lu/%lu acks.\n", __atomic_load_n(&shootdownreq.acks, memory_order_relaxed), target);
+                    panic("TLB shootdown timeout.");
+                }
             }
         }
 
@@ -96,30 +91,45 @@ namespace NArch {
             (void)isr;
             (void)ctx;
 
-            struct CPU::cpulocal *cpu = CPU::get();
-            struct CPU::tlblocal *state = &cpu->tlblocal;
+            CPU::cpulocal *cpu = CPU::get();
 
-            if (!__atomic_load_n(&state->pending, memory_order_acquire)) { // Don't even bother without a pending operation.
+            // Read the current generation.
+            size_t currentgen = __atomic_load_n(&shootdownreq.generation, memory_order_acquire);
+
+            // Load our last-processed generation.
+            size_t lastgen = __atomic_load_n(&cpu->tlbgeneration, memory_order_acquire);
+
+            // Already processed this generation? We don't care, then.
+            if (currentgen <= lastgen) {
                 return;
             }
 
-            switch (state->type) {
-                case CPU::TLBSHOOTDOWN_SINGLE:
-                    invlpg(state->start);
+            // Read request parameters.
+            asm volatile("" ::: "memory");
+            enum shootdowntype type = shootdownreq.type;
+            uintptr_t start = shootdownreq.start;
+            uintptr_t end = shootdownreq.end;
+
+            // Perform the invalidation.
+            switch (type) {
+                case SHOOTDOWN_SINGLE:
+                    invlpg(start);
                     break;
-                case CPU::TLBSHOOTDOWN_RANGE:
-                    invlrange(state->start, state->end - state->start);
+                case SHOOTDOWN_RANGE:
+                    invlrange(start, end - start);
                     break;
-                case CPU::TLBSHOOTDOWN_FULL:
+                case SHOOTDOWN_FULL:
                     flushtlb();
                     break;
-                case CPU::TLBSHOOTDOWN_NONE:
+                case SHOOTDOWN_NONE:
                     break;
             }
 
-            // Mark as done.
-            __atomic_fetch_add(&state->completion, 1, memory_order_release);
-            __atomic_store_n(&state->pending, false, memory_order_release);
+            // Update our processed generation.
+            __atomic_store_n(&cpu->tlbgeneration, currentgen, memory_order_release);
+
+            // Acknowledge completion.
+            __atomic_fetch_add(&shootdownreq.acks, 1, memory_order_release);
         }
 
 
@@ -170,6 +180,9 @@ namespace NArch {
         struct dupwork {
             struct addrspace *src;
             struct addrspace *dest;
+            uintptr_t shootdownstart;
+            uintptr_t shootdownend;
+            bool needshootdown;
         };
 
         static inline uint64_t vmatovmm(uint64_t vma, bool cow) {
@@ -189,6 +202,17 @@ namespace NArch {
 
                 void *reserved = work->dest->vmaspace->reserve(node->start, node->end, node->flags);
                 assertarg(reserved, "Failed to reserve VMA region %p-%p in destination during fork.\n", (void *)node->start, (void *)node->end);
+
+                // Copy file-backing information if present.
+                if (node->backingfile) {
+                    NMem::Virt::vmanode *destvma = work->dest->vmaspace->findcontaining(node->start);
+                    if (destvma) {
+                        destvma->backingfile = node->backingfile;
+                        destvma->fileoffset = node->fileoffset;
+                        destvma->filemapsize = node->filemapsize;
+                        node->backingfile->ref(); // Keep reference for forked VMA.
+                    }
+                }
 
                 size_t size = node->end - node->start;
 
@@ -216,10 +240,24 @@ namespace NArch {
                         assertarg(false, "Failed to destination map page %p during address space fork.\n", node->start + i);
                     }
                     if (make_cow) { // Only bother remapping the source if we're doing CoW.
-                        if (!_mappage(work->src, node->start + i, phys, vmatovmm(node->flags, true))) {
+                        if (!_mappage(work->src, node->start + i, phys, vmatovmm(node->flags, true), false)) {
                             // Note: We do not unref here since dest mapping succeeded and holds a ref.
                             // The page will be cleaned up when the dest address space is destroyed.
                             assertarg(false, "Failed to source remap page during %p address space fork.\n", node->start + i);
+                        }
+                        // Track shootdown range for source address space.
+                        uintptr_t page_addr = node->start + i;
+                        if (!work->needshootdown) {
+                            work->shootdownstart = page_addr;
+                            work->shootdownend = page_addr + PAGESIZE;
+                            work->needshootdown = true;
+                        } else {
+                            if (page_addr < work->shootdownstart) {
+                                work->shootdownstart = page_addr;
+                            }
+                            if (page_addr + PAGESIZE > work->shootdownend) {
+                                work->shootdownend = page_addr + PAGESIZE;
+                            }
                         }
                     }
                 }
@@ -230,7 +268,7 @@ namespace NArch {
             NLib::ScopeIRQSpinlock guard(&this->lock);
 
             // Perform full TLB shootdown (we're about to free a LOT of pages).
-            doshootdown(CPU::TLBSHOOTDOWN_FULL, 0, 0);
+            doshootdown(SHOOTDOWN_FULL, 0, 0);
 
             this->vmaspace->traversedata(this->vmaspace->getroot(), [](struct NMem::Virt::vmanode *node, void *data) {
                 struct addrspace *space = (struct addrspace *)data;
@@ -308,40 +346,51 @@ namespace NArch {
         struct addrspace *forkcontext(struct addrspace *src) {
             assert(src, "Invalid source.\n");
 
-            NLib::ScopeIRQSpinlock sguard(&src->lock);
-
-            struct addrspace *dest = new struct VMM::addrspace;
-            NLib::ScopeIRQSpinlock dguard(&dest->lock);
-
-            dest->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
-            assert(dest->pml4, "Failed to allocate memory for user space PML4.\n");
-            dest->pml4phy = (uintptr_t)dest->pml4;
-            dest->pml4 = (struct VMM::pagetable *)hhdmoff(dest->pml4);
-            NLib::memset(dest->pml4, 0, PAGESIZE);
-
-            dest->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000);
-
             struct dupwork work {
                 .src = src,
-                .dest = dest
+                .dest = nullptr,
+                .shootdownstart = 0,
+                .shootdownend = 0,
+                .needshootdown = false
             };
 
-            for (size_t i = 0; i < 512; i++) {
-                uint64_t entry = src->pml4->entries[i];
+            struct addrspace *dest = new struct VMM::addrspace;
+            work.dest = dest;
 
-                if (!entry || !(entry & PRESENT)) {
-                    dest->pml4->entries[i] = 0;
-                    continue;
+            {
+                NLib::ScopeIRQSpinlock sguard(&src->lock);
+                NLib::ScopeIRQSpinlock dguard(&dest->lock);
+
+                dest->pml4 = (struct VMM::pagetable *)PMM::alloc(PAGESIZE);
+                assert(dest->pml4, "Failed to allocate memory for user space PML4.\n");
+                dest->pml4phy = (uintptr_t)dest->pml4;
+                dest->pml4 = (struct VMM::pagetable *)hhdmoff(dest->pml4);
+                NLib::memset(dest->pml4, 0, PAGESIZE);
+
+                dest->vmaspace = new NMem::Virt::VMASpace(0x0000000000001000, 0x0000800000000000);
+
+                for (size_t i = 0; i < 512; i++) {
+                    uint64_t entry = src->pml4->entries[i];
+
+                    if (!entry || !(entry & PRESENT)) {
+                        dest->pml4->entries[i] = 0;
+                        continue;
+                    }
+
+                    if (!(entry & USER)) {
+                        dest->pml4->entries[i] = src->pml4->entries[i]; // Copy kernel mappings as-is.
+                    }
                 }
 
-                if (!(entry & USER)) {
-                    dest->pml4->entries[i] = src->pml4->entries[i]; // Copy kernel mappings as-is.
-                }
+                src->vmaspace->traversedata(src->vmaspace->getroot(), dupvmanode, &work);
+
+                asm volatile("mfence" : : : "memory");
             }
 
-            src->vmaspace->traversedata(src->vmaspace->getroot(), dupvmanode, &work);
-
-            asm volatile("mfence" : : : "memory");
+            // Do deferred TLB shootdown for source address space *after* we've set everything. Isn't going to be locked.
+            if (work.needshootdown) {
+                doshootdown(SHOOTDOWN_RANGE, work.shootdownstart, work.shootdownend);
+            }
 
             return dest;
         }
@@ -355,7 +404,7 @@ namespace NArch {
             }
 
             asm volatile("sfence" : : : "memory");
-            doshootdown(CPU::TLBSHOOTDOWN_FULL, 0, 0);
+            doshootdown(SHOOTDOWN_FULL, 0, 0);
         }
 
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt) {
@@ -425,7 +474,7 @@ namespace NArch {
             return (*pte & ADDRMASK) | (virt & OFFMASK);
         }
 
-        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
+        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool shootdown) {
             bool user = flags & USER; // If flags contain user, we should mark the intermediate pages as user too.
 
             // Align down to base of the page the address exists in.
@@ -490,8 +539,8 @@ namespace NArch {
             // At the end of all the indirection:
             pt->entries[ptidx] = (phys & ADDRMASK) | flags;
 
-            if (wasPresent) {
-                doshootdown(CPU::TLBSHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
+            if (wasPresent && shootdown) {
+                doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
             }
             return true;
         }
@@ -500,7 +549,7 @@ namespace NArch {
             uint64_t *pte = _resolvepte(space, virt);
             if (pte) {
                 *pte = 0; // Blank page table entry, so that it now points NOWHERE.
-                doshootdown(CPU::TLBSHOOTDOWN_SINGLE, virt, virt + PAGESIZE); // Invalidate, so that the CPU will know that it's lost this page.
+                doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE); // Invalidate, so that the CPU will know that it's lost this page.
             }
         }
 
@@ -529,7 +578,7 @@ namespace NArch {
                 }
             }
 
-            doshootdown(CPU::TLBSHOOTDOWN_RANGE, virt, end);
+            doshootdown(SHOOTDOWN_RANGE, virt, end);
         }
 
         static inline uint8_t convertflags(uint64_t flags) {
@@ -645,8 +694,7 @@ namespace NArch {
                     SYSCALL_RET(-EISDIR);
                 }
 
-                if (off < 0 || (size_t)off + size > nodeattr.st_size) {
-                    // Mapping beyond end of file.
+                if (off < 0) {
                     node->unref();
                     filedesc->unref();
                     SYSCALL_RET(-EINVAL);
@@ -735,18 +783,28 @@ namespace NArch {
 
                 if (demandback) { // We can map regular files and block devices.
                     // Allocate file-backed VMA with demand paging.
+                    size_t filemapsize = 0;
+                    if ((size_t)off < nodeattr.st_size) {
+                        filemapsize = nodeattr.st_size - off;
+                        if (filemapsize > size) {
+                            filemapsize = size;
+                        }
+                    }
+
                     if (flags & MAP_FIXED) {
                         // Find and update the VMA node with file backing info.
                         NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)addr);
                         if (vma) {
                             vma->backingfile = node;
                             vma->fileoffset = off;
+                            vma->filemapsize = filemapsize;
                             node->ref(); // Keep a reference to the file.
                         }
                     } else {
                         NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)addr);
                         vma->backingfile = node;
                         vma->fileoffset = off;
+                        vma->filemapsize = filemapsize;
                         node->ref(); // Keep a reference to the file.
                     }
                 } else if (NFS::VFS::S_ISCHR(nodeattr.st_mode)) {
@@ -839,12 +897,26 @@ namespace NArch {
                 }
             }
 
-            // Free physical pages before unmapping
+            // Free physical pages before unmapping.
             for (size_t i = 0; i < size; i += PAGESIZE) {
                 uint64_t *pte = _resolvepte(space, (uintptr_t)ptr + i);
                 if (pte && (*pte & PRESENT)) {
-                    void *phys = (void *)(*pte & ADDRMASK);
-                    PMM::free(phys, PAGESIZE);
+                    uintptr_t phys = *pte & ADDRMASK;
+                    PMM::PageMeta *meta = PMM::phystometa(phys);
+
+                    // Check if this page is part of the page cache.
+                    if (meta && (meta->flags & PMM::PageMeta::PAGEMETA_PAGECACHE)) {
+                        // This is a page cache page, remove the reverse mapping.
+                        NMem::CachePage *cachepage = (NMem::CachePage *)meta->cacheentry;
+                        if (cachepage) {
+                            cachepage->removemapping(space, (uintptr_t)ptr + i);
+                        }
+                        // Decrement page reference (we still have a ref from the cache).
+                        meta->unref();
+                    } else {
+                        // Anonymous page or non-cached, just free it.
+                        PMM::free((void *)phys, PAGESIZE);
+                    }
                 }
             }
 nophys: // Jump label to skip unmapping physical pages for character special files.
@@ -875,21 +947,47 @@ nophys: // Jump label to skip unmapping physical pages for character special fil
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
-            NLib::ScopeIRQSpinlock guard(&space->lock);
+            uintptr_t shootdownstart = 0;
+            uintptr_t shootdownend = 0;
+            bool needshootdown = false;
 
-            uint64_t vmaflags = prottovma(prot);
+            {
+                NLib::ScopeIRQSpinlock guard(&space->lock);
 
-            // Update VMA flags for specified range.
-            space->vmaspace->protect((uintptr_t)ptr, (uintptr_t)ptr + size, vmaflags);
+                uint64_t vmaflags = prottovma(prot);
 
-            for (size_t i = 0; i < size; i += PAGESIZE) {
-                uint64_t *pte = _resolvepte(space, (uintptr_t)ptr + i);
-                if (pte && (*pte & PRESENT)) {
-                    uint64_t phys = *pte & ADDRMASK;
-                    uint64_t newflags = prottovmm(prot);
-                    *pte = phys | newflags;
-                    doshootdown(CPU::TLBSHOOTDOWN_SINGLE, (uintptr_t)ptr + i, (uintptr_t)ptr + i + PAGESIZE);
+                // Update VMA flags for specified range.
+                space->vmaspace->protect((uintptr_t)ptr, (uintptr_t)ptr + size, vmaflags);
+
+                for (size_t i = 0; i < size; i += PAGESIZE) {
+                    uint64_t *pte = _resolvepte(space, (uintptr_t)ptr + i);
+                    if (pte && (*pte & PRESENT)) {
+                        uint64_t phys = *pte & ADDRMASK;
+                        uint64_t newflags = prottovmm(prot);
+                        *pte = phys | newflags;
+
+                        // Track range for shootdown after lock release.
+                        uintptr_t page_start = (uintptr_t)ptr + i;
+                        uintptr_t page_end = page_start + PAGESIZE;
+                        if (!needshootdown) {
+                            shootdownstart = page_start;
+                            shootdownend = page_end;
+                            needshootdown = true;
+                        } else {
+                            if (page_start < shootdownstart) {
+                                shootdownstart = page_start;
+                            }
+                            if (page_end > shootdownend) {
+                                shootdownend = page_end;
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Perform TLB shootdown after releasing the address space lock.
+            if (needshootdown) {
+                doshootdown(SHOOTDOWN_RANGE, shootdownstart, shootdownend);
             }
 
             SYSCALL_RET(0);
@@ -913,46 +1011,70 @@ nophys: // Jump label to skip unmapping physical pages for character special fil
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
-            NLib::ScopeIRQSpinlock guard(&space->lock);
+            uintptr_t shootdownstart = 0;
+            uintptr_t shootdownend = 0;
+            bool needshootdown = false;
 
-            // Find the VMA containing this range.
-            NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)ptr);
-            if (!vma || !vma->used) {
-                SYSCALL_RET(-ENOMEM);
-            }
+            {
+                NLib::ScopeIRQSpinlock guard(&space->lock);
 
-            // Only file-backed shared mappings need writeback.
-            if (!vma->backingfile || !(vma->flags & NMem::Virt::VIRT_SHARED) || (vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
-                SYSCALL_RET(0); // Anonymous or private mapping, nothing to do.
-            }
-
-            // Write back dirty pages to the file.
-            for (size_t i = 0; i < size; i += PAGESIZE) {
-                uintptr_t pageaddr = (uintptr_t)ptr + i;
-                if (pageaddr >= vma->end) {
-                    break; // Past end of VMA.
+                // Find the VMA containing this range.
+                NMem::Virt::vmanode *vma = space->vmaspace->findcontaining((uintptr_t)ptr);
+                if (!vma || !vma->used) {
+                    SYSCALL_RET(-ENOMEM);
                 }
 
-                uint64_t *pte = _resolvepte(space, pageaddr);
-                if (!pte || !(*pte & PRESENT)) {
-                    continue; // Page not present, nothing to sync.
+                // Only file-backed shared mappings need writeback.
+                if (!vma->backingfile || !(vma->flags & NMem::Virt::VIRT_SHARED) || (vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
+                    SYSCALL_RET(0); // Anonymous or private mapping, nothing to do.
                 }
 
-                if (*pte & DIRTY) { // Writeback dirty pages.
-                    off_t fileoff = vma->fileoffset + (pageaddr - vma->start);
-
-                    void *phys = (void *)(*pte & ADDRMASK);
-
-                    // Write page data back to file.
-                    ssize_t nwritten = vma->backingfile->write(hhdmoff(phys), PAGESIZE, fileoff, 0);
-                    if (nwritten < 0) {
-                        SYSCALL_RET(nwritten); // Return error.
+                // Write back dirty pages to the file.
+                for (size_t i = 0; i < size; i += PAGESIZE) {
+                    uintptr_t pageaddr = (uintptr_t)ptr + i;
+                    if (pageaddr >= vma->end) {
+                        break; // Past end of VMA.
                     }
 
-                    // Clear dirty bit.
-                    *pte &= ~DIRTY;
-                    doshootdown(CPU::TLBSHOOTDOWN_SINGLE, pageaddr, pageaddr + PAGESIZE);
+                    uint64_t *pte = _resolvepte(space, pageaddr);
+                    if (!pte || !(*pte & PRESENT)) {
+                        continue; // Page not present, nothing to sync.
+                    }
+
+                    if (*pte & DIRTY) { // Writeback dirty pages.
+                        off_t fileoff = vma->fileoffset + (pageaddr - vma->start);
+
+                        void *phys = (void *)(*pte & ADDRMASK);
+
+                        // Write page data back to file.
+                        ssize_t nwritten = vma->backingfile->write(hhdmoff(phys), PAGESIZE, fileoff, 0);
+                        if (nwritten < 0) {
+                            SYSCALL_RET(nwritten); // Return error.
+                        }
+
+                        // Clear dirty bit.
+                        *pte &= ~DIRTY;
+
+                        // Track range for shootdown after lock release.
+                        if (!needshootdown) {
+                            shootdownstart = pageaddr;
+                            shootdownend = pageaddr + PAGESIZE;
+                            needshootdown = true;
+                        } else {
+                            if (pageaddr < shootdownstart) {
+                                shootdownstart = pageaddr;
+                            }
+                            if (pageaddr + PAGESIZE > shootdownend) {
+                                shootdownend = pageaddr + PAGESIZE;
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Perform TLB shootdown after releasing the address space lock.
+            if (needshootdown) {
+                doshootdown(SHOOTDOWN_RANGE, shootdownstart, shootdownend);
             }
 
             SYSCALL_RET(0);

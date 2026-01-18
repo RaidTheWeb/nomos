@@ -11,16 +11,13 @@
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
 #include <lib/string.hpp>
+#include <mm/pagecache.hpp>
 #include <mm/virt.hpp>
 #include <util/kprint.hpp>
 #include <sched/signal.hpp>
+#include <sys/fault.hpp>
 
 namespace NArch {
-    namespace VMM {
-        // Perform a TLB shootdown, also handles the TLB work on the calling CPU.
-        extern void doshootdown(enum CPU::shootdown type, uintptr_t start, uintptr_t end);
-    }
-
     namespace Interrupts {
         // Reference ISR table from assembly. This is for stubs, not handlers.
         extern "C" const uint64_t isr_table[256];
@@ -142,13 +139,29 @@ namespace NArch {
                         uintptr_t vmastart = vma->start;
                         uintptr_t vmaend = vma->end;
                         off_t vmafileoffset = vma->fileoffset;
+                        size_t vmafilemapsize = vma->filemapsize;
                         uint8_t vmaflags = vma->flags;
                         NFS::VFS::INode *backingfile = vma->backingfile;
                         backingfile->ref();
                         space->lock.release();
 
-                        void *newpage = PMM::alloc(PAGESIZE);
-                        if (!newpage) {
+                        // Calculate file offset for this page.
+                        uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
+                        size_t pageoffsetinvma = pagestart - vmastart;
+
+                        if (pageoffsetinvma >= vmafilemapsize) { // Send SIGBUS for accesses beyond file-backed region.
+                            backingfile->unref();
+                            if (isuserspace) {
+                                NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
+                                return;
+                            }
+                            panic("Page fault beyond file-backed region.\n");
+                        }
+
+                        off_t fileoff = vmafileoffset + pageoffsetinvma;
+
+                        NMem::CachePage *cachepage = backingfile->getorcacheepage(fileoff);
+                        if (!cachepage) {
                             backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
@@ -157,32 +170,36 @@ namespace NArch {
                             panic("Out of memory during demand paging.\n");
                         }
 
-                        NLib::memset(hhdmoff(newpage), 0, PAGESIZE);
-
-                        // Calculate file offset for this page.
-                        uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
-                        off_t fileoff = vmafileoffset + (pagestart - vmastart);
-
-                        // Read from backing file into the new page (may sleep).
-                        ssize_t nread = backingfile->read(hhdmoff(newpage), PAGESIZE, fileoff, 0);
-                        if (nread < 0) {
-                            PMM::free(newpage, PAGESIZE);
-                            backingfile->unref();
-                            if (isuserspace) {
-                                NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
-                                return;
+                        // Page is returned locked. Check if it needs to be read from disk.
+                        if (!cachepage->testflag(NMem::PAGE_UPTODATE)) {
+                            int err = backingfile->readpage(cachepage);
+                            if (err < 0) {
+                                cachepage->pageunlock();
+                                backingfile->unref();
+                                if (isuserspace) {
+                                    NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
+                                    return;
+                                }
+                                panic("File read failed during demand paging.\n");
                             }
-                            panic("File read failed during demand paging.\n");
+
+                            // Check if this page contains the EOF boundary.
+                            size_t bytesinthispage = vmafilemapsize - pageoffsetinvma;
+                            if (bytesinthispage < PAGESIZE) {
+                                // This page partially contains file data. Zero-fill the rest.
+                                void *pagedata = hhdmoff((void *)cachepage->physaddr);
+                                NLib::memset((char *)pagedata + bytesinthispage, 0, PAGESIZE - bytesinthispage);
+                            }
                         }
 
-                        // Re-acquire lock and verify VMA is still valid.
+                        // Re-acquire space lock and verify VMA is still valid.
                         space->lock.acquire();
                         vma = space->vmaspace->findcontaining(addr);
                         if (!vma || !vma->used || vma->backingfile != backingfile ||
                             vma->start != vmastart || vma->end != vmaend) {
-                            // VMA was changed while we were sleeping, discard page.
+                            // VMA was changed while we were sleeping, discard mapping.
                             space->lock.release();
-                            PMM::free(newpage, PAGESIZE);
+                            cachepage->pageunlock();
                             backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
@@ -190,9 +207,8 @@ namespace NArch {
                             }
                             panic("VMA changed during demand paging.\n");
                         }
-                        backingfile->unref();
 
-                        // Map the page with appropriate flags from VMA.
+                        // Map the cached page into the process address space.
                         uint64_t mapflags = VMM::PRESENT | VMM::USER;
                         if (vmaflags & NMem::Virt::VIRT_RW) {
                             mapflags |= VMM::WRITEABLE;
@@ -201,10 +217,22 @@ namespace NArch {
                             mapflags |= VMM::NOEXEC;
                         }
 
-                        VMM::_mappage(space, pagestart, (uintptr_t)newpage, mapflags);
+                        // Increment reference count for the mapping.
+                        cachepage->pagemeta->ref();
+
+                        // Track this mapping in the cache page for reverse mapping.
+                        cachepage->addmapping(space, pagestart);
+
+                        VMM::_mappage(space, pagestart, cachepage->physaddr, mapflags);
                         space->lock.release();
 
-                        NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, pagestart, pagestart + PAGESIZE);
+                        cachepage->pageunlock();
+                        backingfile->unref();
+
+                        // Trigger readahead for sequential access patterns.
+                        backingfile->readahead(fileoff + PAGESIZE);
+
+                        VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, pagestart, pagestart + PAGESIZE);
                         return;
                     }
 
@@ -215,6 +243,13 @@ namespace NArch {
                         NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
                         return;
                     }
+
+                    uintptr_t fixup = NSys::checkfault((uintptr_t)ctx->rip);
+                    if (fixup) { // Is this fault fixable?
+                        ctx->rip = fixup;
+                        return; // Return to fixed-up instruction.
+                    }
+
                     goto pffault;
                 }
 
@@ -248,7 +283,7 @@ namespace NArch {
                     meta->unref(); // Unref old page, free if needed.
 
                     // XXX: Free pages with no more references from any thread.
-                    NArch::VMM::doshootdown(CPU::TLBSHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
+                    VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
                     return;
                 }
 

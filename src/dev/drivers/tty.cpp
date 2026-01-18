@@ -294,7 +294,7 @@ namespace NDev {
                 }
 
                 {
-                    NLib::ScopeSpinlock guard(&this->ctrllock);
+                    NLib::ScopeIRQSpinlock guard(&this->ctrllock);
                     if (this->fpgrp) {
                         // Signal the foreground process group.
                         NSched::signalpgrp(this->fpgrp, signal);
@@ -462,7 +462,7 @@ namespace NDev {
         // 2. SIGTTIN is blocked → return EIO
         // 3. Process group is orphaned → return EIO
         {
-            NLib::ScopeSpinlock ctrlguard(&this->ctrllock);
+            NLib::ScopeIRQSpinlock ctrlguard(&this->ctrllock);
             if (this->fpgrp && proc->pgrp && proc->pgrp != this->fpgrp) {
                 // Check if process is in the same session as the TTY.
                 if (this->session && proc->session == this->session) {
@@ -1131,7 +1131,7 @@ notspecial:
 
                             // Set up the controlling terminal.
                             {
-                                NLib::ScopeSpinlock ctrlguard(&tty->tty->ctrllock);
+                                NLib::ScopeIRQSpinlock ctrlguard(&tty->tty->ctrllock);
 
                                 // Release old references.
                                 if (tty->tty->session) {
@@ -1168,7 +1168,7 @@ notspecial:
 
                             int pgid = 0;
                             {
-                                NLib::ScopeSpinlock ctrlguard(&tty->tty->ctrllock);
+                                NLib::ScopeIRQSpinlock ctrlguard(&tty->tty->ctrllock);
                                 if (tty->tty->fpgrp) {
                                     pgid = (int)tty->tty->fpgrp->id;
                                 }
@@ -1207,7 +1207,7 @@ notspecial:
 
                             // The caller must be in the same session as the TTY.
                             {
-                                NLib::ScopeSpinlock ctrlguard(&tty->tty->ctrllock);
+                                NLib::ScopeIRQSpinlock ctrlguard(&tty->tty->ctrllock);
                                 if (!tty->tty->session || !caller->session || caller->session != tty->tty->session) {
                                     tty->devlock.release();
                                     return -ENOTTY;

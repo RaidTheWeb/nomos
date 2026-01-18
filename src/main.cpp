@@ -27,6 +27,7 @@
 #include <mm/slab.hpp>
 #include <mm/vmalloc.hpp>
 #include <util/kprint.hpp>
+#include <sched/exec.hpp>
 #include <sched/sched.hpp>
 #include <sched/workqueue.hpp>
 #include <stddef.h>
@@ -118,27 +119,42 @@ void kpostarch(void) {
 
     NDev::PCI::init(); // Initialise PCI.
 
-    NFS::VFS::INode *node;
-    ssize_t ret = NFS::VFS::vfs->resolve("/bin/init", &node);
-    assert(ret == 0, "Failed to locate file.\n");
 
-    struct NSys::ELF::header elfhdr;
-    assert(node->read(&elfhdr, sizeof(elfhdr), 0, 0) == sizeof(elfhdr), "Failed to read ELF header.\n");
+    char *initproc = NArch::cmdline.get("init");
+    if (initproc) {
+        NUtil::printf("[nomos]: Using init process from cmdline: `%s`.\n", initproc);
+    } else {
+        initproc = (char *)"/bin/init";
+        NUtil::printf("[nomos]: No init process specified, defaulting to `%s`.\n", initproc);
+    }
 
-    assert(NSys::ELF::verifyheader(&elfhdr), "Failed to validate header.\n");
+    // Build exec params for init.
+    char *initargv[] = { initproc, NULL };
 
-    assert(elfhdr.type == NSys::ELF::ET_EXECUTABLE, "ELF is not executable.\n");
+    struct NSched::execparams params;
+    NLib::memset(&params, 0, sizeof(params));
+    params.path = initproc;
+    params.argv = initargv;
+    params.envp = NULL;
+    params.argc = 1;
+    params.envc = 0;
+    params.cwd = NFS::VFS::vfs->getroot();
+    params.root = NFS::VFS::vfs->getroot();
+    params.uid = 0;
+    params.gid = 0;
+    params.euid = 0;
+    params.egid = 0;
+    params.checkperms = false;  // Kernel doesn't need permission check.
+    params.issyscall = false;
+    params.interpdepth = 0;
 
-    struct NArch::VMM::addrspace *uspace;
-    NArch::VMM::uclonecontext(&NArch::VMM::kspace, &uspace);
-
-    void *ent = NULL;
-    uintptr_t phdr = 0;
-    assert(NSys::ELF::loadfile(&elfhdr, node, uspace, &ent, 0, &phdr), "Failed to load ELF.\n");
+    struct NSched::execresult result;
+    int err = NSched::exec(&params, &result);
+    assert(err == 0, "Failed to exec init process.\n");
 
     // PROCESS
-    NSched::Process *proc = new NSched::Process(uspace);
-    proc->cwd = NFS::VFS::vfs->getroot(); // Set initial CWD to root.
+    NSched::Process *proc = new NSched::Process(result.addrspace);
+    proc->cwd = NFS::VFS::vfs->getroot();
     if (proc->cwd && proc->cwd->fs) {
         proc->cwd->fs->fsref();  // Filesystem reference for initial cwd
     }
@@ -163,59 +179,19 @@ void kpostarch(void) {
     proc->session = session;
     proc->pgrp = pgrp;
 
+    // Increment address space reference (exec() created it with ref=0).
+    result.addrspace->ref++;
+
     // THREAD
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
 
-    // XXX: Be able to pass allocation to thread, so it knows to remove it on free.
-    //uintptr_t ustack = (uintptr_t)NArch::PMM::alloc(1 << 20); // Allocate 1MB stack.
-    //assert(ustack, "Failed to allocate memory for user stack.\n");
-    uintptr_t ustack = (uintptr_t)NMem::VMalloc::alloc(1 << 20); // Allocate 1MB stack.
-    assert(ustack, "Failed to allocate memory for user stack.\n");
 
-    uintptr_t ustacktop = 0x0000800000000000 - NArch::PAGESIZE; // Subtract 4096 byte guard page from absolute maximum of userspace.
-
-    uintptr_t ustackbottom = ustacktop - (1 << 20); // Bottom of stack.
-
-    char *argv[] = { (char *)"/bin/init", NULL };
-
-    struct NSys::ELF::execinfo einfo;
-    NLib::memset(&einfo, 0, sizeof(einfo));
-    einfo.argv = argv;
-    einfo.envp = NULL;
-    einfo.entry = (uintptr_t)ent;
-    einfo.lnbase = 0;
-    einfo.phdraddr = phdr;
-
-    einfo.secure = true; // Init process is secure.
-    einfo.uid = 0;
-    einfo.euid = 0;
-    einfo.gid = 0;
-    einfo.egid = 0;
-
-    NSys::Random::EntropyPool *pool = NArch::CPU::get()->entropypool;
-    assert(pool, "CPU entropy pool is NULL.\n");
-    uint8_t randbuf[16];
-    pool->getrandom(randbuf, sizeof(randbuf), false, false); // Non-blocking, urandom source.
-    NLib::memcpy(einfo.random, randbuf, sizeof(randbuf));
-
-    // We pass in the hhdm-offset physical stack top. The user will be given the mapped version.
-    //void *rsp = NSys::ELF::preparestack((uintptr_t)NArch::hhdmoff((void *)(ustack + (1 << 20))), argv, NULL, &elfhdr, ustacktop);
-    void *rsp = NSys::ELF::preparestack(ustack + (1 << 20), &elfhdr, ustacktop, &einfo);
-    assert(rsp, "Stack alignment failed.\n");
-
-    // Reserve stack location. We don't want to end up allocating into the stack region on requests for virtual memory.
-    //uspace->vmaspace->reserve(ustackbottom, ustacktop, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
-
-    uspace->vmaspace->reserve(ustacktop, 0x0000800000000000, 0); // Reserve guard page.
-
-    // Map stack into userspace memory.
-    //NArch::VMM::maprange(uspace, ustackbottom, (uintptr_t)ustack, NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::USER | NArch::VMM::PRESENT, (1 << 20)); // Map range.
-    NMem::VMalloc::mapintospace(uspace, ustack, ustackbottom, 1 << 20, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW | NMem::Virt::VIRT_USER);
-
-    uthread->ctx.rip = elfhdr.entryoff;
-    uthread->ctx.rsp = (uint64_t)rsp;
+#ifdef __x86_64__
+    uthread->ctx.rip = (uint64_t)result.entry;
+    uthread->ctx.rsp = (uint64_t)result.stackptr;
 
     NLimine::console_write("\x1b[2J\x1b[H", 7);
+#endif
 
     NUtil::printf("[nomos]: Starting user init.\n");
     NSched::schedulethread(uthread); // Dispatch!

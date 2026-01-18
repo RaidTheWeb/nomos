@@ -2,6 +2,7 @@
 #include <lib/string.hpp>
 #include <lib/sync.hpp>
 #include <mm/pagecache.hpp>
+#include <sched/event.hpp>
 #include <mm/ucopy.hpp>
 #include <util/kprint.hpp>
 
@@ -556,9 +557,7 @@ namespace NDev {
     }
 
     int BlockDevice::waitbio(struct bioreq *req) {
-        while (!__atomic_load_n(&req->completed, memory_order_acquire)) {
-            req->wq.wait();
-        }
+        waitevent(&req->wq, __atomic_load_n(&req->completed, memory_order_acquire));
         return req->status;
     }
 

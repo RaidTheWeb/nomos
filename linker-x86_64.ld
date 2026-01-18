@@ -41,16 +41,22 @@ SECTIONS
         *(.data .data.*)
     } :data
 
-    .drivers : {
+    .drivers : { /* Driver registration data. So we can initialise a big list of drivers at boot. */
         __drivers_start = .;
         KEEP(*(.drivers*))
         __drivers_end = .;
     } :data
 
-    .filesystems : {
+    .filesystems : { /* Filesystem registration data. So we can initialise a big list of filesystems at boot. */
         __filesystems_start = .;
         KEEP(*(.filesystems*))
         __filesystems_end = .;
+    } :data
+
+    .faulttable : { /* Handler table for recoverable faults. */
+        __faulttable_start = .;
+        KEEP(*(.faulttable*))
+        __faulttable_end = .;
     } :data
 
     .bss : {

@@ -715,7 +715,7 @@ namespace NFS {
 
         // Check extent cache for a cached mapping.
         bool Ext4Node::lookupcachedextent(uint64_t logicalblk, uint64_t *physblk, uint64_t *runlen) {
-            NLib::ScopeSpinlock guard(&this->extentcachelock);
+            NLib::ScopeIRQSpinlock guard(&this->extentcachelock);
             for (size_t i = 0; i < EXTENT_CACHESIZE; i++) {
                 struct extentcacheentry &e = this->extentcache[i];
                 if (e.valid &&
@@ -732,7 +732,7 @@ namespace NFS {
 
         // Cache an extent mapping.
         void Ext4Node::cacheextent(uint64_t logicalstart, uint64_t physstart, uint32_t len) {
-            NLib::ScopeSpinlock guard(&this->extentcachelock);
+            NLib::ScopeIRQSpinlock guard(&this->extentcachelock);
             // Check if this extent is already cached.
             for (size_t i = 0; i < EXTENT_CACHESIZE; i++) {
                 struct extentcacheentry &e = this->extentcache[i];
@@ -755,7 +755,7 @@ namespace NFS {
 
         // Invalidate all cached extents.
         void Ext4Node::invalidateextentcache(void) {
-            NLib::ScopeSpinlock guard(&this->extentcachelock);
+            NLib::ScopeIRQSpinlock guard(&this->extentcachelock);
             for (size_t i = 0; i < EXTENT_CACHESIZE; i++) {
                 this->extentcache[i].valid = false;
             }

@@ -121,6 +121,86 @@ namespace NMem {
         }
     }
 
+    void CachePage::addmapping(NArch::VMM::addrspace *space, uintptr_t virtaddr) {
+        // Allocate a new mapping entry.
+        vmamapping *mapping = new vmamapping(space, virtaddr);
+        if (!mapping) {
+            return; // OOM, mapping won't be tracked.
+        }
+
+        // Insert at head of mappings list.
+        this->lock.acquire();
+        mapping->next = this->mappingshead;
+        mapping->prev = NULL;
+        if (this->mappingshead) {
+            this->mappingshead->prev = mapping;
+        }
+        this->mappingshead = mapping;
+        this->mapcount++;
+        this->lock.release();
+    }
+
+    void CachePage::removemapping(NArch::VMM::addrspace *space, uintptr_t virtaddr) {
+        this->lock.acquire();
+        vmamapping *m = this->mappingshead;
+        while (m) {
+            if (m->space == space && m->virtaddr == virtaddr) {
+                // Found the mapping, remove it from the list.
+                if (m->prev) {
+                    m->prev->next = m->next;
+                } else {
+                    this->mappingshead = m->next;
+                }
+                if (m->next) {
+                    m->next->prev = m->prev;
+                }
+                this->mapcount--;
+                this->lock.release();
+                delete m;
+                return;
+            }
+            m = m->next;
+        }
+        this->lock.release();
+    }
+
+    size_t CachePage::unmapall(void) {
+        // Unmap this page from all address spaces that have it mapped.
+        size_t count = 0;
+
+        this->lock.acquire();
+        vmamapping *m = this->mappingshead;
+        while (m) {
+            vmamapping *next = m->next;
+
+            // Unmap from the address space.
+            m->space->lock.acquire();
+            NArch::VMM::_unmappage(m->space, m->virtaddr);
+            m->space->lock.release();
+
+            // Decrement the page's reference count (process no longer has it mapped).
+            if (this->pagemeta) {
+                this->pagemeta->unref();
+            }
+
+            delete m;
+            count++;
+            m = next;
+        }
+        this->mappingshead = NULL;
+        this->mapcount = 0;
+        this->lock.release();
+
+#ifdef __x86_64__
+        // Issue a full TLB shootdown since we may have unmapped from multiple address spaces.
+        if (count > 0) {
+            NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_FULL, 0, 0);
+        }
+#endif
+
+        return count;
+    }
+
     RadixTreeNode::~RadixTreeNode(void) {
         if (this->height > 0) {
             for (size_t i = 0; i < RADIXTREESLOTS; i++) {
@@ -632,6 +712,10 @@ namespace NMem {
             if (err < 0) {
                 return err;
             }
+        }
+
+        if (page->hasmappings()) {
+            page->unmapall(); // Unmap all mappings during eviction (programs still trying to use the previous mapping will end up triggering demand page to load the page back in).
         }
 
         // Remove from owning radix tree to prevent dangling pointers.

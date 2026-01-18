@@ -14,10 +14,6 @@ namespace NFS {
         // Forward declaration.
         class Ext4FileSystem;
 
-        // Inode flags.
-        #define EXT4_EXTENTSFL 0x00080000 // Inode uses extents.
-        #define EXT4_INLINEDATAFL 0x10000000 // Inode has inline data.
-
         // Extent magic number.
         #define EXT4_EXTMAGIC 0xF30A
 
@@ -40,7 +36,7 @@ namespace NFS {
                 static constexpr size_t EXTENT_CACHESIZE = 4;
                 struct extentcacheentry extentcache[EXTENT_CACHESIZE] = {};
                 size_t extentcacheidx = 0; // Round-robin insertion index.
-                NArch::Spinlock extentcachelock; // Protects extent cache access.
+                NArch::IRQSpinlock extentcachelock; // Protects extent cache access.
             public:
                 Ext4FileSystem *ext4fs; // Owning filesystem (typed).
                 struct inode diskino; // On-disk inode structure.
@@ -178,6 +174,9 @@ namespace NFS {
 
                 // Map a page offset to device LBA for async readahead.
                 uint64_t getpagelba(off_t pageoffset) override;
+
+                // Map a page offset to device LBA using only cached extents (non-blocking).
+                uint64_t getpagelbacached(off_t pageoffset, bool *needsio) override;
         };
 
         class Ext4FileSystem : public VFS::IFileSystem {
@@ -187,6 +186,10 @@ namespace NFS {
                 struct groupdesc *groupdescs; // Block group descriptor table.
                 uint32_t numgroups; // Number of block groups.
                 uint32_t blksize; // Block size in bytes.
+                uint32_t csumseed; // Checksum seed for metadata checksums.
+                uint16_t inodesize; // On-disk inode size.
+                bool readonly; // Mounted read-only due to unsupported RO_COMPAT features.
+                bool haschecksums; // Filesystem has metadata checksums enabled.
 
                 Ext4FileSystem(VFS::VFS *vfs) {
                     this->vfs = vfs;
@@ -194,6 +197,10 @@ namespace NFS {
                     this->groupdescs = NULL;
                     this->numgroups = 0;
                     this->blksize = 0;
+                    this->csumseed = 0;
+                    this->inodesize = 128;
+                    this->readonly = false;
+                    this->haschecksums = false;
                     this->root = NULL; // Will be set in mount().
                 }
 
@@ -257,6 +264,26 @@ namespace NFS {
 
                 // Free a previously allocated inode.
                 int freeinode(uint32_t ino, bool isdir = false);
+
+                // Compute checksum seed from UUID (if CSUM_SEED feature not present).
+                void computecsumseed(void);
+
+                // Compute superblock checksum.
+                uint32_t sbchecksum(void);
+
+                // Compute group descriptor checksum.
+                uint16_t gdchecksum(uint32_t group, struct groupdesc *gd);
+
+                // Compute inode checksum.
+                uint32_t inodechecksum(uint32_t ino, struct inode *diskino);
+
+                // Compute directory block checksum.
+                uint32_t dirblockchecksum(uint32_t ino, uint32_t gen, void *block, size_t len);
+
+                // Check if filesystem has HUGE_FILE feature.
+                bool hugefile(void) const {
+                    return this->sb.featrocompat & EXT4_FEATUREROCOMPATHUGEFILE;
+                }
 
                 int mount(const char *src, const char *path, VFS::INode *mntnode, uint64_t flags, const void *data) override;
 

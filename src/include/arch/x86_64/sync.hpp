@@ -36,33 +36,7 @@ namespace NArch {
             IRQSpinlock(void) { }
 
             void acquire(void);
-            void release(void);
-    };
-
-
-    // Mellor-Crummey and Scott spinlock implementation.
-    // Includes handling off lock depth, and integrates with thread_local to provide individual states to each CPU.
-    // In-all-other-cases primitive that can handle higher contention than the bog-standard spinlock primitive.
-    class MCSSpinlock {
-        private:
-
-            struct mcsnode {
-                struct mcsnode *next;
-                volatile uint32_t locked;
-            };
-
-            struct mcsnode *tail = NULL;
-        public:
-            struct state {
-                struct mcsnode *node;
-                uint8_t depth = 0;
-                uint8_t inited = false;
-            };
-            MCSSpinlock(void) { };
-
-            static void initstate(struct state *state);
-
-            void acquire(void);
+            bool trylock(void);
             void release(void);
     };
 }

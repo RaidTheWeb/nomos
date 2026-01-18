@@ -5,6 +5,7 @@
 #include <fs/ramfs.hpp>
 #include <lib/errno.hpp>
 #include <fs/pipefs.hpp>
+#include <mm/pagecache.hpp>
 
 namespace NFS {
     namespace RAMFS {
@@ -18,7 +19,7 @@ namespace NFS {
 
         int RAMNode::poll(short events, short *revents, int fdflags) {
             (void)fdflags;
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             *revents = 0;
 
@@ -103,6 +104,81 @@ namespace NFS {
             return 0;
         }
 
+        // Read a page from the ramfs internal buffer into a cache page.
+        int RAMNode::readpage(NMem::CachePage *page) {
+            if (!page) {
+                return -EINVAL;
+            }
+
+            off_t offset = page->offset;
+            void *dest = page->data();
+
+            // Zero the entire page first.
+            NLib::memset(dest, 0, NArch::PAGESIZE);
+
+            this->datalock.acquire();
+
+            // Check if offset is within file bounds.
+            if (offset >= this->attr.st_size) {
+                this->datalock.release();
+                page->setflag(NMem::PAGE_UPTODATE);
+                return 0;
+            }
+
+            // Calculate how much to copy.
+            size_t tocopy = NArch::PAGESIZE;
+            if ((off_t)(offset + tocopy) > this->attr.st_size) {
+                tocopy = this->attr.st_size - offset;
+            }
+
+            // Copy data from internal buffer to cache page.
+            if (this->data && tocopy > 0) {
+                NLib::memcpy(dest, this->data + offset, tocopy);
+            }
+
+            this->datalock.release();
+            page->setflag(NMem::PAGE_UPTODATE);
+            return 0;
+        }
+
+        // Write a dirty cache page back to the ramfs internal buffer.
+        int RAMNode::writepage(NMem::CachePage *page) {
+            if (!page) {
+                return -EINVAL;
+            }
+
+            off_t offset = page->offset;
+            void *src = page->data();
+
+            this->datalock.acquire();
+
+            // Grow file if needed.
+            off_t newend = offset + NArch::PAGESIZE;
+            if (newend > this->attr.st_size) {
+                this->attr.st_size = newend;
+                this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
+                this->data = (uint8_t *)NMem::allocator.realloc(this->data, this->attr.st_size);
+                if (!this->data) {
+                    this->datalock.release();
+                    return -ENOMEM;
+                }
+            }
+
+            // Copy data from cache page to internal buffer.
+            size_t tocopy = NArch::PAGESIZE;
+            if ((off_t)(offset + tocopy) > this->attr.st_size) {
+                tocopy = this->attr.st_size - offset;
+            }
+
+            if (tocopy > 0) {
+                NLib::memcpy(this->data + offset, src, tocopy);
+            }
+
+            this->datalock.release();
+            page->clearflag(NMem::PAGE_DIRTY);
+            return 0;
+        }
+
         ssize_t RAMNode::readlink(char *buf, size_t bufsiz) {
             this->datalock.acquire();
 
@@ -122,7 +198,7 @@ namespace NFS {
         }
 
         ssize_t RAMNode::readdir(void *buf, size_t count, off_t offset) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return -ENOTDIR;
@@ -238,7 +314,7 @@ namespace NFS {
         }
 
         VFS::INode *RAMNode::lookup(const char *name) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return NULL; // Non-directories possess no children.
@@ -254,7 +330,7 @@ namespace NFS {
         }
 
         bool RAMNode::add(VFS::INode *node) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false; // Non-directories possess no children.
@@ -274,7 +350,7 @@ namespace NFS {
         }
 
         bool RAMNode::remove(const char *name) {
-            NLib::ScopeSpinlock guard(&this->metalock);
+            NLib::ScopeIRQSpinlock guard(&this->metalock);
 
             if (!VFS::S_ISDIR(this->attr.st_mode)) {
                 return false; // Non-directories possess no children.

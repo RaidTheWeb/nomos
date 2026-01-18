@@ -21,7 +21,7 @@ namespace NDev {
 
 
             int iorequest(struct nvmectrl *ctrl, uint16_t id, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size);
-            int iorequest_async(struct nvmectrl *ctrl, uint16_t id, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size, struct nvmepending **pending);
+            int iorequest_async(struct nvmectrl *ctrl, uint16_t id, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size, struct nvmepending **pending, struct bioreq *bio = NULL);
 
             int waitpending(struct nvmepending *pending);
             int waitmultiple(struct nvmepending **pendings, size_t count);
@@ -123,14 +123,14 @@ namespace NDev {
                     req->count,
                     req->buffer,
                     req->bufsize,
-                    &pending);
+                    &pending,
+                    req);
 
                 if (res < 0) {
                     return res;
                 }
 
                 req->ddata = (void *)pending;
-                pending->bio = req;
                 __atomic_store_n(&req->submitted, true, memory_order_release);
                 return 0;
             }
@@ -146,6 +146,11 @@ namespace NDev {
 
                 req->wq.wake();
                 return res;
+            }
+
+            // NVMe has native async I/O support.
+            bool hasasyncio() const override {
+                return true;
             }
     };
 }

@@ -92,31 +92,6 @@ namespace NArch {
         static const uint32_t MSRGSBASE     = 0xc0000101; // GS.
         static const uint32_t MSRKGSBASE    = 0xc0000102; // Kernel GS.
 
-        enum shootdown : uint8_t {
-            TLBSHOOTDOWN_NONE,
-            TLBSHOOTDOWN_SINGLE,
-            TLBSHOOTDOWN_RANGE,
-            TLBSHOOTDOWN_FULL
-        };
-
-        // Local TLB shootdown state.
-        struct tlblocal {
-            bool pending; // Atomic. Are we working on this?
-
-            // Private states:
-            enum shootdown type;
-            uint64_t start;
-            uint64_t end;
-
-            size_t completion; // Atomic. How much have we done?
-        };
-
-        struct tlbglobal {
-            size_t activereqs; // Should be referenced atomically.
-        };
-
-        extern struct tlbglobal tlbglobal;
-
         struct cpulocal {
             // Place current thread pointer at the start of the CPU struct, so the offset is easier within the system call assembly.
             NSched::Thread *currthread = NULL; // Currently running thread, if any.
@@ -132,7 +107,6 @@ namespace NArch {
             NSched::Thread *idlethread = NULL; // Fallback idle thread, for when trere's no work.
             uint64_t lastschedts; // For runtime delta calculations.
 
-            struct MCSSpinlock::state mcsstate;
             struct ist ist;
             uint64_t gdt[7];
             struct Interrupts::isr isrtable[256];
@@ -146,7 +120,7 @@ namespace NArch {
             bool irqstatestack[IRQSTACKMAX];
             size_t irqstackdepth = 0;
 
-            struct tlblocal tlblocal;
+            volatile size_t tlbgeneration = 0; // Last processed TLB generation for this CPU.
 
             volatile uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
             NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.

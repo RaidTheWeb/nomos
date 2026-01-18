@@ -167,6 +167,7 @@ namespace NMem {
                 root->flags = successor->flags;
                 root->backingfile = successor->backingfile;
                 root->fileoffset = successor->fileoffset;
+                root->filemapsize = successor->filemapsize;
                 // Don't copy maxend or height, they'll be recalculated
 
                 // Recursively remove the successor from right subtree
@@ -310,6 +311,7 @@ namespace NMem {
             node->flags = 0;
             node->backingfile = NULL;
             node->fileoffset = 0;
+            node->filemapsize = 0;
             return node;
         }
 

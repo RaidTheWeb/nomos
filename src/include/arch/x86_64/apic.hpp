@@ -75,11 +75,11 @@ namespace NArch {
                 void *addr;
                 uint32_t gsibase;
                 uint32_t gsitop;
-                Spinlock lock;
+                IRQSpinlock lock;
 
                 // Read from register.
                 uint32_t read(uint32_t reg) {
-                    NLib::ScopeSpinlock guard(&this->lock);
+                    NLib::ScopeIRQSpinlock guard(&this->lock);
 
                     volatile uint32_t *addr = (volatile uint32_t *)this->addr;
                     *addr = reg & 0xff; // Inform IOREGSEL what register we're working with.
@@ -88,7 +88,7 @@ namespace NArch {
 
                 // Write to register.
                 void write(uint32_t reg, uint32_t value) {
-                    NLib::ScopeSpinlock guard(&this->lock);
+                    NLib::ScopeIRQSpinlock guard(&this->lock);
 
                     volatile uint32_t *addr = (volatile uint32_t *)this->addr;
                     *addr = reg & 0xff; // Inform IOREGSEL what register we're working with.

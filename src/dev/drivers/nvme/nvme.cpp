@@ -2,6 +2,7 @@
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/e9.hpp>
+#include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
@@ -15,6 +16,7 @@
 
 #include <lib/align.hpp>
 #include <sched/event.hpp>
+#include <sched/workqueue.hpp>
 #include <stddef.h>
 #include <std/stdatomic.h>
 #include <dev/block.hpp>
@@ -40,6 +42,7 @@ namespace NDev {
 
     static NVMEDriver *instance = NULL;
     static NSched::WorkQueue *nvmeworkqueue = NULL;
+    static NSched::WorkerPool *nvmecompletionpool = NULL; // Dedicated pool for NVMe completions.
 
     // Convert a controller ID, namespace ID and partition ID into a block device minor number.
     static inline uint32_t nsblktominor(uint32_t cid, uint32_t nsid, uint32_t pid) {
@@ -62,7 +65,23 @@ namespace NDev {
     NVMEDriver::NVMEDriver(void) {
         instance = this;
 
-        nvmeworkqueue = new NSched::WorkQueue("nvme_iocomplete", NSched::WQ_UNBOUND);
+
+        // Create dedicated worker pool for NVMe I/O completions, we CANNOT afford I/O completion to be blocked (because it may be relied on by other workers, deadlocking everything).
+        size_t ncpus = NArch::SMP::awakecpus;
+        nvmecompletionpool = new NSched::WorkerPool(
+            -1,
+            NSched::WQ_UNBOUND | NSched::WQ_HIGHPRI,
+            ncpus,
+            ncpus * 2
+        );
+
+        // Pre-spawn minimum workers to ensure they're available for completions.
+        for (size_t i = 0; i < ncpus; i++) {
+            nvmecompletionpool->spawnworker();
+        }
+
+        // Create workqueue using dedicated pool.
+        nvmeworkqueue = new NSched::WorkQueue("nvme_iocomplete", NSched::WQ_UNBOUND | NSched::WQ_HIGHPRI, nvmecompletionpool);
     }
 
     NVMEDriver::~NVMEDriver(void) {
@@ -152,7 +171,7 @@ namespace NDev {
 
     // Submit commands to the admin queue.
     static int submitadmin(struct nvmectrl *ctrl, struct nvmesqe *cmd) {
-        NLib::ScopeSpinlock lock(&ctrl->asq.qlock);
+        NLib::ScopeIRQSpinlock lock(&ctrl->asq.qlock);
 
         uint16_t tail = ctrl->asq.tail;
         struct nvmesqe *next = &((struct nvmesqe *)ctrl->asq.entries)[tail];
@@ -364,19 +383,27 @@ namespace NDev {
         uint64_t submittsc = __atomic_load_n(&pending->submittsc, memory_order_acquire);
         uint64_t deadline = submittsc + (IOTIMEOUTUS * hz) / 1000000;
 
-        // Wait loop with timeout check.
+        // Wait loop using waitevent pattern to prevent lost wakeups.
+        pending->wq.waitinglock.acquire();
         while (!__atomic_load_n(&pending->done, memory_order_acquire)) {
-            // Check for timeout.
+            // Check for timeout while still holding lock.
             uint64_t now = NArch::TSC::query();
             if (now > deadline) {
+                pending->wq.waitinglock.release();
                 NUtil::printf("[dev/nvme]: I/O request timed out after %lu us.\n", IOTIMEOUTUS);
                 // Mark as no longer in use so completion handler ignores late arrival.
                 __atomic_store_n(&pending->inuse, false, memory_order_release);
                 return -1;
             }
 
-            pending->wq.wait();
+            // Add to wait list and yield while holding lock, then reacquire.
+            pending->wq.preparewait();
+            pending->wq.waitinglock.release();
+            NSched::yield();
+            pending->wq.waitinglock.acquire();
+            pending->wq.finishwait(true);
         }
+        pending->wq.waitinglock.release();
 
         int status = __atomic_load_n(&pending->status, memory_order_acquire);
         __atomic_store_n(&pending->inuse, false, memory_order_release);
@@ -399,6 +426,9 @@ namespace NDev {
         }
 
         pending->wq.wakeone();
+
+        // Release this slot.
+        __atomic_store_n(&pending->inuse, false, memory_order_release);
     }
 
     static void queuecompletion(struct nvmepending *pending) {
@@ -587,7 +617,7 @@ retry:
         return result;
     }
 
-    int NVMEDriver::iorequest_async(struct nvmectrl *ctrl, uint16_t qid, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size, struct nvmepending **pending) {
+    int NVMEDriver::iorequest_async(struct nvmectrl *ctrl, uint16_t qid, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size, struct nvmepending **pending, struct NDev::bioreq *bio) {
         struct nvmequeue *sq = &ctrl->iosq[qid];
 
         // Allocate a pending slot first.
@@ -645,6 +675,8 @@ retry:
         }
 
         uintptr_t prplistaddr = (size > 2 * PAGESIZE) ? cmd->prp2 : 0;
+
+        localpending->bio = bio;
 
         // Record submission timestamp for timeout detection before ringing doorbell.
         __atomic_store_n(&localpending->submittsc, NArch::TSC::query(), memory_order_release);
@@ -718,7 +750,16 @@ retry:
                 // Wait on first incomplete request's wait queue.
                 for (size_t i = 0; i < count; i++) {
                     if (!done[i]) {
-                        pendings[i]->wq.wait();
+                        struct nvmepending *p = pendings[i];
+                        p->wq.waitinglock.acquire();
+                        if (!__atomic_load_n(&p->done, memory_order_acquire)) {
+                            p->wq.preparewait();
+                            p->wq.waitinglock.release();
+                            NSched::yield();
+                            p->wq.waitinglock.acquire();
+                            p->wq.finishwait(true);
+                        }
+                        p->wq.waitinglock.release();
                         break;
                     }
                 }

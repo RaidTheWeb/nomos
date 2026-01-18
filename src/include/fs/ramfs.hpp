@@ -42,8 +42,12 @@ namespace NFS {
 
                 int poll(short events, short *revents, int fdflags) override;
 
+                // Page cache integration for demand paging support.
+                int readpage(NMem::CachePage *page) override;
+                int writepage(NMem::CachePage *page) override;
+
                 bool empty(void) override {
-                    NLib::ScopeSpinlock guard(&this->metalock);
+                    NLib::ScopeIRQSpinlock guard(&this->metalock);
                     return this->children.size() == 0;
                 }
         };

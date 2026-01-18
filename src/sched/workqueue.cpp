@@ -17,6 +17,12 @@ namespace NSched {
 
     static void workerentry(void *arg);
 
+    WorkQueue::WorkQueue(const char *name, uint32_t flags, WorkerPool *pool) {
+        this->name = name;
+        this->flags = flags & ~WQ_DRAINING;
+        this->custompool = pool;
+    }
+
     WorkerPool::WorkerPool(int cpu, uint32_t pflags, size_t minw, size_t maxw) {
         this->worklisthead = NULL;
         this->worklisttail = NULL;
@@ -70,7 +76,7 @@ namespace NSched {
         } else {
             // Effective concurrency excludes intensive workers.
             size_t effectiveactive = this->activecount - this->intensivecount;
-            if (effectiveactive > 0 && this->workers.getsize() < this->maxworkers) {
+            if ((effectiveactive > 0 || this->pendingcount > 0) && this->workers.getsize() < this->maxworkers) {
                 shouldspawn = true;
             }
         }
@@ -174,9 +180,19 @@ namespace NSched {
             // Wait for work if queue is empty.
             while (pool->worklisthead == NULL && !pool->exiting) {
                 pool->idlecount++; // Increase our idle count so addwork can wake us.
+
+                // Add ourselves to wait list BEFORE releasing pool->lock.
+                pool->workwq.waitinglock.acquire();
                 pool->lock.release();
 
-                pool->workwq.wait(); // Wait for work. We'll be woken up when work is added.
+                pool->workwq.preparewait();
+                pool->workwq.waitinglock.release();
+
+                yield(); // Wait for work. We'll be woken up when work is added.
+
+                pool->workwq.waitinglock.acquire();
+                pool->workwq.finishwait(true);
+                pool->workwq.waitinglock.release();
 
                 pool->lock.acquire();
                 pool->idlecount--;
@@ -222,6 +238,11 @@ namespace NSched {
     }
 
     WorkerPool *WorkQueue::getpoolforwork(void) {
+        // Use custom pool if set.
+        if (this->custompool) {
+            return this->custompool;
+        }
+
         bool highpri = (this->flags & WQ_HIGHPRI) != 0;
         bool unbound = (this->flags & WQ_UNBOUND) != 0;
 
