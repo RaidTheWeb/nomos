@@ -71,6 +71,7 @@ extern sys_symlink
 extern sys_getrandom
 extern sys_chroot
 extern sys_pivotroot
+extern sys_getrusage
 
 MAXSYSCALLS equ 256
 
@@ -145,6 +146,7 @@ syscall_table:
     dq sys_getrandom
     dq sys_chroot
     dq sys_pivotroot
+    dq sys_getrusage
     times (MAXSYSCALLS - ($ - syscall_table) / 8) dq 0 ; Pad with zeroes, from last system call to end of the table.
 
 

@@ -147,9 +147,14 @@ namespace NFS {
                     SYSCALL_RET(-EINVAL);
             }
 
-            // if ((flags & O_TRUNC) && S_ISREG(st.st_mode)) {
-
-            // }
+            // Truncate regular files if O_TRUNC is set and we have write access.
+            if ((flags & O_TRUNC) && S_ISREG(st.st_mode)) {
+                ssize_t truncres = node->truncate(0);
+                if (truncres < 0) {
+                    node->unref();
+                    SYSCALL_RET(truncres);
+                }
+            }
 
             int fd = proc->fdtable->open(node, flags);
             if (fd < 0) {
@@ -180,9 +185,14 @@ namespace NFS {
         extern "C" uint64_t sys_dup2(int fd, int flags, int newfd) {
             SYSCALL_LOG("sys_dup2(%d, %d, %d).\n", fd, flags, newfd);
 
+            // Only O_CLOEXEC is a valid flag for dup3.
+            if (flags & ~O_CLOEXEC) {
+                SYSCALL_RET(-EINVAL);
+            }
+
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
-            SYSCALL_RET(proc->fdtable->dup2(fd, newfd));
+            SYSCALL_RET(proc->fdtable->dup2(fd, newfd, false, flags & O_CLOEXEC));
         }
 
         extern "C" uint64_t sys_close(int fd) {
@@ -549,7 +559,7 @@ namespace NFS {
                 SYSCALL_RET(-EFAULT);
             }
 
-            if (!NMem::UserCopy::valid(buf, count)) {
+            if (!NMem::UserCopy::valid(buf, count)) { // Validation check protects underlying stuff from kernel addresses being passed through.
                 SYSCALL_RET(-EFAULT); // Invalid buffer.
             }
 
@@ -763,7 +773,8 @@ namespace NFS {
                 case F_SETLK64:
                 case F_SETLKW64:
                 case F_GETLK64:
-                    SYSCALL_RET(0); // No locking implemented.
+                    // XXX: Unimplemented.
+                    SYSCALL_RET(-ENOSYS);
                 default:
                     SYSCALL_RET(-EINVAL);
             }
@@ -2005,7 +2016,6 @@ namespace NFS {
             tgtbuf[tgtlen] = '\0';
             fstbuf[fstlen] = '\0';
 
-            NUtil::printf("Mounting %s on %s as %s with flags %lx and data %p\n", srcbuf, tgtbuf, fstbuf, flags, data);
             // Perform the mount operation.
             res = vfs->mount(srcbuf, tgtbuf, fstbuf, flags, data);
             delete[] srcbuf;
@@ -2394,7 +2404,7 @@ namespace NFS {
                 SYSCALL_RET(-EINVAL);
             }
 
-            // Normalize paths.
+            // Normalise paths.
             Path newrootpath = Path(newrootbuf);
             const char *newrootnorm = newrootpath.construct();
             if (!newrootnorm) {
@@ -2560,7 +2570,7 @@ namespace NFS {
                 SYSCALL_RET(-ENOMEM);
             }
 
-            // Initialize to NULL for safe cleanup.
+            // Initialise to NULL for safe cleanup.
             for (size_t i = 0; i < mountcount; i++) {
                 newpaths[i] = NULL;
             }

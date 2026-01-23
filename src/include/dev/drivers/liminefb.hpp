@@ -39,7 +39,7 @@ namespace NDev {
         uint32_t sync;
         uint32_t vmode;
         uint32_t rotate;
-        uint32_t colorspace;
+        uint32_t colourspace;
         uint32_t reserved[4];
     };
 

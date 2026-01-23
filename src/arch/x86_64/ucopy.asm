@@ -5,23 +5,21 @@ global __ucopyto
 global __ustrlen
 global __umemset
 
+; XXX: Use rep instructions for better performance.
+
 ; Fault tolerant copy from user space to kernel space.
 __ucopyfrom:
     test rdx, rdx ; Check for zero size.
     jz .copydone
-    mov rcx, rdx
-.copyloop:
+
+    ; Set up for rep movsb.
+    mov rcx, rdx ; size (count for rep).
+    ; rsi and rdi are already set up as source and destination.
 .Lfromfault: ; Point where a fault can occur.
-    mov al, [rsi]
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    dec rcx
-    jnz .copyloop
+    rep movsb
 .copydone:
     xor rax, rax ; Return 0. Success!
     ret
-
 .fromhandler: ; Fault handler jumps here on fault.
     mov rax, -14 ; -EFAULT
     ret
@@ -30,15 +28,10 @@ __ucopyfrom:
 __ucopyto:
     test rdx, rdx ; Check for zero size.
     jz .copydone2
-    mov rcx, rdx
-.copyloop2:
-    mov al, [rsi]
+    mov rcx, rdx ; size (count for rep).
+    ; rsi and rdi are already set up as source and destination.
 .Ltofault: ; Point where a fault can occur.
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    dec rcx
-    jnz .copyloop2
+    rep movsb
 .copydone2:
     xor rax, rax ; Return 0. Success!
     ret
@@ -73,13 +66,13 @@ __ustrlen:
 __umemset:
     test rdx, rdx ; Check for zero size.
     jz .memsetdone
-    mov rcx, rdx
-.memsetloop:
+
+    ; Set up for rep stosb.
+    mov rcx, rdx ; size (count for rep).
+    ; rdi is already set up for destination.
+    mov al, sil ; byte to set is in sil.
 .Lmemsetfault: ; Point where a fault can occur.
-    mov [rdi], sil
-    inc rdi
-    dec rcx
-    jnz .memsetloop
+    rep stosb
 .memsetdone:
     xor rax, rax ; Return 0. Success!
     ret

@@ -59,7 +59,7 @@ namespace NMem {
             }
 
             for (size_t i = 0; i < pagesneeded; i++) {
-                NArch::VMM::_mappage(&NArch::VMM::kspace, (uintptr_t)virt + (i * NArch::PAGESIZE), (uintptr_t)pages[i], NArch::VMM::WRITEABLE | NArch::VMM::PRESENT);
+                NArch::VMM::_mappage(&NArch::VMM::kspace, (uintptr_t)virt + (i * NArch::PAGESIZE), (uintptr_t)pages[i], NArch::VMM::WRITEABLE | NArch::VMM::PRESENT, false);
             }
 
             // Zero the allocated region.
@@ -76,19 +76,27 @@ namespace NMem {
 
             size_t pagesneeded = NLib::alignup(size, NArch::PAGESIZE) / NArch::PAGESIZE;
 
-            NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
+            uintptr_t shootdownstart = (uintptr_t)ptr;
+            uintptr_t shootdownend = shootdownstart + (pagesneeded * NArch::PAGESIZE);
 
-            // Freeing is easy as we just unmap and free each page individually.
-            for (size_t i = 0; i < pagesneeded; i++) {
-                uintptr_t virtaddr = (uintptr_t)ptr + (i * NArch::PAGESIZE);
-                uintptr_t physaddr = NArch::VMM::virt2phys(&NArch::VMM::kspace, virtaddr);
-                if (physaddr) {
-                    NArch::VMM::_unmappage(&NArch::VMM::kspace, virtaddr);
-                    NArch::PMM::free((void *)physaddr, NArch::PAGESIZE);
+            {
+                NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
+
+                // Freeing is easy as we just unmap and free each page individually.
+                for (size_t i = 0; i < pagesneeded; i++) {
+                    uintptr_t virtaddr = (uintptr_t)ptr + (i * NArch::PAGESIZE);
+                    uintptr_t physaddr = NArch::VMM::virt2phys(&NArch::VMM::kspace, virtaddr);
+                    if (physaddr) {
+                        NArch::VMM::_unmappage(&NArch::VMM::kspace, virtaddr, false);
+                        NArch::PMM::free((void *)physaddr, NArch::PAGESIZE);
+                    }
                 }
+
+                NArch::VMM::kspace.vmaspace->free(ptr, (uintptr_t)ptr + pagesneeded * NArch::PAGESIZE);
             }
 
-            NArch::VMM::kspace.vmaspace->free(ptr, (uintptr_t)ptr + pagesneeded * NArch::PAGESIZE);
+            // Perform TLB shootdown after releasing the lock.
+            NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_RANGE, shootdownstart, shootdownend);
         }
 
         static uint64_t vmatovmm(uint8_t vmaflags) {
@@ -99,20 +107,24 @@ namespace NMem {
         }
 
         void mapintospace(struct NArch::VMM::addrspace *space, uintptr_t virt, uintptr_t newvirt, size_t size, uint8_t vmaflags) {
-            NLib::ScopeIRQSpinlock kguard(&NArch::VMM::kspace.lock);
-            NLib::ScopeIRQSpinlock uguard(&space->lock);
-
-            // Map a vmalloc region into a specific address space.
             size_t pagesneeded = NLib::alignup(size, NArch::PAGESIZE) / NArch::PAGESIZE;
-            for (size_t i = 0; i < pagesneeded; i++) {
-                uintptr_t vmallocvirt = virt + (i * NArch::PAGESIZE);
-                uintptr_t physaddr = NArch::VMM::_virt2phys(&NArch::VMM::kspace, vmallocvirt);
-                if (physaddr) {
-                    NArch::VMM::_mappage(space, newvirt + (i * NArch::PAGESIZE), physaddr, vmatovmm(vmaflags) | NArch::VMM::PRESENT);
+            {
+                NLib::ScopeIRQSpinlock kguard(&NArch::VMM::kspace.lock);
+                NLib::ScopeIRQSpinlock uguard(&space->lock);
+
+                // Map a vmalloc region into a specific address space.
+                for (size_t i = 0; i < pagesneeded; i++) {
+                    uintptr_t vmallocvirt = virt + (i * NArch::PAGESIZE);
+                    uintptr_t physaddr = NArch::VMM::_virt2phys(&NArch::VMM::kspace, vmallocvirt);
+                    if (physaddr) {
+                        NArch::VMM::_mappage(space, newvirt + (i * NArch::PAGESIZE), physaddr, vmatovmm(vmaflags) | NArch::VMM::PRESENT, false);
+                    }
                 }
+                // Map into VMA space as well.
+                space->vmaspace->reserve(newvirt, newvirt + pagesneeded * NArch::PAGESIZE, vmaflags);
             }
-            // Map into VMA space as well.
-            space->vmaspace->reserve(newvirt, newvirt + pagesneeded * NArch::PAGESIZE, vmaflags);
+            // Shootdown for the mapped region.
+            NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_RANGE, newvirt, newvirt + pagesneeded * NArch::PAGESIZE);
         }
     }
 }

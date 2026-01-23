@@ -37,9 +37,19 @@ namespace NDev {
 
                 size_t totalwritten = 0;
                 const char *cbuf = (const char *)buf;
+
+                char kbuf[256];
                 while (totalwritten < count) {
-                    NArch::E9::puts(&cbuf[totalwritten]);
-                    totalwritten++;
+                    size_t chunk = (count - totalwritten > sizeof(kbuf)) ? sizeof(kbuf) : (count - totalwritten);
+                    ssize_t ret = NMem::UserCopy::copyfrom(&kbuf, &cbuf[totalwritten], chunk);
+                    if (ret < 0) {
+                        return ret;
+                    }
+
+                    for (size_t i = 0; i < chunk; i++) {
+                        NArch::E9::puts(&kbuf[i]);
+                    }
+                    totalwritten += chunk;
                 }
                 return (ssize_t)totalwritten;
             }

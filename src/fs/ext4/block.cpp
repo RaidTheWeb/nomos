@@ -41,9 +41,9 @@ namespace NFS {
                             this->setblockbitmappadding(bitmap);
 
                             res = this->writeblock(bitmapblk, bitmap);
-                            delete[] bitmap;
 
                             if (res < 0) {
+                                delete[] bitmap;
                                 return 0;
                             }
 
@@ -51,6 +51,15 @@ namespace NFS {
                             // Let group descriptor know we have one less free block.
                             gd->freeblkcountlo = freeblks & 0xFFFF;
                             gd->freeblkcounthi = (freeblks >> 16) & 0xFFFF;
+
+                            // Update block bitmap checksum in group descriptor if checksums are enabled.
+                            if (this->haschecksums) {
+                                uint32_t bitmapchecksum = this->blockbitmapchecksum(group, bitmap);
+                                gd->blockbitmapcsumlo = bitmapchecksum & 0xFFFF;
+                                gd->blockbitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
+                            }
+
+                            delete[] bitmap;
                             this->writegroupdesc(group);
 
                             uint64_t sbfree = ((uint64_t)this->sb.freeblkcnthi << 32) | this->sb.freeblkcntlo;
@@ -159,9 +168,9 @@ namespace NFS {
                 this->setblockbitmappadding(bitmap);
 
                 res = this->writeblock(bitmapblk, bitmap);
-                delete[] bitmap;
 
                 if (res < 0) {
+                    delete[] bitmap;
                     *allocated = 0;
                     return 0;
                 }
@@ -170,6 +179,15 @@ namespace NFS {
                 freeblks -= bestlen;
                 gd->freeblkcountlo = freeblks & 0xFFFF;
                 gd->freeblkcounthi = (freeblks >> 16) & 0xFFFF;
+
+                // Update block bitmap checksum in group descriptor if checksums are enabled.
+                if (this->haschecksums) {
+                    uint32_t bitmapchecksum = this->blockbitmapchecksum(group, bitmap);
+                    gd->blockbitmapcsumlo = bitmapchecksum & 0xFFFF;
+                    gd->blockbitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
+                }
+
+                delete[] bitmap;
                 this->writegroupdesc(group);
 
                 // Update superblock free count.
@@ -228,9 +246,9 @@ namespace NFS {
             this->setblockbitmappadding(bitmap);
 
             res = this->writeblock(bitmapblk, bitmap);
-            delete[] bitmap;
 
             if (res < 0) {
+                delete[] bitmap;
                 return res;
             }
 
@@ -239,6 +257,15 @@ namespace NFS {
             freeblks++;
             gd->freeblkcountlo = freeblks & 0xFFFF;
             gd->freeblkcounthi = (freeblks >> 16) & 0xFFFF;
+
+            // Update block bitmap checksum in group descriptor if checksums are enabled.
+            if (this->haschecksums) {
+                uint32_t bitmapchecksum = this->blockbitmapchecksum(group, bitmap);
+                gd->blockbitmapcsumlo = bitmapchecksum & 0xFFFF;
+                gd->blockbitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
+            }
+
+            delete[] bitmap;
             this->writegroupdesc(group);
 
             // Update superblock free count.
@@ -556,7 +583,7 @@ namespace NFS {
                     struct extent *extents = (struct extent *)(node + sizeof(struct extenthdr));
                     for (uint16_t i = 0; i < hdr->entries; i++) {
                         uint32_t startblk = extents[i].fileblk;
-                        uint16_t len = extents[i].len & 0x7FFF; // Mask out uninitialized flag.
+                        uint16_t len = extents[i].len & 0x7FFF; // Mask out uninitialised flag.
                         if (logicalblk >= startblk && logicalblk < startblk + len) {
 
                             uint64_t physblk = ((uint64_t)extents[i].starthi << 32) | extents[i].startlo;
@@ -650,7 +677,7 @@ namespace NFS {
                     struct extent *extents = (struct extent *)(node + sizeof(struct extenthdr));
                     for (uint16_t i = 0; i < hdr->entries; i++) {
                         uint32_t startblk = extents[i].fileblk;
-                        uint16_t len = extents[i].len & 0x7FFF; // Mask out uninitialized flag.
+                        uint16_t len = extents[i].len & 0x7FFF; // Mask out uninitialised flag.
                         if (logicalblk >= startblk && logicalblk < startblk + len) {
                             uint64_t offset = logicalblk - startblk;
                             uint64_t extphysstart = ((uint64_t)extents[i].starthi << 32) | extents[i].startlo;

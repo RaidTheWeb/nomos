@@ -357,6 +357,8 @@ flagbreak:
         }
 
         NArch::E9::puts(buffer);
+#else
+        assert(false, "vprintf not implemented on this architecture.");
 #endif
 
         printlock.release();

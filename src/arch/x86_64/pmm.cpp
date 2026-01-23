@@ -513,7 +513,7 @@ done:
             assert(meta, "Failed to allocate bitmap page metadata.\n");
             meta = (PageMeta *)hhdmoff(meta);
 
-            // Zero metadata using optimized fastzero
+            // Zero metadata using optimised fastzero.
             NLib::fastzero(meta, metasize);
 
             // Now acquire the lock to update the zone data structures.

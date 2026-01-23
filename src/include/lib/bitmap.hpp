@@ -57,7 +57,7 @@ namespace NLib {
 
                     // Clear full words.
                     if (oldfullsize < newfullsize) {
-                        NLib::memset((void *)((uintptr_t)this->data + oldfullsize), 0, sizeof(uint64_t) * (newfullsize - oldfullsize));
+                        NLib::memset((void *)(this->data + oldfullsize), 0, sizeof(uint64_t) * (newfullsize - oldfullsize));
                     }
                 }
 
@@ -106,7 +106,8 @@ namespace NLib {
                 for (size_t word = 0; word < wordcount; word++) {
                     uint64_t val = this->data[word];
                     if (val != ~0ull) {
-                        const size_t maxbit = (word == wordcount - 1) ? this->size % BITSPERWORD : BITSPERWORD;
+                        size_t remainder = this->size % BITSPERWORD;
+                        const size_t maxbit = (word == wordcount - 1 && remainder != 0) ? remainder : BITSPERWORD;
 
                         for (size_t bit = 0; bit < maxbit; bit++) {
                             if (!(val & (1ull << bit))) {

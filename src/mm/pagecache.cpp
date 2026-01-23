@@ -109,18 +109,6 @@ namespace NMem {
         return NArch::hhdmoff((void *)this->physaddr);
     }
 
-    void CachePage::ref(void) {
-        if (this->pagemeta) {
-            this->pagemeta->ref();
-        }
-    }
-
-    void CachePage::unref(void) {
-        if (this->pagemeta) {
-            this->pagemeta->unref();
-        }
-    }
-
     void CachePage::addmapping(NArch::VMM::addrspace *space, uintptr_t virtaddr) {
         // Allocate a new mapping entry.
         vmamapping *mapping = new vmamapping(space, virtaddr);
@@ -173,9 +161,9 @@ namespace NMem {
         while (m) {
             vmamapping *next = m->next;
 
-            // Unmap from the address space.
+            // Unmap from the address space (defer shootdown until all locks are released).
             m->space->lock.acquire();
-            NArch::VMM::_unmappage(m->space, m->virtaddr);
+            NArch::VMM::_unmappage(m->space, m->virtaddr, false);
             m->space->lock.release();
 
             // Decrement the page's reference count (process no longer has it mapped).
@@ -299,9 +287,8 @@ namespace NMem {
         return 0;
     }
 
-    CachePage *RadixTree::lookup(off_t index) {
-        NLib::ScopeIRQSpinlock guard(&this->treelock);
-
+    CachePage *RadixTree::lookupinternal(off_t index) {
+        // Internal lookup without lock, caller must hold treelock.
         if (!this->root) {
             return NULL;
         }
@@ -326,6 +313,39 @@ namespace NMem {
 
         size_t slot = index & RADIXTREEMASK;
         return (CachePage *)node->slots[slot];
+    }
+
+    CachePage *RadixTree::lookup(off_t index) {
+        NLib::ScopeIRQSpinlock guard(&this->treelock);
+        return lookupinternal(index);
+    }
+
+    CachePage *RadixTree::lookupandlock(off_t index) {
+        this->treelock.acquire();
+
+        CachePage *page = lookupinternal(index);
+        if (!page) {
+            this->treelock.release();
+            return NULL;
+        }
+
+        // Take a reference on the page's pagemeta before releasing treelock.
+        // This prevents eviction from freeing the page while we try to lock it.
+        if (page->pagemeta) {
+            page->pagemeta->ref();
+        }
+
+        this->treelock.release();
+
+        // Now lock the page. We hold a ref so it won't be freed.
+        page->pagelock();
+
+        // Release the ref we took (pagelock now protects us).
+        if (page->pagemeta) {
+            page->pagemeta->unref();
+        }
+
+        return page;
     }
 
     CachePage *RadixTree::remove(off_t index) {
@@ -525,7 +545,9 @@ namespace NMem {
                 // Apply filter if provided.
                 if (!filter || filter(page, ctx)) {
                     // Take a reference before returning.
-                    page->ref();
+                    if (page->pagemeta) {
+                        page->pagemeta->ref();
+                    }
                     out[collected++] = page;
 
                     if (collected >= maxcount) {
@@ -559,7 +581,7 @@ namespace NMem {
         this->targetfreepages = targetfree;
 
 
-        NUtil::printf("[mm/pagecache]: Page cache initialized with max %lu pages.\n", maxpages);
+        NUtil::printf("[mm/pagecache]: Page cache initialised with max %lu pages.\n", maxpages);
     }
 
     void PageCache::shutdown(void) {
@@ -743,9 +765,8 @@ namespace NMem {
         if (page->pagemeta) {
             page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
             page->pagemeta->cacheentry = NULL;
-        }
-        if (page->physaddr) {
-            NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+            page->pagemeta->unref();  // Release initial cache ref.
+            page->pagemeta->unref();  // Release ref taken by shrink() before calling evictpage.
         }
 
         // Release reference to inode or blockdev to allow them to be freed.
@@ -812,18 +833,17 @@ namespace NMem {
         // Look up in inode's page cache.
         RadixTree *cache = inode->getpagecache();
         if (!cache) {
-            this->cachemisses++;
+            this->incmisses();
             return NULL;
         }
 
-        CachePage *page = cache->lookup(index);
+        CachePage *page = cache->lookupandlock(index);
         if (page) {
-            this->cachehits++;
-            page->pagelock();
+            this->inchits();
             return page;
         }
 
-        this->cachemisses++;
+        this->incmisses();
         return NULL;
     }
 
@@ -839,7 +859,7 @@ namespace NMem {
             return page;
         }
 
-        this->cachemisses++;
+        this->incmisses();
         return NULL;
     }
 
@@ -848,16 +868,27 @@ namespace NMem {
             return -EINVAL;
         }
 
-        NLib::ScopeIRQSpinlock guard(&this->cachelock);
+        {
+            NLib::ScopeIRQSpinlock guard(&this->cachelock);
 
-        addtoactive(page);
-        this->totalpages++;
+            addtoactive(page);
+            this->totalpages++;
+        }
 
         // Check if we need to evict.
         if (this->maxpages > 0 && this->totalpages > this->maxpages) {
-            // Trigger async reclaim rather than blocking.
-            // For now, just warn.
-            // TODO: Wake up reclaim thread.
+            // Calculate how many pages we need to evict to get back to targetfreepages below max.
+            size_t target = this->targetfreepages > 0 ? this->targetfreepages : 16;
+            size_t current = this->totalpages;
+            size_t limit = this->maxpages;
+
+            if (current > limit) {
+                size_t toevict = current - limit + target;
+                shrink(toevict);
+            }
+
+            // Also wake writeback thread to help flush dirty pages.
+            wakewriteback();
         }
 
         return 0;
@@ -876,125 +907,6 @@ namespace NMem {
         if (page->testflag(PAGE_DIRTY)) {
             this->dirtypages--;
         }
-    }
-
-    ssize_t PageCache::read(NFS::VFS::INode *inode, void *buf, size_t count, off_t offset) {
-        if (!inode || !buf || count == 0) {
-            return -EINVAL;
-        }
-
-        ssize_t totalread = 0;
-        uint8_t *dest = (uint8_t *)buf;
-
-        while (count > 0) {
-            off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
-            size_t offwithinpage = offset % NArch::PAGESIZE;
-            size_t toread = NArch::PAGESIZE - offwithinpage;
-            if (toread > count) {
-                toread = count;
-            }
-
-            // Find or create the page.
-            CachePage *page = findorcreate(inode, offset);
-            if (!page) {
-                if (totalread > 0) {
-                    return totalread;
-                }
-                return -ENOMEM;
-            }
-
-            // If page is not up to date, read from backing store.
-            if (!page->testflag(PAGE_UPTODATE)) {
-                // Read from inode.
-                ssize_t readresult = inode->read(page->data(), NArch::PAGESIZE, pageoffset, 0);
-                if (readresult < 0) {
-                    page->pageunlock();
-                    if (totalread > 0) {
-                        return totalread;
-                    }
-                    return readresult;
-                }
-                // Zero rest of page if partial read.
-                if ((size_t)readresult < NArch::PAGESIZE) {
-                    NLib::memset((uint8_t *)page->data() + readresult, 0, NArch::PAGESIZE - readresult);
-                }
-                page->setflag(PAGE_UPTODATE);
-            }
-
-            // Copy data to user buffer.
-            NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
-
-            page->setflag(PAGE_REFERENCED);
-            page->pageunlock();
-
-            dest += toread;
-            offset += toread;
-            count -= toread;
-            totalread += toread;
-        }
-
-        return totalread;
-    }
-
-    ssize_t PageCache::write(NFS::VFS::INode *inode, const void *buf, size_t count, off_t offset) {
-        if (!inode || !buf || count == 0) {
-            return -EINVAL;
-        }
-
-        ssize_t totalwritten = 0;
-        const uint8_t *src = (const uint8_t *)buf;
-
-        while (count > 0) {
-            off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
-            size_t offwithinpage = offset % NArch::PAGESIZE;
-            size_t towrite = NArch::PAGESIZE - offwithinpage;
-            if (towrite > count) {
-                towrite = count;
-            }
-
-            // Find or create the page.
-            CachePage *page = findorcreate(inode, offset);
-            if (!page) {
-                if (totalwritten > 0) {
-                    return totalwritten;
-                }
-                return -ENOMEM;
-            }
-
-            // If partial page write and page not uptodate, need to read first.
-            if (!page->testflag(PAGE_UPTODATE) && (offwithinpage != 0 || towrite < NArch::PAGESIZE)) {
-                ssize_t readresult = inode->read(page->data(), NArch::PAGESIZE, pageoffset, 0);
-                if (readresult < 0 && readresult != -ENOENT) {
-                    page->pageunlock();
-                    if (totalwritten > 0) {
-                        return totalwritten;
-                    }
-                    return readresult;
-                }
-                if (readresult >= 0) {
-                    if ((size_t)readresult < NArch::PAGESIZE) {
-                        NLib::memset((uint8_t *)page->data() + readresult, 0, NArch::PAGESIZE - readresult);
-                    }
-                } else {
-                    // New page, zero it.
-                    NLib::memset(page->data(), 0, NArch::PAGESIZE);
-                }
-            }
-
-            // Copy data from user buffer.
-            NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
-
-            page->setflag(PAGE_UPTODATE);
-            page->markdirty();
-            page->pageunlock();
-
-            src += towrite;
-            offset += towrite;
-            count -= towrite;
-            totalwritten += towrite;
-        }
-
-        return totalwritten;
     }
 
     int PageCache::syncnode(NFS::VFS::INode *inode) {
@@ -1024,7 +936,9 @@ namespace NMem {
                 while (page && count < MAXBATCH) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                        page->ref();
+                        if (page->pagemeta) {
+                            page->pagemeta->ref();
+                        }
                         batch[count++] = page;
                     }
                     page = next;
@@ -1043,7 +957,9 @@ namespace NMem {
                     }
                     page->pageunlock();
                 }
-                page->unref();
+                if (page->pagemeta) {
+                    page->pagemeta->unref();
+                }
             }
         } while (count >= MAXBATCH);
 
@@ -1057,7 +973,9 @@ namespace NMem {
                 while (page && count < MAXBATCH) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                        page->ref();
+                        if (page->pagemeta) {
+                            page->pagemeta->ref();
+                        }
                         batch[count++] = page;
                     }
                     page = next;
@@ -1076,7 +994,9 @@ namespace NMem {
                     }
                     page->pageunlock();
                 }
-                page->unref();
+                if (page->pagemeta) {
+                    page->pagemeta->unref();
+                }
             }
         } while (count >= MAXBATCH);
 
@@ -1088,6 +1008,7 @@ namespace NMem {
 
         while (this->isrunning()) {
             // Wait for either timeout or explicit wakeup.
+            // XXX: Doesn't actively wake on explicit wakeup yet.
             NSched::sleep(WRITEBACKINTERVALMS);
 
             if (!this->isrunning()) {
@@ -1110,7 +1031,9 @@ namespace NMem {
                 while (page && count < BATCHSIZE && written + count < MAXWRITEBACKPERCYCLE) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                        page->ref();
+                        if (page->pagemeta) {
+                            page->pagemeta->ref();
+                        }
                         batch[count++] = page;
                     }
                     page = next;
@@ -1127,7 +1050,9 @@ namespace NMem {
                     }
                     page->pageunlock();
                 }
-                page->unref();
+                if (page->pagemeta) {
+                    page->pagemeta->unref();
+                }
             }
 
             // Collect from inactive list if we haven't hit the limit.
@@ -1140,7 +1065,9 @@ namespace NMem {
                     while (page && count < BATCHSIZE && written + count < MAXWRITEBACKPERCYCLE) {
                         CachePage *next = page->lrunext;
                         if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
-                            page->ref();
+                            if (page->pagemeta) {
+                                page->pagemeta->ref();
+                            }
                             batch[count++] = page;
                         }
                         page = next;
@@ -1157,7 +1084,9 @@ namespace NMem {
                         }
                         page->pageunlock();
                     }
-                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                 }
             }
 
@@ -1216,7 +1145,9 @@ namespace NMem {
                     if (!victim) {
                         break;
                     }
-                    victim->ref();
+                    if (victim->pagemeta) {
+                        victim->pagemeta->ref();
+                    }
                     batch[collected++] = victim;
                 }
             }
@@ -1236,11 +1167,15 @@ namespace NMem {
                     } else {
                         // Eviction failed, page still valid.
                         page->pageunlock();
-                        page->unref();
+                        if (page->pagemeta) {
+                            page->pagemeta->unref();
+                        }
                     }
                 } else {
                     // Couldn't lock page, skip it.
-                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                 }
             }
         }
@@ -1275,13 +1210,11 @@ namespace NMem {
             return 0; // No cache, nothing to invalidate.
         }
 
-        CachePage *page = cache->lookup(index);
+        // Use lookupandlock to atomically look up and lock, preventing race with eviction.
+        CachePage *page = cache->lookupandlock(index);
         if (!page) {
             return 0; // Page not cached.
         }
-
-        // Lock the page.
-        page->pagelock();
 
         // If dirty, write it back first (we don't want to lose data).
         if (page->testflag(PAGE_DIRTY)) {
@@ -1407,8 +1340,7 @@ namespace NMem {
     void initpagecache(void) {
         pagecache = new PageCache();
         if (pagecache) {
-            //pagecache->init(16384, 256); // 16k pages, but TRY to keep at least 256 free.
-            pagecache->init(__SIZE_MAX__, 0); // Unlimited pages. XXX: Figure out how to actually manage this. Right now, it'll just keep claiming until OOM (and that's the only time we'll ever reclaim).
+            pagecache->init(16384, 256); // XXX: Set based on total system memory?
         }
     }
 

@@ -3,6 +3,7 @@
 #include <fs/ext4/ext4fs.hpp>
 #include <lib/string.hpp>
 #include <mm/slab.hpp>
+#include <mm/ucopy.hpp>
 #include <std/stdatomic.h>
 #include <stddef.h>
 #include <sys/clock.hpp>
@@ -35,6 +36,62 @@ namespace NFS {
                 case FT_SOCK: return VFS::S_IFSOCK;
                 case FT_SYMLINK: return VFS::S_IFLNK;
                 default: return 0;
+            }
+        }
+
+        // Validate a directory entry for correctness.
+        static bool checkdirentry(struct direntry2 *de, size_t blockoff, uint32_t blksize, uint64_t dirsize, uint64_t diroff) {
+            // Minimum rec_len is 8 bytes (inode + reclen + namelen + filetype).
+            constexpr size_t minreclen = sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t);
+
+            // rec_len must be non-zero.
+            if (de->reclen < minreclen) {
+                return false;
+            }
+
+            // rec_len must be 4-byte aligned.
+            if (de->reclen & 3) {
+                return false;
+            }
+
+            // rec_len must not extend past the end of the block.
+            if (blockoff + de->reclen > blksize) {
+                return false;
+            }
+
+            // rec_len must not extend past the end of the directory.
+            if (diroff + blockoff + de->reclen > dirsize) {
+                return false;
+            }
+
+            // If the entry is active (inode != 0), name_len must fit within rec_len.
+            if (de->inode != 0) {
+                size_t minsize = minreclen + de->namelen;
+                // rec_len must be large enough to hold the name.
+                if (de->reclen < minsize) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // Update i_blocks in inode structure with proper HUGE_FILE handling.
+        static void updateiblocks(struct inode *ino, uint64_t blocks, uint32_t blksize, bool hugefile) {
+            uint64_t sectors = blocks * (blksize / 512);
+
+            // Check if we need to use HUGE_FILE mode.
+            // HUGE_FILE mode is required if sectors exceeds 32 bits.
+            if (hugefile && (sectors > 0xFFFFFFFFULL || (ino->flags & EXT4_HUGEFILEFL))) {
+                // Use filesystem block units with HUGE_FILE flag.
+                ino->blockslo = blocks & 0xFFFFFFFF;
+                ino->blkshi = (blocks >> 32) & 0xFFFF;
+                ino->flags |= EXT4_HUGEFILEFL;
+            } else {
+                // Use 512-byte sector units (standard mode).
+                ino->blockslo = sectors & 0xFFFFFFFF;
+                ino->blkshi = (sectors >> 32) & 0xFFFF;
+                ino->flags &= ~EXT4_HUGEFILEFL;
             }
         }
 
@@ -187,6 +244,7 @@ namespace NFS {
             uint8_t *blkbuf = new uint8_t[blksize];
             size_t bytesread = 0;
 
+            // XXX: Errors lose partial read data.
             while (bytesread < count) { // Read block-wise.
                 uint64_t logicalblk = (offset + bytesread) / blksize;
                 size_t blkoff = (offset + bytesread) % blksize;
@@ -201,15 +259,23 @@ namespace NFS {
                 if (physblk == 0) { // Unallocated block (hole).
                     this->metalock.acquire();
                     // Fill holes with zeroes.
-                    NLib::memset((uint8_t *)buf + bytesread, 0, toread);
+                    ssize_t ret = NMem::UserCopy::memset((uint8_t *)buf + bytesread, 0, toread);
+                    if (ret < 0) {
+                        delete[] blkbuf;
+                        return bytesread > 0 ? bytesread : ret; // Either return bytes read so far, or error.
+                    }
                 } else { // Actual data!!! Read it and shove it into the user buffer.
                     ssize_t res = this->ext4fs->readblock(physblk, blkbuf); // Device-level read in terms of ext4 blocks.
                     this->metalock.acquire();
                     if (res < 0) {
                         delete[] blkbuf;
-                        return res;
+                        return bytesread > 0 ? bytesread : res; // Either return bytes read so far, or error.
                     }
-                    NLib::memcpy((uint8_t *)buf + bytesread, blkbuf + blkoff, toread);
+                    ssize_t ret = NMem::UserCopy::copyto((uint8_t *)buf + bytesread, blkbuf + blkoff, toread);
+                    if (ret < 0) {
+                        delete[] blkbuf;
+                        return bytesread > 0 ? bytesread : ret; // Either return bytes read so far, or error.
+                    }
                 }
 
                 bytesread += toread;
@@ -239,12 +305,19 @@ namespace NFS {
                     return byteswritten;
                 }
                 struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + byteswritten);
-                dentry->d_ino = this->attr.st_ino;
-                dentry->d_off = byteswritten + reclen;
-                dentry->d_reclen = (uint16_t)reclen;
-                dentry->d_type = VFS::S_IFDIR >> 12;
-                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                dentry->d_name[0] = '.';
+                struct VFS::dirent kdentry;
+
+                kdentry.d_ino = this->attr.st_ino;
+                kdentry.d_off = byteswritten + reclen;
+                kdentry.d_reclen = (uint16_t)reclen;
+                kdentry.d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                kdentry.d_name[0] = '.';
+
+                ssize_t ret = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                if (ret < 0) {
+                    return byteswritten > 0 ? byteswritten : ret;
+                }
                 byteswritten += reclen;
             }
             curroffset += reclen;
@@ -255,6 +328,7 @@ namespace NFS {
                     return byteswritten;
                 }
                 struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + byteswritten);
+                struct VFS::dirent kdentry;
 
                 // Determine parent inode without holding lock to avoid deadlock.
                 // Release lock temporarily to call getroot() and getattr() safely.
@@ -273,13 +347,18 @@ namespace NFS {
                     root->unref();
                 }
 
-                dentry->d_ino = parent_ino;
-                dentry->d_off = byteswritten + reclen;
-                dentry->d_reclen = (uint16_t)reclen;
-                dentry->d_type = VFS::S_IFDIR >> 12;
-                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                dentry->d_name[0] = '.';
-                dentry->d_name[1] = '.';
+                kdentry.d_ino = parent_ino;
+                kdentry.d_off = byteswritten + reclen;
+                kdentry.d_reclen = (uint16_t)reclen;
+                kdentry.d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                kdentry.d_name[0] = '.';
+                kdentry.d_name[1] = '.';
+
+                ssize_t ret = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                if (ret < 0) {
+                    return byteswritten > 0 ? byteswritten : ret;
+                }
                 byteswritten += reclen;
             }
             curroffset += reclen;
@@ -315,8 +394,9 @@ namespace NFS {
                 while (blockoff < blksize && diroff + blockoff < dirsize) {
                     struct direntry2 *de = (struct direntry2 *)(blkbuf + blockoff);
 
-                    if (de->reclen == 0) {
-                        break; // Invalid entry.
+                    // Validate directory entry before using it.
+                    if (!checkdirentry(de, blockoff, blksize, dirsize, diroff)) {
+                        break; // Corrupt entry, stop parsing this block.
                     }
 
                     // Stop if we hit the directory tail (checksum entry).
@@ -337,16 +417,24 @@ namespace NFS {
                                 }
 
                                 struct VFS::dirent *vfsde = (struct VFS::dirent *)((uint8_t *)buf + byteswritten);
-                                vfsde->d_ino = de->inode;
-                                vfsde->d_off = byteswritten + reclen;
-                                vfsde->d_reclen = (uint16_t)reclen;
-                                vfsde->d_type = dttomode(de->filetype) >> 12;
-                                NLib::memset(vfsde->d_name, 0, sizeof(vfsde->d_name));
+                                struct VFS::dirent kdentry;
+
+                                kdentry.d_ino = de->inode;
+                                kdentry.d_off = byteswritten + reclen;
+                                kdentry.d_reclen = (uint16_t)reclen;
+                                kdentry.d_type = dttomode(de->filetype) >> 12;
+                                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
                                 size_t namelen = de->namelen;
-                                if (namelen > sizeof(vfsde->d_name) - 1) {
-                                    namelen = sizeof(vfsde->d_name) - 1;
+                                if (namelen > sizeof(kdentry.d_name) - 1) {
+                                    namelen = sizeof(kdentry.d_name) - 1;
                                 }
-                                NLib::memcpy(vfsde->d_name, de->name, namelen);
+                                NLib::memcpy(kdentry.d_name, de->name, namelen);
+
+                                ssize_t ret = NMem::UserCopy::copyto(vfsde, &kdentry, sizeof(struct VFS::dirent));
+                                if (ret < 0) {
+                                    delete[] blkbuf;
+                                    return byteswritten > 0 ? byteswritten : ret;
+                                }
 
                                 byteswritten += reclen;
                             }
@@ -378,7 +466,14 @@ namespace NFS {
                 if (tocopy > bufsiz) {
                     tocopy = bufsiz;
                 }
-                NLib::memcpy(buf, this->diskino.block, tocopy); // We can read shorter symlinks right out of the block array.
+                if (NMem::UserCopy::iskernel(buf, tocopy)) {
+                    NLib::memcpy(buf, this->diskino.block, tocopy);
+                } else {
+                    ssize_t ret = NMem::UserCopy::copyto(buf, this->diskino.block, tocopy); // We can read shorter symlinks right out of the block array.
+                    if (ret < 0) {
+                        return ret;
+                    }
+                }
                 return tocopy;
             }
 
@@ -442,8 +537,9 @@ namespace NFS {
                 while (blockoff < blksize && diroff + blockoff < dirsize) {
                     struct direntry2 *de = (struct direntry2 *)(blkbuf + blockoff);
 
-                    if (de->reclen == 0) {
-                        break;
+                    // Validate directory entry before using it.
+                    if (!checkdirentry(de, blockoff, blksize, dirsize, diroff)) {
+                        break; // Corrupt entry, stop parsing this block.
                     }
 
                     // Stop if we hit the directory tail (checksum entry).
@@ -584,7 +680,10 @@ namespace NFS {
 
                 // Clear the block array and copy target.
                 NLib::memset(this->diskino.block, 0, sizeof(this->diskino.block));
-                NLib::memcpy(this->diskino.block, (void *)target, len);
+                ssize_t ret = NMem::UserCopy::copyfrom(this->diskino.block, (void *)target, len);
+                if (ret < 0) {
+                    return ret;
+                }
 
                 // Set size.
                 this->diskino.sizelo = len;
@@ -1136,12 +1235,10 @@ namespace NFS {
                     this->diskino.sizelo = writtenend & 0xFFFFFFFF;
                     this->diskino.sizethi = (writtenend >> 32) & 0xFFFFFFFF;
 
-                    // Update block count.
+                    // Update block count with proper HUGE_FILE handling.
                     uint64_t newblocks = (writtenend + blksize - 1) / blksize;
-                    newblocks = newblocks * (blksize / 512); // Convert to 512-byte sectors.
-                    this->diskino.blockslo = newblocks & 0xFFFFFFFF;
-                    this->diskino.blkshi = (newblocks >> 32) & 0xFFFF;
-                    this->attr.st_blocks = newblocks;
+                    updateiblocks(&this->diskino, newblocks, blksize, this->ext4fs->hugefile());
+                    this->attr.st_blocks = newblocks * (blksize / 512);
                 }
 
                 // Write through page cache.
@@ -1225,7 +1322,30 @@ namespace NFS {
                 }
 
                 // Copy data into the block buffer.
-                NLib::memcpy(blkbuf + blkoff, (void *)((const uint8_t *)buf + byteswritten), towrite);
+                if (NMem::UserCopy::iskernel(buf, count)) {
+                    NLib::memcpy(blkbuf + blkoff, (void *)((const uint8_t *)buf + byteswritten), towrite);
+                } else {
+                    ssize_t ret = NMem::UserCopy::copyfrom(blkbuf + blkoff, (void *)((const uint8_t *)buf + byteswritten), towrite);
+                    if (ret < 0) {
+                        delete[] blkbuf;
+                        if (byteswritten > 0) {
+                            this->metalock.acquire();
+                            // Update file size if we wrote anything.
+                            uint64_t newsize = offset + byteswritten;
+                            uint64_t oldsize = ((uint64_t)this->diskino.sizethi << 32) | this->diskino.sizelo;
+                            if (newsize > oldsize) {
+                                this->diskino.sizelo = newsize & 0xFFFFFFFF;
+                                this->diskino.sizethi = (newsize >> 32) & 0xFFFFFFFF;
+                                __atomic_store_n(&this->attr.st_size, newsize, memory_order_release);
+                                this->touchtime(true, true, false); // Update mtime/ctime on write.
+                                this->writeback(); // Writeback information.
+                            }
+                            this->metalock.release();
+                            return byteswritten;
+                        }
+                        return ret;
+                    }
+                }
 
                 // Write the block back.
                 ssize_t res = this->ext4fs->writeblock(physblk, blkbuf);
@@ -1249,12 +1369,10 @@ namespace NFS {
                 this->diskino.sizethi = (newsize >> 32) & 0xFFFFFFFF;
                 __atomic_store_n(&this->attr.st_size, newsize, memory_order_release);
 
-                // Update block count.
+                // Update block count with proper HUGE_FILE handling.
                 uint64_t newblocks = (newsize + blksize - 1) / blksize;
-                newblocks = newblocks * (blksize / 512); // Convert to 512-byte sectors.
-                this->diskino.blockslo = newblocks & 0xFFFFFFFF;
-                this->diskino.blkshi = (newblocks >> 32) & 0xFFFF;
-                this->attr.st_blocks = newblocks;
+                updateiblocks(&this->diskino, newblocks, blksize, this->ext4fs->hugefile());
+                this->attr.st_blocks = newblocks * (blksize / 512);
             }
 
             // Update timestamps and write inode back to disk.
@@ -1482,12 +1600,10 @@ namespace NFS {
             this->diskino.sizethi = (newsize >> 32) & 0xFFFFFFFF;
             __atomic_store_n(&this->attr.st_size, newsize, memory_order_release);
 
-            // Update block count.
+            // Update block count with proper HUGE_FILE handling.
             uint64_t blocks = (newsize + blksize - 1) / blksize;
-            blocks = blocks * (blksize / 512); // Convert to 512-byte sectors.
-            this->diskino.blockslo = blocks & 0xFFFFFFFF;
-            this->diskino.blkshi = (blocks >> 32) & 0xFFFF;
-            this->attr.st_blocks = blocks;
+            updateiblocks(&this->diskino, blocks, blksize, this->ext4fs->hugefile());
+            this->attr.st_blocks = blocks * (blksize / 512);
 
             // Update timestamps and write inode back to disk.
             this->touchtime(true, true, false); // Update mtime/ctime on truncate.
@@ -1546,8 +1662,9 @@ namespace NFS {
                 while (blockoff < blksize) {
                     struct direntry2 *de = (struct direntry2 *)(blkbuf + blockoff);
 
-                    if (de->reclen == 0) {
-                        break;
+                    // Validate directory entry before using it.
+                    if (!checkdirentry(de, blockoff, blksize, dirsize, diroff)) {
+                        break; // Corrupt entry, stop parsing this block.
                     }
 
                     // Stop if we hit the directory tail (checksum entry).
@@ -1572,6 +1689,12 @@ namespace NFS {
                         newde->namelen = namelen;
                         newde->filetype = modetodt(child->attr.st_mode);
                         NLib::memcpy(newde->name, (void *)name, namelen);
+
+                        // Update directory block checksum if checksums are enabled.
+                        if (this->ext4fs->haschecksums) {
+                            struct dirtail *tail = (struct dirtail *)(blkbuf + blksize - sizeof(struct dirtail));
+                            tail->checksum = this->ext4fs->dirblockchecksum(this->attr.st_ino, this->diskino.generation, blkbuf, blksize);
+                        }
 
                         // Write block back.
                         this->metalock.release();
@@ -1614,15 +1737,32 @@ namespace NFS {
                 return false;
             }
 
-            // Initialize the new block with our entry.
+            // Initialise the new block with our entry.
             NLib::memset(blkbuf, 0, blksize);
             struct direntry2 *newde = (struct direntry2 *)blkbuf;
             newde->inode = child->attr.st_ino;
-            // Entry spans entire block (shrinks when more entries are added).
-            newde->reclen = blksize;
+
+            // If checksums enabled, reserve space for dirtail at end of block.
+            if (this->ext4fs->haschecksums) {
+                newde->reclen = blksize - sizeof(struct dirtail);
+            } else {
+                // Entry spans entire block (shrinks when more entries are added).
+                newde->reclen = blksize;
+            }
+
             newde->namelen = namelen;
             newde->filetype = modetodt(child->attr.st_mode);
             NLib::memcpy(newde->name, (void *)name, namelen);
+
+            // Add directory tail with checksum if checksums are enabled.
+            if (this->ext4fs->haschecksums) {
+                struct dirtail *tail = (struct dirtail *)(blkbuf + blksize - sizeof(struct dirtail));
+                tail->reserved = 0;
+                tail->reclen = sizeof(struct dirtail);
+                tail->reserved_namelen = 0;
+                tail->reserved_filetype = EXT4_FTDIRCSUM;
+                tail->checksum = this->ext4fs->dirblockchecksum(this->attr.st_ino, this->diskino.generation, blkbuf, blksize);
+            }
 
             // Write the new block.
             this->metalock.release();
@@ -1641,12 +1781,10 @@ namespace NFS {
             this->diskino.sizethi = (dirsize >> 32) & 0xFFFFFFFF;
             __atomic_store_n(&this->attr.st_size, (off_t)dirsize, memory_order_release);
 
-            // Update block count.
+            // Update block count with proper HUGE_FILE handling.
             uint64_t blocks = (dirsize + blksize - 1) / blksize;
-            blocks = blocks * (blksize / 512);
-            this->diskino.blockslo = blocks & 0xFFFFFFFF;
-            this->diskino.blkshi = (blocks >> 32) & 0xFFFF;
-            this->attr.st_blocks = blocks;
+            updateiblocks(&this->diskino, blocks, blksize, this->ext4fs->hugefile());
+            this->attr.st_blocks = blocks * (blksize / 512);
 
             // Update parent link count for directories.
             if (VFS::S_ISDIR(child->attr.st_mode)) {
@@ -1701,8 +1839,9 @@ namespace NFS {
                 while (blockoff < blksize) {
                     struct direntry2 *de = (struct direntry2 *)(blkbuf + blockoff);
 
-                    if (de->reclen == 0) {
-                        break;
+                    // Validate directory entry before using it.
+                    if (!checkdirentry(de, blockoff, blksize, dirsize, diroff)) {
+                        break; // Corrupt entry, stop parsing this block.
                     }
 
                     // Stop if we hit the directory tail (checksum entry).
@@ -1720,6 +1859,12 @@ namespace NFS {
                             } else {
                                 // Zero out inode to mark as deleted.
                                 de->inode = 0;
+                            }
+
+                            // Update directory block checksum if checksums are enabled.
+                            if (this->ext4fs->haschecksums) {
+                                struct dirtail *tail = (struct dirtail *)(blkbuf + blksize - sizeof(struct dirtail));
+                                tail->checksum = this->ext4fs->dirblockchecksum(this->attr.st_ino, this->diskino.generation, blkbuf, blksize);
                             }
 
                             // Write block back.

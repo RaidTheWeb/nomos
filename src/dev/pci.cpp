@@ -444,10 +444,14 @@ namespace NDev {
             // If MMIO, map the physical BAR into kernel virtual space and return virtual base.
             if (bar.mmio) {
                 size_t len = (size_t)bar_size;
-                NArch::VMM::kspace.lock.acquire();
-                uintptr_t virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(len, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
-                assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, bar.base, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, len), "Failed to map PCI MMIO space.\n");
-                NArch::VMM::kspace.lock.release();
+                uintptr_t virt;
+                {
+                    NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
+                    virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(len, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
+                    assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, bar.base, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, len, false), "Failed to map PCI MMIO space.\n");
+                }
+                // Deferred shootdown after releasing lock.
+                NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_RANGE, virt, virt + len);
 
                 bar.len = len;
                 bar.base = virt; // Update BAR with virtual mapped address.
@@ -467,13 +471,18 @@ namespace NDev {
 
                 struct acpi_mcfg_allocation *alloc = (struct acpi_mcfg_allocation *)NArch::ACPI::mcfg.start;
                 while (alloc < (struct acpi_mcfg_allocation *)NArch::ACPI::mcfg.end) {
+
+
+                    size_t maplen = 4096 * 8 * 32 * (alloc->end_bus - alloc->start_bus + 1);
+                    uintptr_t virt;
+                    {
+                        NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
+                        virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(maplen, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
+                        assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, alloc->address, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, maplen, false), "Failed to map PCI MMIO space.\n");
+                    }
                     NUtil::printf("[dev/pci]: Discovered ECAM space at %p for bus range %d-%d.\n", alloc->address, alloc->start_bus, alloc->end_bus);
-
-
-                    NArch::VMM::kspace.lock.acquire();
-                    uintptr_t virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(4096 * 8 * 32 * (alloc->end_bus - alloc->start_bus + 1), NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
-                    assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, alloc->address, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, 4096 * 8 * 32 * (alloc->end_bus - alloc->start_bus + 1)), "Failed to map PCI MMIO space.\n");
-                    NArch::VMM::kspace.lock.release();
+                    // Deferred shootdown after releasing lock.
+                    NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_RANGE, virt, virt + maplen);
 
                     ranges.push((struct mcfgrange) {
                         .base = virt,

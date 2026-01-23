@@ -59,7 +59,7 @@ namespace NArch {
 
         void init(void) {
             setisr();
-            NSys::Clock::init(); // Initialize clock subsystem after TSC calibration.
+            NSys::Clock::init(); // Initialise clock subsystem after TSC calibration.
             NUtil::printf("[arch/x86_64/timer]: Timer subsystem initialised.\n");
         }
     }

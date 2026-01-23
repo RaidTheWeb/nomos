@@ -553,9 +553,29 @@ namespace NDev {
                 tocopy = count;
             }
 
-            for (size_t i = 0; i < tocopy; i++) {
-                buf[i] = this->linebuffer.pop();
+            uint8_t kbuf[256];
+            size_t kbufidx = 0;
+
+            for (size_t i = 0; i < tocopy;) {
+                // Minimum between remaining to copy and size of kbuf.
+                size_t chunk = (sizeof(tocopy - i) < sizeof(kbuf)) ? (tocopy - i) : sizeof(kbuf);
+                for (size_t j = 0; j < chunk; j++) {
+                    kbuf[j] = this->linebuffer.pop();
+                    kbufidx++;
+                }
+
+                if (kbufidx > 0) {
+                    size_t ret = NMem::UserCopy::copyto(buf + i, (const char *)kbuf, kbufidx);
+                    if (ret < 0) {
+                        // Failed to copy to user.
+                        this->linelock.release();
+                        return ret;
+                    }
+                }
+                i += chunk;
+                kbufidx = 0;
             }
+
             this->linelock.release();
             return tocopy;
         } else {
@@ -586,8 +606,25 @@ namespace NDev {
                 toread = count;
             }
 
-            for (size_t i = 0; i < toread; i++) {
-                buf[i] = this->inbuffer.pop();
+            char kbuf[256];
+            size_t kbufidx = 0;
+            for (size_t i = 0; i < toread;) {
+                size_t chunk = (sizeof(toread - i) < sizeof(kbuf)) ? (toread - i) : sizeof(kbuf);
+                for (size_t j = 0; j < chunk; j++) {
+                    kbuf[j] = this->inbuffer.pop();
+                    kbufidx++;
+                }
+
+                if (kbufidx > 0) {
+                    size_t ret = NMem::UserCopy::copyto(buf + i, (const char *)kbuf, kbufidx);
+                    if (ret < 0) {
+                        // Failed to copy to user.
+                        this->inlock.release();
+                        return ret;
+                    }
+                }
+                i += chunk;
+                kbufidx = 0;
             }
             this->inlock.release();
             return toread;

@@ -383,7 +383,7 @@ namespace NFS {
 
                 NMem::RadixTree *pagecache = NULL;
 
-                // Read-ahead state for sequential access optimization (lock-free).
+                // Read-ahead state for sequential access optimisation (lock-free).
                 volatile off_t ralastoffset = -1; // Last read offset (for sequential detection).
                 volatile size_t rasize = 0; // Current read-ahead size in pages.
             public:
@@ -841,7 +841,7 @@ namespace NFS {
                 int close(int fd); // Close fd and call INode::close() if last reference.
 
                 int dup(int oldfd);
-                int dup2(int oldfd, int newfd, bool fcntl = false);
+                int dup2(int oldfd, int newfd, bool fcntl = false, bool cloexec = false);
 
                 FileDescriptor *get(int fd);
 

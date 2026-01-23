@@ -55,7 +55,7 @@ namespace NArch {
                 return;
             }
 
-            //  Acquire global shootdown lock (serializes all shootdowns).
+            //  Acquire global shootdown lock (serialises all shootdowns).
             NLib::ScopeIRQSpinlock guard(&shootdownlock);
 
             // Set up the global request.
@@ -81,8 +81,15 @@ namespace NArch {
             while (__atomic_load_n(&shootdownreq.acks, memory_order_acquire) < target) {
                 asm volatile("pause" ::: "memory");
                 if (--timeout == 0) {
-                    NUtil::printf("TLB shootdown timeout: %lu/%lu acks.\n", __atomic_load_n(&shootdownreq.acks, memory_order_relaxed), target);
-                    panic("TLB shootdown timeout.");
+                    size_t acks = __atomic_load_n(&shootdownreq.acks, memory_order_relaxed);
+                    NUtil::printf("TLB shootdown timeout: %lu/%lu acks (missing %lu responses).\n", acks, target, target - acks);
+                    NUtil::printf("At least one CPU has interrupts disabled and cannot respond to IPI.\n");
+#ifdef TSTATE_DEBUG
+                    NUtil::printf("Dumping thread states:\n");
+                    NSched::dumpthreads();
+#endif
+                    panic("TLB shootdown timeout! Deadlock detected.");
+
                 }
             }
         }
@@ -235,7 +242,8 @@ namespace NArch {
                     bool make_cow = !cowexempt && !readonly;
 
                     // Map page into destination address space.
-                    if (!_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, make_cow))) {
+                    // No shootdown needed for dest since it's a new address space not yet in use.
+                    if (!_mappage(work->dest, node->start + i, phys, vmatovmm(node->flags, make_cow), false)) {
                         meta->unref(); // Release the reference we just took on failure.
                         assertarg(false, "Failed to destination map page %p during address space fork.\n", node->start + i);
                     }
@@ -246,17 +254,17 @@ namespace NArch {
                             assertarg(false, "Failed to source remap page during %p address space fork.\n", node->start + i);
                         }
                         // Track shootdown range for source address space.
-                        uintptr_t page_addr = node->start + i;
+                        uintptr_t pageaddr = node->start + i;
                         if (!work->needshootdown) {
-                            work->shootdownstart = page_addr;
-                            work->shootdownend = page_addr + PAGESIZE;
+                            work->shootdownstart = pageaddr;
+                            work->shootdownend = pageaddr + PAGESIZE;
                             work->needshootdown = true;
                         } else {
-                            if (page_addr < work->shootdownstart) {
-                                work->shootdownstart = page_addr;
+                            if (pageaddr < work->shootdownstart) {
+                                work->shootdownstart = pageaddr;
                             }
-                            if (page_addr + PAGESIZE > work->shootdownend) {
-                                work->shootdownend = page_addr + PAGESIZE;
+                            if (pageaddr + PAGESIZE > work->shootdownend) {
+                                work->shootdownend = pageaddr + PAGESIZE;
                             }
                         }
                     }
@@ -265,10 +273,8 @@ namespace NArch {
         }
 
         addrspace::~addrspace(void) {
-            NLib::ScopeIRQSpinlock guard(&this->lock);
 
-            // Perform full TLB shootdown (we're about to free a LOT of pages).
-            doshootdown(SHOOTDOWN_FULL, 0, 0);
+            NLib::ScopeIRQSpinlock guard(&this->lock);
 
             this->vmaspace->traversedata(this->vmaspace->getroot(), [](struct NMem::Virt::vmanode *node, void *data) {
                 struct addrspace *space = (struct addrspace *)data;
@@ -396,11 +402,13 @@ namespace NArch {
         }
 
         void enterucontext(struct pagetable *pt, struct addrspace *space) {
-            NLib::ScopeIRQSpinlock kguard(&kspace.lock);
-            NLib::ScopeIRQSpinlock uguard(&space->lock);
+            {
+                NLib::ScopeIRQSpinlock kguard(&kspace.lock);
+                NLib::ScopeIRQSpinlock uguard(&space->lock);
 
-            for (size_t i = 0; i < 256; i++) { // Copy lower half userspace tables to kernel map.
-                pt->entries[i] = space->pml4->entries[i];
+                for (size_t i = 0; i < 256; i++) { // Copy lower half userspace tables to kernel map.
+                    pt->entries[i] = space->pml4->entries[i];
+                }
             }
 
             asm volatile("sfence" : : : "memory");
@@ -545,15 +553,17 @@ namespace NArch {
             return true;
         }
 
-        void _unmappage(struct addrspace *space, uintptr_t virt) {
+        void _unmappage(struct addrspace *space, uintptr_t virt, bool shootdown) {
             uint64_t *pte = _resolvepte(space, virt);
             if (pte) {
                 *pte = 0; // Blank page table entry, so that it now points NOWHERE.
-                doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE); // Invalidate, so that the CPU will know that it's lost this page.
+                if (shootdown) {
+                    doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE); // Invalidate, so that the CPU will know that it's lost this page.
+                }
             }
         }
 
-        bool _maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
+        bool _maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size, bool shootdown) {
             size_t end = NLib::alignup(virt + size, PAGESIZE); // Align length to page.
             // Align down to base.
             phys = NLib::aligndown(phys, PAGESIZE);
@@ -561,12 +571,12 @@ namespace NArch {
             size = end - virt; // Overwrite size of range to represent page alignmentment.
 
             for (size_t i = 0; i < size; i += PAGESIZE) {
-                assertarg(_mappage(space, virt + i, phys + i, flags), "Failed to map page in range 0x%016llx->0x%016llx.\n", virt, virt + size);
+                assertarg(_mappage(space, virt + i, phys + i, flags, shootdown), "Failed to map page in range 0x%016llx->0x%016llx.\n", virt, virt + size);
             }
             return true;
         }
 
-        void _unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
+        void _unmaprange(struct addrspace *space, uintptr_t virt, size_t size, bool shootdown) {
             size_t end = NLib::alignup(virt + size, PAGESIZE); // Align length to page.
             virt = NLib::aligndown(virt, PAGESIZE);
             size = end - virt;
@@ -578,7 +588,9 @@ namespace NArch {
                 }
             }
 
-            doshootdown(SHOOTDOWN_RANGE, virt, end);
+            if (shootdown) {
+                doshootdown(SHOOTDOWN_RANGE, virt, end);
+            }
         }
 
         static inline uint8_t convertflags(uint64_t flags) {
@@ -717,7 +729,9 @@ namespace NArch {
                     }
                     SYSCALL_RET(-EINVAL);
                 }
-                space->vmaspace->free(hint, size); // Free any existing mappings in the range.
+                // Unmap any existing page table entries in the range.
+                _unmaprange(space, (uintptr_t)hint, size, false);
+                space->vmaspace->free(hint, size); // Free any existing VMA mappings in the range.
                 addr = space->vmaspace->reserve((uintptr_t)hint, (uintptr_t)hint + size, vmaflags);
                 if (!addr) {
                     // Failed to reserve at fixed address.
@@ -760,7 +774,7 @@ namespace NArch {
                         SYSCALL_RET(-ENOMEM);
                     }
                     NLib::memset(hhdmoff(page), 0, PAGESIZE);
-                    if (!_mappage(space, (uintptr_t)addr + i, (uintptr_t)page, prottovmm(prot))) {
+                    if (!_mappage(space, (uintptr_t)addr + i, (uintptr_t)page, prottovmm(prot), false)) {
                         // Free the page we just allocated plus all previously allocated pages
                         PMM::free(page, PAGESIZE);
                         for (size_t j = 0; j < i; j += PAGESIZE) {
@@ -770,7 +784,7 @@ namespace NArch {
                                 PMM::free(phys, PAGESIZE);
                             }
                         }
-                        _unmaprange(space, (uintptr_t)addr, i);
+                        _unmaprange(space, (uintptr_t)addr, i, false);
                         space->vmaspace->free(addr, size);
                         SYSCALL_RET(-ENOMEM);
                     }
@@ -858,6 +872,11 @@ namespace NArch {
             NSched::Process *proc = thread->process;
             struct addrspace *space = proc->addrspace;
 
+            bool needshootdown = false;
+            uintptr_t shootdownstart = 0;
+            uintptr_t shootdownend = 0;
+
+            {
             NLib::ScopeIRQSpinlock guard(&space->lock);
 
             // Check if this is a file-backed mapping.
@@ -921,7 +940,10 @@ namespace NArch {
             }
 nophys: // Jump label to skip unmapping physical pages for character special files.
 
-            _unmaprange(space, (uintptr_t)ptr, size);
+            _unmaprange(space, (uintptr_t)ptr, size, false);
+            needshootdown = true;
+            shootdownstart = (uintptr_t)ptr;
+            shootdownend = (uintptr_t)ptr + size;
 
             // Unref the backing file if present before freeing VMA.
             if (backingfile) {
@@ -929,6 +951,12 @@ nophys: // Jump label to skip unmapping physical pages for character special fil
             }
 
             space->vmaspace->free(ptr, size);
+            }
+
+            // Perform TLB shootdown after releasing the address space lock.
+            if (needshootdown) {
+                doshootdown(SHOOTDOWN_RANGE, shootdownstart, shootdownend);
+            }
 
             SYSCALL_RET(0);
         }
@@ -967,15 +995,15 @@ nophys: // Jump label to skip unmapping physical pages for character special fil
                         *pte = phys | newflags;
 
                         // Track range for shootdown after lock release.
-                        uintptr_t page_start = (uintptr_t)ptr + i;
-                        uintptr_t page_end = page_start + PAGESIZE;
+                        uintptr_t pagestart = (uintptr_t)ptr + i;
+                        uintptr_t page_end = pagestart + PAGESIZE;
                         if (!needshootdown) {
-                            shootdownstart = page_start;
+                            shootdownstart = pagestart;
                             shootdownend = page_end;
                             needshootdown = true;
                         } else {
-                            if (page_start < shootdownstart) {
-                                shootdownstart = page_start;
+                            if (pagestart < shootdownstart) {
+                                shootdownstart = pagestart;
                             }
                             if (page_end > shootdownend) {
                                 shootdownend = page_end;

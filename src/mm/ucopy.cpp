@@ -3,6 +3,9 @@
 #include <mm/ucopy.hpp>
 #include <stdint.h>
 
+
+// XXX: Usercopy only copies all data, or fails, without notifying user of partial copies.
+
 // Import architecture-specific fault-handling ucopy implementations.
 extern "C" ssize_t __ucopyfrom(void *dst, const void *src, size_t size);
 extern "C" ssize_t __ucopyto(void *dst, const void *src, size_t size);
@@ -101,7 +104,7 @@ namespace NMem {
 
         int copyfrom(void *dest, const void *src, size_t size) {
             if (size == 0) {
-                return -EINVAL;
+                return 0;
             }
 
             if (!valid(src, size)) {
@@ -113,7 +116,7 @@ namespace NMem {
 
         int copyto(void *dest, const void *src, size_t size) {
             if (size == 0) {
-                return -EINVAL;
+                return 0;
             }
 
             if (!valid(dest, size)) {

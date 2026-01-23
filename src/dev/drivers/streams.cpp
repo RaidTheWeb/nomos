@@ -69,7 +69,10 @@ namespace NDev {
                     }
                     case ZEROMINOR:
                     case FULLMINOR: { // Both of these provide zeroes on read.
-                        NLib::memset(buf, 0, count); // Reading device simply wants us to fill the buffer with zeroes.
+                        ssize_t ret = NMem::UserCopy::memset(buf, 0, count); // Reading device simply wants us to fill the buffer with zeroes.
+                        if (ret < 0) {
+                            return ret;
+                        }
                         return count;
                     }
                     case RANDOMMINOR: // /dev/random uses blocking and limited by entropy.

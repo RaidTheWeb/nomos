@@ -58,7 +58,7 @@ namespace NSys {
                 // Get hardware tick count (architecture-specific).
                 uint64_t gethdcnt(void);
 
-                // Initialize clock with hardware frequency and offset.
+                // Initialise clock with hardware frequency and offset.
                 void initclock(uint64_t hwfreq, uint64_t hwoffset);
         };
 

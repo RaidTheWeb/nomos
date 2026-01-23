@@ -122,6 +122,7 @@ namespace NSched {
         NUtil::printf("    inrunqueue=%d, wokenbeforewait=%d, cid=%lu, lastcid=%lu\n",
             inrq, wokenbefore, cid, lastcid);
         NUtil::printf("    laststatetrans=%lums ago @ %s\n", agems, lastloc ? lastloc : "(unknown)");
+        NUtil::printf("    locksheld=%lu\n", __atomic_load_n(&thread->locksheld, memory_order_acquire));
 
         // Check for potential issues.
         if (curstate == Thread::state::READY && !inrq) {
@@ -339,7 +340,7 @@ namespace NSched {
 
                 cpu->runqueue.lock.release();
 
-                // Normalize vruntime to target's minvruntime before inserting.
+                // Normalise vruntime to target's minvruntime before inserting.
                 uint64_t targetmin = __atomic_load_n(&target->minvruntime, memory_order_acquire);
                 uint64_t curvrt = thread->getvruntime();
                 if (curvrt < targetmin) {
@@ -412,11 +413,8 @@ namespace NSched {
     }
 
     static void checkitimer(Process *proc, uint64_t now) {
-        if (proc->itimerdeadline == 0) {
-            return; // Timer not armed.
-        }
-
-        if (now >= proc->itimerdeadline) {
+        // Check ITIMER_REAL (wall clock time).
+        if (proc->itimerdeadline != 0 && now >= proc->itimerdeadline) {
             signalproc(proc, SIGALRM); // Send SIGALRM to the process.
 
             // Reload or disarm timer.
@@ -425,6 +423,35 @@ namespace NSched {
                 proc->itimerdeadline = now + ticks;
             } else {
                 proc->itimerdeadline = 0;
+            }
+        }
+
+        // Check ITIMER_VIRTUAL and ITIMER_PROF (CPU time based).
+        uint64_t cputicks = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed);
+
+        // ITIMER_VIRTUAL: user CPU time (we track total CPU time, close enough).
+        if (proc->itimervirtdeadline != 0 && cputicks >= proc->itimervirtdeadline) {
+            signalproc(proc, SIGVTALRM); // Send SIGVTALRM to the process.
+
+            // Reload or disarm timer.
+            if (proc->itimervirtintv > 0) {
+                uint64_t ticks = (proc->itimervirtintv * TSC::hz) / 1000000;
+                proc->itimervirtdeadline = cputicks + ticks;
+            } else {
+                proc->itimervirtdeadline = 0;
+            }
+        }
+
+        // ITIMER_PROF: user + system CPU time (same as ITIMER_VIRTUAL for us).
+        if (proc->itimerprofdeadline != 0 && cputicks >= proc->itimerprofdeadline) {
+            signalproc(proc, SIGPROF); // Send SIGPROF to the process.
+
+            // Reload or disarm timer.
+            if (proc->itimerprofintv > 0) {
+                uint64_t ticks = (proc->itimerprofintv * TSC::hz) / 1000000;
+                proc->itimerprofdeadline = cputicks + ticks;
+            } else {
+                proc->itimerprofdeadline = 0;
             }
         }
     }
@@ -511,6 +538,12 @@ namespace NSched {
 
         if (prev && prev != cpu->idlethread) {
             prev->setvruntime(delta);
+            // Update CPU time tracking for CLOCK_THREAD_CPUTIME_ID.
+            __atomic_fetch_add(&prev->cputimeticks, delta, memory_order_relaxed);
+            // Update process CPU time for CLOCK_PROCESS_CPUTIME_ID.
+            if (prev->process) {
+                __atomic_fetch_add(&prev->process->cputimeticks, delta, memory_order_relaxed);
+            }
         }
 
         // 2. Update load weight periodically.
@@ -817,7 +850,7 @@ namespace NSched {
             if (!target) target = CPU::get();
         }
 
-        // Normalize vruntime to target's minvruntime (lock-free read).
+        // Normalise vruntime to target's minvruntime (lock-free read).
         uint64_t targetmin = __atomic_load_n(&target->minvruntime, memory_order_acquire);
         uint64_t curvrt = thread->getvruntime();
         if (curvrt < targetmin) {

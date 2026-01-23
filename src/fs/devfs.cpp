@@ -215,12 +215,18 @@ namespace NFS {
                     return bytesread;
                 }
                 struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
-                dentry->d_ino = this->attr.st_ino;
-                dentry->d_off = bytesread + reclen;
-                dentry->d_reclen = (uint16_t)reclen;
-                dentry->d_type = VFS::S_IFDIR >> 12;
-                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                dentry->d_name[0] = '.';
+                struct VFS::dirent kdentry;
+                kdentry.d_ino = this->attr.st_ino;
+                kdentry.d_off = bytesread + reclen;
+                kdentry.d_reclen = (uint16_t)reclen;
+                kdentry.d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                kdentry.d_name[0] = '.';
+
+                ssize_t res = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                if (res < 0) {
+                    return res;
+                }
                 bytesread += reclen;
             }
             curroffset += reclen;
@@ -231,23 +237,27 @@ namespace NFS {
                     return bytesread;
                 }
                 struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
-
+                struct VFS::dirent kdentry;
                 INode *root = this->fs->getroot();
                 if (root == this) {
-                    dentry->d_ino = this->attr.st_ino; // Parent of root is root.
+                    kdentry.d_ino = this->attr.st_ino; // Parent of root is root.
                 } else if (this->parent) {
-                    dentry->d_ino = this->parent->getattr().st_ino;
+                    kdentry.d_ino = this->parent->getattr().st_ino;
                 } else {
-                    dentry->d_ino = 0; // No parent.
+                    kdentry.d_ino = 0; // No parent.
                 }
                 root->unref();
 
-                dentry->d_off = bytesread + reclen;
-                dentry->d_reclen = (uint16_t)reclen;
-                dentry->d_type = VFS::S_IFDIR >> 12;
-                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                dentry->d_name[0] = '.';
-                dentry->d_name[1] = '.';
+                kdentry.d_off = bytesread + reclen;
+                kdentry.d_reclen = (uint16_t)reclen;
+                kdentry.d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                kdentry.d_name[0] = '.';
+                kdentry.d_name[1] = '.';
+                ssize_t res = NMem::UserCopy::copyto((struct VFS::dirent *)((uint8_t *)buf + bytesread), &kdentry, sizeof(struct VFS::dirent));
+                if (res < 0) {
+                    return res;
+                }
                 bytesread += reclen;
             }
             curroffset += reclen;
@@ -265,12 +275,18 @@ namespace NFS {
 
                     struct VFS::stat childattr = child->getattr();
                     struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
-                    dentry->d_ino = childattr.st_ino;
-                    dentry->d_off = bytesread + reclen;
-                    dentry->d_reclen = (uint16_t)reclen;
-                    dentry->d_type = (childattr.st_mode & VFS::S_IFMT) >> 12;
-                    NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                    NLib::strncpy(dentry->d_name, (char *)childname, sizeof(dentry->d_name) - 1);
+                    struct VFS::dirent kdentry;
+                    kdentry.d_ino = childattr.st_ino;
+                    kdentry.d_off = bytesread + reclen;
+                    kdentry.d_reclen = (uint16_t)reclen;
+                    kdentry.d_type = (childattr.st_mode & VFS::S_IFMT) >> 12;
+                    NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                    NLib::strncpy(kdentry.d_name, (char *)childname, sizeof(kdentry.d_name) - 1);
+
+                    ssize_t res = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                    if (res < 0) {
+                        return res;
+                    }
                     bytesread += reclen;
                 }
                 curroffset += reclen;

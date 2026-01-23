@@ -478,6 +478,63 @@ namespace NSched {
 
     #define WNOHANG     1 // Don't block.
     #define WUNTRACED   2 // Report stopped children.
+    #define WCONTINUED  8 // Report continued children.
+
+    // POSIX status encoding macros.
+    #define W_EXITCODE(ret, sig) ((ret) << 8 | (sig))
+    #define W_STOPCODE(sig) ((sig) << 8 | 0x7f)
+
+    // Find a child matching the pid criteria.
+    // If wantstate is ZOMBIE, looks for zombie children to reap.
+    // If wantstate is STOPPED, looks for stopped children (for WUNTRACED).
+    // If wantstate is RUNNING, just checks existence.
+    static Process *findchildbystate(Process *parent, int pid, Process::state wantstate) {
+        NLib::DoubleList<Process *>::Iterator it = parent->children.begin();
+        for (; it.valid(); it.next()) {
+            Process *child = *(it.get());
+            bool match = false;
+
+            child->lock.acquire();
+
+            // Check if child state matches what we want.
+            if (wantstate == Process::state::ZOMBIE && child->pstate != Process::state::ZOMBIE) {
+                child->lock.release();
+                continue;
+            }
+            if (wantstate == Process::state::STOPPED && child->pstate != Process::state::STOPPED) {
+                child->lock.release();
+                continue;
+            }
+
+            if (pid == -1) { // Any child.
+                match = true;
+            } else if (pid > 0) { // Specific PID.
+                if (child->id == (size_t)pid) {
+                    match = true;
+                }
+            } else if (pid == 0) { // Any child in our process group.
+                if (child->pgrp == parent->pgrp) {
+                    match = true;
+                }
+            } else { // Negative PID means any child in process group -pid.
+                if (child->pgrp->id == (size_t)(-pid)) {
+                    match = true;
+                }
+            }
+
+            if (match) {
+                if (wantstate == Process::state::ZOMBIE) {
+                    // Atomically claim the zombie by transitioning to REAPING state.
+                    child->pstate = Process::state::REAPING;
+                }
+                child->lock.release();
+                return child;
+            }
+
+            child->lock.release();
+        }
+        return NULL;
+    }
 
     static Process *findchild(Process *parent, int pid, bool zombie) {
         NLib::DoubleList<Process *>::Iterator it = parent->children.begin();
@@ -546,25 +603,42 @@ namespace NSched {
             SYSCALL_RET(-ECHILD); // No matching children.
         }
 
-        Process *zombie = NULL;
+        Process *found = NULL;
+        bool isstopped = false;
 
         if (options & WNOHANG) {
-            // Non-blocking wait.
-            zombie = findchild(current, pid, true);
-            if (!zombie) {
+            // Non-blocking wait, but check for zombies first.
+            found = findchild(current, pid, true);
+            if (!found && (options & WUNTRACED)) {
+                // Check for stopped children.
+                found = findchildbystate(current, pid, Process::state::STOPPED);
+                if (found) {
+                    isstopped = true;
+                }
+            }
+            if (!found) {
                 current->lock.release();
-                SYSCALL_RET(0); // No matching zombies.
+                SYSCALL_RET(0); // No matching zombies or stopped children.
             }
         } else {
             // Blocking wait.
-            int ret;
-
-            ret = 0;
+            int ret = 0;
             while (true) {
-                zombie = findchild(current, pid, true);
-                if (zombie != NULL) {
+                // Check for zombies.
+                found = findchild(current, pid, true);
+                if (found != NULL) {
                     break;
                 }
+
+                // Check for stopped children if WUNTRACED.
+                if (options & WUNTRACED) {
+                    found = findchildbystate(current, pid, Process::state::STOPPED);
+                    if (found != NULL) {
+                        isstopped = true;
+                        break;
+                    }
+                }
+
                 int __ret = current->exitwq.waitinterruptiblelocked(&current->lock);
                 if (__ret < 0) {
                     ret = __ret;
@@ -573,42 +647,64 @@ namespace NSched {
             }
 
             if (ret < 0) {
-                // Even if interrupted, check if a zombie appeared.
-                zombie = findchild(current, pid, true);
-                if (!zombie) {
-                    current->lock.release();
-                    SYSCALL_RET(ret); // Interrupted and no zombie.
+                // Even if interrupted, check if something appeared.
+                found = findchild(current, pid, true);
+                if (!found && (options & WUNTRACED)) {
+                    found = findchildbystate(current, pid, Process::state::STOPPED);
+                    if (found) {
+                        isstopped = true;
+                    }
                 }
-                // Fall through to reap the zombie.
+                if (!found) {
+                    current->lock.release();
+                    SYSCALL_RET(ret); // Interrupted and no child state change.
+                }
+                // Fall through to handle the found child.
             }
         }
 
-        // The zombie is now in REAPING state (claimed by us in findchild),
-        // so no other waitpid can race with us to reap it.
         current->lock.release();
 
-        zombie->lock.acquire();
+        if (isstopped) {
+            // Report stopped child without reaping.
+            found->lock.acquire();
+            int stopsig = found->stopsig;
+            size_t fid = found->id;
+            found->lock.release();
+
+            if (status) {
+                int stopstatus = W_STOPCODE(stopsig);
+                if (NMem::UserCopy::copyto(status, &stopstatus, sizeof(int)) < 0) {
+                    SYSCALL_RET(-EFAULT);
+                }
+            }
+
+            SYSCALL_RET(fid);
+        }
+
+        // The found process is a zombie now in REAPING state (claimed by us in findchild), so no other waitpid can race with us to reap it.
+        found->lock.acquire();
         // Verify we still own the zombie (should always be true since we claimed it).
-        assert(zombie->pstate == Process::state::REAPING, "Zombie not in REAPING state after claim");
-        int zstatus = zombie->exitstatus;
-        size_t zid = zombie->id;
+        assert(found->pstate == Process::state::REAPING, "Zombie not in REAPING state after claim");
+        int zstatus = found->exitstatus;
+        size_t zid = found->id;
 
         if (status) {
             // Copy status out.
             if (NMem::UserCopy::copyto(status, &zstatus, sizeof(int)) < 0) {
                 // Revert to ZOMBIE state so another waiter can try.
-                zombie->pstate = Process::state::ZOMBIE;
-                zombie->lock.release();
+                found->pstate = Process::state::ZOMBIE;
+                found->lock.release();
                 SYSCALL_RET(-EFAULT);
             }
         }
 
-        zombie->pstate = Process::state::DEAD;
-        zombie->lock.release();
+        found->pstate = Process::state::DEAD;
+        found->lock.release();
 
         // Destructor will acquire parent lock to remove from children list.
         // Don't hold it here to avoid double acquisition.
-        delete zombie; // Reap process.
+        delete found; // Reap process.
 
         SYSCALL_RET(zid);
     }
@@ -839,7 +935,7 @@ namespace NSched {
     extern "C" ssize_t sys_futex(int *ptr, int op, int expected, struct timespec *timeout) {
         SYSCALL_LOG("sys_futex(%p, %d, %d, %p).\n", ptr, op, expected, timeout);
 
-        // Lazily initialize the futex table.
+        // Lazily initialise the futex table.
         if (!futextable) {
             futexlock.acquire();
             if (!futextable) {

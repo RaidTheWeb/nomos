@@ -292,6 +292,11 @@ namespace NFS {
             uint16_t unused;
         } __attribute__((packed));
 
+        // Extent block tail for checksums.
+        struct extenttail {
+            uint32_t checksum; // CRC32c checksum.
+        } __attribute__((packed));
+
 
         enum filetype {
             FT_UNKNOWN = 0,

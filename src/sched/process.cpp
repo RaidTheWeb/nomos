@@ -36,7 +36,7 @@ namespace NSched {
         this->addrspace->ref++; // Reference address space.
         this->addrspace->lock.release();
 
-        // Initialize signal state to defaults (no pending, all handlers SIG_DFL).
+        // Initialise signal state to defaults (no pending, all handlers SIG_DFL).
         this->signalstate.pending = 0;
         for (size_t i = 0; i < NSIG; i++) {
             this->signalstate.actions[i].handler = SIG_DFL;
@@ -191,4 +191,89 @@ namespace NSched {
         pidtablelock.release();
     }
 
+#define RUSAGE_SELF     0
+#define RUSAGE_CHILDREN (-1)
+#define RUSAGE_THREAD   1
+
+    struct rusage {
+        struct timeval ru_utime; // User CPU time.
+        struct timeval ru_stime; // System CPU time.
+
+        long ru_maxrss;   // Maximum resident set size.
+        long ru_ixrss;    // Integral shared memory size.
+        long ru_idrss;    // Integral unshared data size.
+        long ru_isrss;    // Integral unshared stack size.
+        long ru_minflt;   // Page reclaims (soft page faults).
+        long ru_majflt;   // Page faults (hard page faults).
+        long ru_nswap;    // Swaps.
+        long ru_inblock;  // Block input operations.
+        long ru_oublock;  // Block output operations.
+        long ru_msgsnd;   // Messages sent.
+        long ru_msgrcv;   // Messages received.
+        long ru_nsignals; // Signals received.
+        long ru_nvcsw;    // Voluntary context switches.
+        long ru_nivcsw;   // Involuntary context switches.
+    };
+
+    static void tickstotimeval(uint64_t ticks, struct timeval *tv) {
+#ifdef __x86_64__
+        uint64_t freq = NArch::TSC::hz;
+        if (freq == 0) {
+            tv->tv_sec = 0;
+            tv->tv_usec = 0;
+            return;
+        }
+        tv->tv_sec = ticks / freq;
+        tv->tv_usec = ((ticks % freq) * 1000000) / freq;
+#else
+        assert(false, "tickstotimeval not implemented on this architecture.");
+#endif
+    }
+
+    extern "C" int sys_getrusage(int who, struct rusage *rusage) {
+        SYSCALL_LOG("sys_getrusage(%d, %p).\n", who, rusage);
+
+        if (!rusage) {
+            SYSCALL_RET(-EFAULT);
+        }
+
+        Thread *thread = NArch::CPU::get()->currthread;
+        Process *proc = thread->process;
+
+        struct rusage krusage;
+        NLib::memset(&krusage, 0, sizeof(krusage));
+
+        uint64_t cputicks = 0;
+
+        switch (who) {
+            case RUSAGE_SELF:
+                // Return resource usage for the calling process.
+                cputicks = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed);
+                tickstotimeval(cputicks, &krusage.ru_utime);
+                // ru_stime is 0 for now (we don't distinguish user/system time).
+                break;
+
+            case RUSAGE_THREAD:
+                // Return resource usage for the calling thread.
+                cputicks = __atomic_load_n(&thread->cputimeticks, memory_order_relaxed);
+                tickstotimeval(cputicks, &krusage.ru_utime);
+                break;
+
+            case RUSAGE_CHILDREN:
+                // Return resource usage for all terminated children.
+                // XXX: We don't currently track this. Return zeros.
+                break;
+
+            default:
+                SYSCALL_RET(-EINVAL);
+        }
+
+        // Copy result to userspace.
+        int err = NMem::UserCopy::copyto(rusage, &krusage, sizeof(krusage));
+        if (err) {
+            SYSCALL_RET(-EFAULT);
+        }
+
+        SYSCALL_RET(0);
+    }
 }

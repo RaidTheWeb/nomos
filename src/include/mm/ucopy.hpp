@@ -13,7 +13,7 @@ namespace NMem {
                 return false;
             }
 
-            if (addr > 0x800000000000) { // Isn't userspace at start.
+            if (addr >= 0x800000000000) { // Isn't userspace at start.
                 return false;
             }
 
@@ -24,6 +24,19 @@ namespace NMem {
             return true;
         }
 
+        static inline bool iskernel(const void *ptr, size_t size) {
+            uintptr_t addr = (uintptr_t)ptr;
+
+            if (addr + size < addr) { // Wraps around.
+                return false;
+            }
+
+            if (addr >= 0x800000000000) { // Is kernelspace.
+                return true;
+            }
+
+            return false;
+        }
 
         // Userspace safe copy of string to kernel buffer.
         int strncpyfrom(char *dest, const char *src, size_t size);

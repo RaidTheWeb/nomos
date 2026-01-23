@@ -223,7 +223,7 @@ namespace NArch {
                         // Track this mapping in the cache page for reverse mapping.
                         cachepage->addmapping(space, pagestart);
 
-                        VMM::_mappage(space, pagestart, cachepage->physaddr, mapflags);
+                        VMM::_mappage(space, pagestart, cachepage->physaddr, mapflags, false);
                         space->lock.release();
 
                         cachepage->pageunlock();

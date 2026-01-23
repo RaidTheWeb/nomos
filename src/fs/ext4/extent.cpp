@@ -29,8 +29,12 @@ namespace NFS {
             struct extenthdr *leafhdr = (struct extenthdr *)leafbuf;
             leafhdr->magic = EXT4_EXTMAGIC;
             leafhdr->entries = hdr->entries;
-            // Max extents that fit in a full block (minus header).
-            leafhdr->max = (this->ext4fs->blksize - sizeof(struct extenthdr)) / sizeof(struct extent);
+            // Max extents that fit in a full block (minus header and tail for checksum).
+            size_t usable = this->ext4fs->blksize - sizeof(struct extenthdr);
+            if (this->ext4fs->haschecksums) {
+                usable -= sizeof(struct extenttail);
+            }
+            leafhdr->max = usable / sizeof(struct extent);
             leafhdr->depth = 0;
             leafhdr->generation = hdr->generation;
 
@@ -38,6 +42,12 @@ namespace NFS {
             struct extent *srcextents = (struct extent *)((uint8_t *)this->diskino.block + sizeof(struct extenthdr));
             struct extent *dstextents = (struct extent *)(leafbuf + sizeof(struct extenthdr));
             NLib::memcpy(dstextents, srcextents, hdr->entries * sizeof(struct extent));
+
+            // Add extent block checksum if checksums are enabled.
+            if (this->ext4fs->haschecksums) {
+                struct extenttail *tail = (struct extenttail *)(leafbuf + this->ext4fs->blksize - sizeof(struct extenttail));
+                tail->checksum = this->ext4fs->extentblockchecksum(this->attr.st_ino, this->diskino.generation, leafbuf, this->ext4fs->blksize);
+            }
 
             // Write the new leaf block to disk.
             this->metalock.release();
@@ -165,6 +175,12 @@ namespace NFS {
                 if (logicalblk == extstart + extlen && physblk == extphys + extlen) {
                     extents[i].len = (extents[i].len & 0x8000) | ((extlen + len) & 0x7FFF);
 
+                    // Update extent block checksum if checksums are enabled.
+                    if (this->ext4fs->haschecksums) {
+                        struct extenttail *tail = (struct extenttail *)(leafbuf + this->ext4fs->blksize - sizeof(struct extenttail));
+                        tail->checksum = this->ext4fs->extentblockchecksum(this->attr.st_ino, this->diskino.generation, leafbuf, this->ext4fs->blksize);
+                    }
+
                     this->metalock.release();
                     ssize_t res = this->ext4fs->writeblock(leafblk, leafbuf);
                     this->metalock.acquire();
@@ -197,6 +213,12 @@ namespace NFS {
                 extents[insertpos].startlo = physblk & 0xFFFFFFFF;
                 leafhdr->entries++;
 
+                // Update extent block checksum if checksums are enabled.
+                if (this->ext4fs->haschecksums) {
+                    struct extenttail *tail = (struct extenttail *)(leafbuf + this->ext4fs->blksize - sizeof(struct extenttail));
+                    tail->checksum = this->ext4fs->extentblockchecksum(this->attr.st_ino, this->diskino.generation, leafbuf, this->ext4fs->blksize);
+                }
+
                 this->metalock.release();
                 ssize_t res = this->ext4fs->writeblock(leafblk, leafbuf);
                 this->metalock.acquire();
@@ -208,7 +230,7 @@ namespace NFS {
             // Leaf is full, and now we need to split.
             // XXX: Implement splitting of extent leaf nodes.
             delete[] leafbuf;
-            NUtil::printf("[fs/ext4fs]: Extent leaf full, splitting not yet implemented\n");
+            NUtil::printf("[fs/ext4fs]: Extent leaf full (inode %lu, logblk %lu), splitting not yet implemented\n", (unsigned long)this->attr.st_ino, (unsigned long)logicalblk);
             return 0;
         }
 
@@ -245,7 +267,17 @@ namespace NFS {
 
             // Handle deep extent trees (depth >= 1).
             if (hdr->depth != 0) {
-                return this->allocextentdeep(logicalblk, len, physblk);
+                uint64_t result = this->allocextentdeep(logicalblk, len, physblk);
+                if (result == 0) {
+                    // allocextentdeep failed (e.g., leaf full), free the allocated blocks.
+                    for (uint16_t i = 0; i < len; i++) {
+                        this->metalock.release();
+                        this->ext4fs->freeblock(physblk + i);
+                        this->metalock.acquire();
+                    }
+                    return 0;
+                }
+                return result;
             }
 
             // Depth 0 is inline extents.

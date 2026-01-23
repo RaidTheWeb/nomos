@@ -182,6 +182,27 @@ void kpostarch(void) {
     // Increment address space reference (exec() created it with ref=0).
     result.addrspace->ref++;
 
+    // Create /dev folder in VFS.
+    NFS::VFS::vfs->create("/dev", NULL, { .st_mode = NFS::VFS::S_IFDIR | 0755, .st_uid = 0, .st_gid = 0 });
+    // Mount DevFS at /dev.
+    ssize_t ret = NFS::VFS::vfs->mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+    if (ret < 0) {
+        NUtil::printf("[nomos]: Warning: Failed to mount devtmpfs at /dev (%d).\n", ret);
+    }
+
+
+    NFS::VFS::INode *console = NULL;
+    ret = NFS::VFS::vfs->resolve("/dev/console", &console);
+    if (ret < 0) {
+        NUtil::printf("[nomos]: Warning: /dev/console not found for init process.\n");
+    } else {
+        proc->fdtable->open(console, NFS::VFS::O_RDWR); // FD 0.
+        proc->fdtable->dup2(0, 1); // FD 1.
+        proc->fdtable->dup2(0, 2); // FD 2.
+        console->unref();
+    }
+
+
     // THREAD
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
 
@@ -191,6 +212,8 @@ void kpostarch(void) {
     uthread->ctx.rsp = (uint64_t)result.stackptr;
 
     NLimine::console_write("\x1b[2J\x1b[H", 7);
+#else
+    assert(false, "User thread setup not implemented on this architecture.");
 #endif
 
     NUtil::printf("[nomos]: Starting user init.\n");

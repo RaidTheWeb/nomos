@@ -8,6 +8,7 @@
 #include <lib/errno.hpp>
 #include <lib/sync.hpp>
 #include <mm/ucopy.hpp>
+#include <sched/sched.hpp>
 #include <std/stddef.h>
 #include <sys/clock.hpp>
 #include <sys/syscall.hpp>
@@ -20,11 +21,12 @@ namespace NSys {
 #ifdef __x86_64__
             return NArch::TSC::query();
 #else
+            assert(false, "gethdcnt not implemented on this architecture.");
             return 0; // Not implemented for this architecture.
 #endif
         }
 
-        // Initialize clock with hardware parameters.
+        // Initialise clock with hardware parameters.
         void Clock::initclock(uint64_t hwfreq, uint64_t hwoffset) {
             NLib::ScopeIRQSpinlock guard(&this->lock);
             this->freq = hwfreq;
@@ -67,7 +69,7 @@ namespace NSys {
                     NLib::ScopeIRQSpinlock guard(&this->lock);
 
                     if (this->freq == 0) {
-                        return -EINVAL; // Clock not initialized.
+                        return -EINVAL; // Clock not initialised.
                     }
 
                     uint64_t elapsedticks = now - this->baseoffset;
@@ -118,7 +120,7 @@ namespace NSys {
                     NLib::ScopeIRQSpinlock guard(&this->lock);
 
                     if (this->freq == 0) {
-                        return -EINVAL; // Clock not initialized.
+                        return -EINVAL; // Clock not initialised.
                     }
 
                     uint64_t elapsedticks = now - this->baseoffset;
@@ -144,7 +146,7 @@ namespace NSys {
                 }
         };
 
-        // Process CPU time clock (stub implementation).
+        // Process CPU time clock implementation.
         class ProcessCPUTimeClock : public Clock {
             public:
                 ProcessCPUTimeClock(uint64_t id, enum setperm permission = CLOCK_NOONE) : Clock(id, permission) { }
@@ -155,17 +157,44 @@ namespace NSys {
                 }
 
                 int gettime(struct timespec *ts) override {
+#ifdef __x86_64__
+                    NSched::Thread *thread = NArch::CPU::get()->currthread;
+                    if (!thread || !thread->process) {
+                        return -EINVAL;
+                    }
+
+                    uint64_t ticks = __atomic_load_n(&thread->process->cputimeticks, memory_order_relaxed);
+                    uint64_t freq = NArch::TSC::hz;
+                    if (freq == 0) {
+                        return -EINVAL;
+                    }
+
+                    ts->tv_sec = ticks / freq;
+                    ts->tv_nsec = ((ticks % freq) * NSEC_PER_SEC) / freq;
+                    return 0;
+#else
                     (void)ts;
-                    return -ENOSYS; // Not yet implemented.
+                    return -ENOSYS;
+#endif
                 }
 
                 int getres(struct timespec *ts) override {
+#ifdef __x86_64__
+                    uint64_t freq = NArch::TSC::hz;
+                    if (freq == 0) {
+                        return -EINVAL;
+                    }
+                    ts->tv_sec = 0;
+                    ts->tv_nsec = NSEC_PER_SEC / freq;
+                    return 0;
+#else
                     (void)ts;
                     return -ENOSYS;
+#endif
                 }
         };
 
-        // Thread CPU time clock (stub implementation).
+        // Thread CPU time clock implementation.
         class ThreadCPUTimeClock : public Clock {
             public:
                 ThreadCPUTimeClock(uint64_t id, enum setperm permission = CLOCK_NOONE) : Clock(id, permission) { }
@@ -176,21 +205,48 @@ namespace NSys {
                 }
 
                 int gettime(struct timespec *ts) override {
+#ifdef __x86_64__
+                    NSched::Thread *thread = NArch::CPU::get()->currthread;
+                    if (!thread) {
+                        return -EINVAL;
+                    }
+
+                    uint64_t ticks = __atomic_load_n(&thread->cputimeticks, memory_order_relaxed);
+                    uint64_t freq = NArch::TSC::hz;
+                    if (freq == 0) {
+                        return -EINVAL;
+                    }
+
+                    ts->tv_sec = ticks / freq;
+                    ts->tv_nsec = ((ticks % freq) * NSEC_PER_SEC) / freq;
+                    return 0;
+#else
                     (void)ts;
-                    return -ENOSYS; // Not yet implemented.
+                    return -ENOSYS;
+#endif
                 }
 
                 int getres(struct timespec *ts) override {
+#ifdef __x86_64__
+                    uint64_t freq = NArch::TSC::hz;
+                    if (freq == 0) {
+                        return -EINVAL;
+                    }
+                    ts->tv_sec = 0;
+                    ts->tv_nsec = NSEC_PER_SEC / freq;
+                    return 0;
+#else
                     (void)ts;
                     return -ENOSYS;
+#endif
                 }
         };
 
         // Global clock instances.
         static RealtimeClock realtimeclock(CLOCK_REALTIME, CLOCK_ROOT);
         static MonotonicClock monotonicclock(CLOCK_MONOTONIC, CLOCK_NOONE);
-        static ProcessCPUTimeClock processclock(CLOCK_PROCESS_CPUTIME_ID, CLOCK_NOONE); // XXX: Calculate (add delta in schedule()).
-        static ThreadCPUTimeClock threadclock(CLOCK_THREAD_CPUTIME_ID, CLOCK_NOONE); // XXX: Calculate (add delta in schedule()).
+        static ProcessCPUTimeClock processclock(CLOCK_PROCESS_CPUTIME_ID, CLOCK_NOONE);
+        static ThreadCPUTimeClock threadclock(CLOCK_THREAD_CPUTIME_ID, CLOCK_NOONE);
         static MonotonicClock rawclock(CLOCK_MONOTONIC_RAW, CLOCK_NOONE); // XXX: Don't process.
         static RealtimeClock coarserealtimeclock(CLOCK_REALTIME_COARSE, CLOCK_ROOT);
         static MonotonicClock coarsemonotonicclock(CLOCK_MONOTONIC_COARSE, CLOCK_NOONE);
@@ -218,22 +274,22 @@ namespace NSys {
 
         void init(void) {
 #ifdef __x86_64__
-            // Ensure TSC is calibrated before initializing clocks.
+            // Ensure TSC is calibrated before initialising clocks.
             if (NArch::TSC::hz == 0) {
-                NUtil::printf("[sys/clock]: Warning - TSC not calibrated, cannot initialize clocks.\n");
+                NUtil::printf("[sys/clock]: Warning - TSC not calibrated, cannot initialise clocks.\n");
                 return;
             }
 
             uint64_t tscfreq = NArch::TSC::hz;
             uint64_t tscnow = NArch::TSC::query();
 
-            // Initialize all monotonic clocks with TSC parameters.
+            // Initialise all monotonic clocks with TSC parameters.
             monotonicclock.initclock(tscfreq, tscnow);
             rawclock.initclock(tscfreq, tscnow);
             coarsemonotonicclock.initclock(tscfreq, tscnow);
             boottimeclock.initclock(tscfreq, tscnow);
 
-            // Initialize realtime clocks with TSC parameters.
+            // Initialise realtime clocks with TSC parameters.
             realtimeclock.initclock(tscfreq, tscnow);
             struct timespec ts = { 0, 0 };
             int rtcres = NArch::RTC::gettime(&ts);
@@ -244,9 +300,9 @@ namespace NSys {
             }
             coarserealtimeclock.initclock(tscfreq, tscnow);
 
-            NUtil::printf("[sys/clock]: Clock subsystem initialized with TSC frequency %lu Hz.\n", tscfreq);
+            NUtil::printf("[sys/clock]: Clock subsystem initialised with TSC frequency %lu Hz.\n", tscfreq);
 #else
-            NUtil::printf("[sys/clock]: Clock subsystem initialized (no hardware support).\n");
+            NUtil::printf("[sys/clock]: Clock subsystem initialised (no hardware support).\n");
 #endif
         }
 

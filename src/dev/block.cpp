@@ -3,6 +3,7 @@
 #include <lib/sync.hpp>
 #include <mm/pagecache.hpp>
 #include <sched/event.hpp>
+#include <sched/sched.hpp>
 #include <mm/ucopy.hpp>
 #include <util/kprint.hpp>
 
@@ -34,11 +35,7 @@ namespace NDev {
         }
 
         off_t index = offset / NArch::PAGESIZE;
-        NMem::CachePage *page = cache->lookup(index);
-        if (page) {
-            page->pagelock();
-        }
-        return page;
+        return cache->lookupandlock(index);
     }
 
     NMem::CachePage *BlockDevice::getorcachepage(off_t offset) {
@@ -50,10 +47,9 @@ namespace NDev {
         off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
         off_t index = pageoffset / NArch::PAGESIZE;
 
-        // Check if page already exists.
-        NMem::CachePage *page = cache->lookup(index);
+        // Check if page already exists (use lookupandlock to prevent race with eviction).
+        NMem::CachePage *page = cache->lookupandlock(index);
         if (page) {
-            page->pagelock();
             return page;
         }
 
@@ -95,11 +91,8 @@ namespace NDev {
             NArch::PMM::free(phys, NArch::PAGESIZE);
             delete page;
 
-            page = cache->lookup(index);
-            if (page) {
-                page->pagelock();
-            }
-            return page;
+            // Use lookupandlock to prevent race with eviction.
+            return cache->lookupandlock(index);
         } else if (err < 0) {
             // Allocation failure in radix tree.
             if (page->pagemeta) {
@@ -153,14 +146,13 @@ namespace NDev {
                 if (page->pagemeta) {
                     page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
                     page->pagemeta->cacheentry = NULL;
-                    page->pagemeta->unref();
-                }
-                if (page->physaddr) {
-                    NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+                    page->pagemeta->unref();  // Release initial cache ref.
                 }
 
                 page->pageunlock();
-                page->unref();  // Release ref from foreachcollect.
+                if (page->pagemeta) {
+                    page->pagemeta->unref();  // Release ref from foreachcollect.
+                }
                 delete page;
             }
 
@@ -263,7 +255,15 @@ namespace NDev {
                 return res;
             }
 
-            NLib::memcpy(dest, blkbuf + blkoff, toread);
+            if (NMem::UserCopy::iskernel(dest, toread)) {
+                NLib::memcpy(dest, blkbuf + blkoff, toread);
+            } else {
+                ssize_t ret = NMem::UserCopy::copyto(dest, blkbuf + blkoff, toread);
+                if (ret < 0) {
+                    delete[] blkbuf;
+                    return ret;
+                }
+            }
             delete[] blkbuf;
 
             dest += toread;
@@ -301,7 +301,15 @@ namespace NDev {
                 return totalread > 0 ? totalread : res;
             }
 
-            NLib::memcpy(dest, blkbuf, count);
+            if (NMem::UserCopy::iskernel(dest, count)) {
+                NLib::memcpy(dest, blkbuf, count);
+            } else {
+                ssize_t ret = NMem::UserCopy::copyto(dest, blkbuf, count);
+                if (ret < 0) {
+                    delete[] blkbuf;
+                    return totalread > 0 ? totalread : ret;
+                }
+            }
             delete[] blkbuf;
 
             totalread += count;
@@ -334,7 +342,15 @@ namespace NDev {
                 delete[] blkbuf;
                 return res;
             }
-            NLib::memcpy(blkbuf + blkoff, (void *)src, towrite);
+            if (NMem::UserCopy::iskernel((void *)src, towrite)) {
+                NLib::memcpy(blkbuf + blkoff, (void *)src, towrite);
+            } else {
+                ssize_t ret = NMem::UserCopy::copyto(blkbuf + blkoff, (void *)src, towrite);
+                if (ret < 0) {
+                    delete[] blkbuf;
+                    return ret;
+                }
+            }
             // Write updated block back.
             res = this->writeblock(lba, blkbuf);
             if (res < 0) {
@@ -375,7 +391,15 @@ namespace NDev {
                 delete[] blkbuf;
                 return totalwritten > 0 ? totalwritten : res;
             }
-            NLib::memcpy(blkbuf, (void *)src, count);
+            if (NMem::UserCopy::iskernel((void *)src, count)) {
+                NLib::memcpy(blkbuf, (void *)src, count);
+            } else {
+                ssize_t ret = NMem::UserCopy::copyfrom(blkbuf, (void *)src, count);
+                if (ret < 0) {
+                    delete[] blkbuf;
+                    return totalwritten > 0 ? totalwritten : ret;
+                }
+            }
             // Write updated block back.
             res = this->writeblock(lba, blkbuf);
             if (res < 0) {
@@ -463,8 +487,19 @@ namespace NDev {
                 page->setflag(NMem::PAGE_UPTODATE);
             }
 
-            // Copy requested portion to user buffer.
-            NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
+            // Copy requested portion to user buffer
+            if (NMem::UserCopy::iskernel(dest, toread)) {
+                NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
+            } else {
+                ssize_t res = NMem::UserCopy::copyto(dest, (uint8_t *)page->data() + offwithinpage, toread);
+                if (res < 0) {
+                    page->pageunlock();
+                    if (totalread > 0) {
+                        return totalread;
+                    }
+                    return res;
+                }
+            }
 
             page->setflag(NMem::PAGE_REFERENCED);
             page->pageunlock();
@@ -513,11 +548,28 @@ namespace NDev {
             }
 
             // Copy user data into page.
-            NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
+            if (NMem::UserCopy::iskernel((void *)src, towrite)) {
+                NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
+            } else {
+                ssize_t res = NMem::UserCopy::copyfrom((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
+                if (res < 0) {
+                    page->pageunlock();
+                    if (totalwritten > 0) {
+                        return totalwritten;
+                    }
+                    return res;
+                }
+            }
 
             page->setflag(NMem::PAGE_UPTODATE);
             page->markdirty();
             page->pageunlock();
+
+            // Throttle if too many dirty pages to prevent unbounded dirty page growth.
+            if (NMem::pagecache && NMem::pagecache->shouldthrottle()) {
+                NMem::pagecache->wakewriteback();
+                NSched::yield(); // Give writeback thread a chance to run.
+            }
 
             src += towrite;
             offset += towrite;
@@ -652,14 +704,18 @@ namespace NDev {
 
                 // Try to lock the page. If we can't, skip it (another thread has it).
                 if (!page->trypagelock()) {
-                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                     continue;
                 }
 
                 // Re-check dirty flag after acquiring page lock (may have been cleaned).
                 if (!page->testflag(NMem::PAGE_DIRTY)) {
                     page->pageunlock();
-                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                     continue;
                 }
 
@@ -677,7 +733,9 @@ namespace NDev {
                 if (!req) {
                     page->clearflag(NMem::PAGE_WRITEBACK);
                     page->pageunlock();
-                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                     errors++;
                     continue;
                 }
@@ -694,7 +752,9 @@ namespace NDev {
                         page->setflag(NMem::PAGE_ERROR);
                     }
                     page->pageunlock();
-                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                     errors++;
                     continue;
                 }
@@ -725,7 +785,9 @@ namespace NDev {
                         pg->errorcount = 0;
                     }
                     pg->pageunlock();
-                    pg->unref();
+                    if (pg->pagemeta) {
+                        pg->pagemeta->unref();
+                    }
                     delete rq;
                 }
             }

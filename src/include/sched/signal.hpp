@@ -17,7 +17,8 @@ namespace NSched {
     enum dflactions {
         DFL_IGNORE,         // Performs no actions.
         DFL_TERMINATE,      // Kills program.
-        DFL_STOP            // Sleep thread until woken with SIGCONT.
+        DFL_STOP,           // Sleep thread until woken with SIGCONT.
+        DFL_CONTINUE        // Continue a stopped process.
     };
 
     #define SIG_ERR ((void (*)(int))-1)

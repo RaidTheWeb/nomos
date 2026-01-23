@@ -8,6 +8,7 @@
 #include <lib/errno.hpp>
 #include <mm/pagecache.hpp>
 #include <mm/ucopy.hpp>
+#include <sched/sched.hpp>
 #include <sched/workqueue.hpp>
 #include <sys/clock.hpp>
 #include <sys/syscall.hpp>
@@ -32,11 +33,8 @@ namespace NFS {
             }
 
             off_t index = offset / NArch::PAGESIZE;
-            NMem::CachePage *page = cache->lookup(index);
-            if (page) {
-                page->pagelock();
-            }
-            return page;
+            // Use lookupandlock() to atomically look up and lock, preventing race with eviction.
+            return cache->lookupandlock(index);
         }
 
         NMem::CachePage *INode::getorcacheepage(off_t offset) {
@@ -48,10 +46,9 @@ namespace NFS {
             off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
             off_t index = pageoffset / NArch::PAGESIZE;
 
-            // Check if page already exists.
-            NMem::CachePage *page = cache->lookup(index);
+            // Check if page already exists (use lookupandlock to prevent race with eviction).
+            NMem::CachePage *page = cache->lookupandlock(index);
             if (page) {
-                page->pagelock();
                 return page;
             }
 
@@ -96,11 +93,8 @@ namespace NFS {
                 NArch::PMM::free(phys, NArch::PAGESIZE);
                 delete page;
 
-                page = cache->lookup(index);
-                if (page) {
-                    page->pagelock();
-                }
-                return page;
+                // Use lookupandlock to prevent race with eviction.
+                return cache->lookupandlock(index);
             } else if (err < 0) {
                 // Allocation failure in radix tree.
                 if (page->pagemeta) {
@@ -157,10 +151,7 @@ namespace NFS {
                     if (page->pagemeta) {
                         page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
                         page->pagemeta->cacheentry = NULL;
-                        page->pagemeta->unref();
-                    }
-                    if (page->physaddr) {
-                        NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+                        page->pagemeta->unref();  // Release initial cache ref.
                     }
 
                     // Release reference to inode.
@@ -169,7 +160,9 @@ namespace NFS {
                     }
 
                     page->pageunlock();
-                    page->unref();  // Release ref from foreachcollect.
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();  // Release ref from foreachcollect.
+                    }
                     delete page;
                 }
 
@@ -212,14 +205,18 @@ namespace NFS {
 
                     // Try to lock the page. If we can't, skip it.
                     if (!page->trypagelock()) {
-                        page->unref();
+                        if (page->pagemeta) {
+                            page->pagemeta->unref();
+                        }
                         continue;
                     }
 
                     // Re-check dirty flag after acquiring page lock.
                     if (!page->testflag(NMem::PAGE_DIRTY)) {
                         page->pageunlock();
-                        page->unref();
+                        if (page->pagemeta) {
+                            page->pagemeta->unref();
+                        }
                         continue;
                     }
 
@@ -237,7 +234,9 @@ namespace NFS {
                         // Unlock and unref flushed pages.
                         for (size_t j = 0; j < batchcount; j++) {
                             batch[j]->pageunlock();
-                            batch[j]->unref();
+                            if (batch[j]->pagemeta) {
+                                batch[j]->pagemeta->unref();
+                            }
                         }
                         batchcount = 0;
                     }
@@ -258,7 +257,9 @@ namespace NFS {
                         }
                         for (size_t j = 0; j < batchcount; j++) {
                             batch[j]->pageunlock();
-                            batch[j]->unref();
+                            if (batch[j]->pagemeta) {
+                                batch[j]->pagemeta->unref();
+                            }
                         }
                         batchcount = 0;
                     }
@@ -278,7 +279,9 @@ namespace NFS {
                 }
                 for (size_t i = 0; i < batchcount; i++) {
                     batch[i]->pageunlock();
-                    batch[i]->unref();
+                    if (batch[i]->pagemeta) {
+                        batch[i]->pagemeta->unref();
+                    }
                 }
             }
 
@@ -537,7 +540,18 @@ namespace NFS {
                 }
 
                 // Copy data to user buffer.
-                NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
+                if (NMem::UserCopy::iskernel(dest, toread)) { // XXX: This way of doing things is scary, because we now have to protect every user-facing read with a validation before letting it ever touch readcached().
+                    NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
+                } else {
+                    int ret = NMem::UserCopy::copyto(dest, (uint8_t *)page->data() + offwithinpage, toread);
+                    if (ret < 0) {
+                        page->pageunlock();
+                        if (totalread > 0) {
+                            return totalread;
+                        }
+                        return ret;
+                    }
+                }
 
                 page->setflag(NMem::PAGE_REFERENCED);
                 page->pageunlock();
@@ -592,11 +606,28 @@ namespace NFS {
                 }
 
                 // Copy data from user buffer.
-                NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
+                if (NMem::UserCopy::iskernel(src, towrite)) { // XXX: This way of doing things is scary, because we now have to protect every user-facing write with a validation before letting it ever touch writecached().
+                    NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
+                } else {
+                    int ret = NMem::UserCopy::copyfrom((uint8_t *)page->data() + offwithinpage, src, towrite);
+                    if (ret < 0) {
+                        page->pageunlock();
+                        if (totalwritten > 0) {
+                            return totalwritten;
+                        }
+                        return ret;
+                    }
+                }
 
                 page->setflag(NMem::PAGE_UPTODATE);
                 page->markdirty();
                 page->pageunlock();
+
+                // Throttle if too many dirty pages to prevent unbounded dirty page growth.
+                if (NMem::pagecache && NMem::pagecache->shouldthrottle()) {
+                    NMem::pagecache->wakewriteback();
+                    NSched::yield(); // Give writeback thread a chance to run.
+                }
 
                 src += towrite;
                 offset += towrite;
@@ -746,7 +777,7 @@ namespace NFS {
         }
 
         int VFS::umount(const char *_path, int flags) {
-            // Normalize and validate path.
+            // Normalise and validate path.
             Path upath = Path(_path);
 
             // Umount paths must be absolute.
@@ -1191,7 +1222,9 @@ namespace NFS {
             parent->unref();
 
             node->ref(); // Increment refcount before returning, matching resolve() contract.
-            *nodeout = node;
+            if (nodeout) {
+                *nodeout = node;
+            }
             return 0;
         }
 
@@ -1490,7 +1523,7 @@ namespace NFS {
             return newfd;
         }
 
-        int FileDescriptorTable::dup2(int oldfd, int newfd, bool fcntl) {
+        int FileDescriptorTable::dup2(int oldfd, int newfd, bool fcntl, bool cloexec) {
             NLib::ScopeWriteLock guard(&this->lock);
 
             if (oldfd < 0 || oldfd >= (int)this->fds.getsize() || !this->fds[oldfd] || !this->openfds.test(oldfd)) { // Discard if we can tell that the FD is bad.
@@ -1571,7 +1604,11 @@ namespace NFS {
             this->fds[newfd] = this->fds[oldfd];
             this->fds[newfd]->ref();
             this->openfds.set(newfd); // Occupy new FD.
-            this->closeonexec.clear(newfd); // dup2 clears close-on-exec per POSIX.
+            if (cloexec) {
+                this->closeonexec.set(newfd); // dup3 with O_CLOEXEC sets close-on-exec.
+            } else {
+                this->closeonexec.clear(newfd); // dup2 clears close-on-exec per POSIX.
+            }
             return newfd;
         }
 
@@ -1597,17 +1634,14 @@ namespace NFS {
 
             for (size_t i = 0; i < this->fds.getsize(); i++) {
                 if (this->openfds.test(i)) { // There is an open FD, copy it.
+                    assert(this->fds[i] != NULL, "FD marked as open but descriptor is NULL!");
                     newtable->fds[i] = this->fds[i]; // Copy reference to same FileDescriptor.
                     newtable->fds[i]->ref(); // Increase refcount.
                     newtable->openfds.set(i); // Mark as allocated.
 
-
                     if (this->closeonexec.test(i)) { // If this is also marked as close on exec.
                         newtable->closeonexec.set(i); // Mark as allocated.
                     }
-                } else {
-                    this->openfds.clear(i);
-                    this->closeonexec.clear(i);
                 }
             }
 
@@ -1642,8 +1676,9 @@ namespace NFS {
             NLib::ScopeWriteLock guard(&this->lock);
 
             for (size_t i = 0; i < this->closeonexec.getsize(); i++) { // Effectively the same logic as closeall(), but we only close FDs marked as close-on-exec.
-                if (this->closeonexec.test(i)) {
+                if (this->closeonexec.test(i) && this->openfds.test(i)) {
                     FileDescriptor *desc = this->fds[i];
+                    assert(desc != NULL, "closeonexec and openfds set but descriptor is NULL!");
                     if (desc->unref() == 0) {
                         INode *node = desc->getnode();
                         node->close(desc->getflags());

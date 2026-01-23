@@ -30,19 +30,28 @@ void *uacpi_kernel_map(uacpi_phys_addr phys, uacpi_size length) {
     using namespace NArch::VMM;
     using namespace NMem::Virt;
 
-    NLib::ScopeIRQSpinlock guard(&kspace.lock);
-    uintptr_t virt = (uintptr_t)kspace.vmaspace->alloc(length, VIRT_RW | VIRT_NX);
-    NArch::VMM::_maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NLib::alignup(length, NArch::PAGESIZE));
+    uintptr_t virt;
+    {
+        NLib::ScopeIRQSpinlock guard(&kspace.lock);
+        virt = (uintptr_t)kspace.vmaspace->alloc(length, VIRT_RW | VIRT_NX);
+        NArch::VMM::_maprange(&kspace, virt, phys, PRESENT | WRITEABLE | NOEXEC, NLib::alignup(length, NArch::PAGESIZE), false);
+    }
+    doshootdown(SHOOTDOWN_RANGE, virt, virt + NLib::alignup(length, NArch::PAGESIZE));
     size_t offset = phys - NLib::aligndown(phys, NArch::PAGESIZE);
     return (void *)(virt + offset);
 }
 
 void uacpi_kernel_unmap(void *ptr, uacpi_size length) {
     using namespace NArch::VMM;
-    NLib::ScopeIRQSpinlock guard(&kspace.lock);
 
-    NArch::VMM::_unmaprange(&kspace, (uintptr_t)ptr, NLib::alignup(length, NArch::PAGESIZE));
-    kspace.vmaspace->free(ptr, length);
+    uintptr_t start = (uintptr_t)ptr;
+    size_t alignedlen = NLib::alignup(length, NArch::PAGESIZE);
+    {
+        NLib::ScopeIRQSpinlock guard(&kspace.lock);
+        NArch::VMM::_unmaprange(&kspace, start, alignedlen, false);
+        kspace.vmaspace->free(ptr, length);
+    }
+    doshootdown(SHOOTDOWN_RANGE, start, start + alignedlen);
 }
 
 namespace NArch {

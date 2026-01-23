@@ -205,7 +205,7 @@ namespace NArch {
                 CPU::get()->hasrdseed = true;
             }
 
-            // Initialize TLB shootdown generation tracking for this CPU.
+            // Initialise TLB shootdown generation tracking for this CPU.
             struct cpulocal *local = CPU::get();
             __atomic_store_n(&local->tlbgeneration, 0, memory_order_seq_cst);
         }

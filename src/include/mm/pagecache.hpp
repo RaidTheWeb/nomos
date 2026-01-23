@@ -116,9 +116,6 @@ namespace NMem {
             // Get virtual address of page data via HHDM.
             void *data(void);
 
-            void ref(void);
-            void unref(void);
-
             // Add a mapping from an address space to this cached page.
             void addmapping(NArch::VMM::addrspace *space, uintptr_t virtaddr);
             // Remove a specific mapping from this page.
@@ -227,7 +224,7 @@ namespace NMem {
             PageCache(void);
             ~PageCache(void);
 
-            // Initialize with memory limits.
+            // Initialise with memory limits.
             void init(size_t maxpages, size_t targetfree);
 
             CachePage *findpage(NFS::VFS::INode *inode, off_t offset);
@@ -239,12 +236,6 @@ namespace NMem {
             // Remove a page from the cache. Page must be locked.
             void removepage(CachePage *page);
 
-            // Read data from cache, populating from backing store if needed.
-            ssize_t read(NFS::VFS::INode *inode, void *buf, size_t count, off_t offset);
-
-            // Write data to cache, marking pages dirty.
-            ssize_t write(NFS::VFS::INode *inode, const void *buf, size_t count, off_t offset);
-
             // Write back all dirty pages for an inode.
             int syncnode(NFS::VFS::INode *inode);
             // Write back all dirty pages globally.
@@ -253,7 +244,7 @@ namespace NMem {
             // Background writeback thread entry point.
             void writebackthread(void);
 
-            // Start the writeback thread. Called after scheduler is initialized.
+            // Start the writeback thread. Called after scheduler is initialised.
             void startwritebackthread(void);
 
             // Immediately wake the writeback thread.
@@ -281,10 +272,17 @@ namespace NMem {
                 return this->dirtypages;
             }
             uint64_t gethits(void) const {
-                return this->cachehits;
+                return __atomic_load_n(&this->cachehits, memory_order_relaxed);
             }
             uint64_t getmisses(void) const {
-                return this->cachemisses;
+                return __atomic_load_n(&this->cachemisses, memory_order_relaxed);
+            }
+
+            void inchits(void) {
+                __atomic_add_fetch(&this->cachehits, 1, memory_order_relaxed);
+            }
+            void incmisses(void) {
+                __atomic_add_fetch(&this->cachemisses, 1, memory_order_relaxed);
             }
 
             void incdirtypages(void) {
@@ -309,7 +307,7 @@ namespace NMem {
     // Global page cache instance.
     extern PageCache *pagecache;
 
-    // Initialize the global page cache subsystem.
+    // Initialise the global page cache subsystem.
     void initpagecache(void);
 
     // Start the page cache writeback thread (call after scheduler init).

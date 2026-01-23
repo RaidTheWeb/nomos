@@ -42,7 +42,7 @@ namespace NSched {
         DFL_TERMINATE,              // SIGTERM
         DFL_TERMINATE,              // SIGSTKFLT
         DFL_IGNORE,                 // SIGCHLD
-        DFL_IGNORE,                 // SIGCONT
+        DFL_CONTINUE,               // SIGCONT
         DFL_STOP,                   // SIGSTOP
         DFL_STOP,                   // SIGTSTP
         DFL_STOP,                   // SIGTTIN
@@ -85,9 +85,56 @@ namespace NSched {
                     NSched::exit(1, sig);
                     // Unreachable.
                     __builtin_unreachable();
-                case DFL_STOP:
-                    // TODO: Implement stop/continue mechanism.
+                case DFL_STOP: {
+                    // Stop the process: pause all threads and set process state to STOPPED.
+                    proc->pstate = Process::state::STOPPED;
+                    proc->stopsig = sig;
+
+                    // Wake parent's exitwq so waitpid(WUNTRACED) can return.
+                    if (proc->parent) {
+                        proc->parent->exitwq.wake();
+                    }
+
+                    // Mark this thread as PAUSED; it will stop after returning.
+                    __atomic_store_n(&thread->tstate, Thread::state::PAUSED, memory_order_release);
+
+                    // Mark all other threads in the process as PAUSED too.
+                    NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
+                    for (; it.valid(); it.next()) {
+                        Thread *t = *it.get();
+                        if (t != thread) {
+                            __atomic_store_n(&t->tstate, Thread::state::PAUSED, memory_order_release);
+                        }
+                    }
+
+                    proc->lock.release();
+
+                    // Yield to let the scheduler handle the pause.
+                    NSched::yield();
+
+                    // When we return here, SIGCONT was received.
                     return;
+                }
+                case DFL_CONTINUE: {
+                    // Continue the process if it was stopped.
+                    if (proc->pstate == Process::state::STOPPED) {
+                        proc->pstate = Process::state::RUNNING;
+                        proc->stopsig = 0;
+
+                        // Wake all threads in the process that are paused.
+                        NLib::DoubleList<Thread *>::Iterator it = proc->threads.begin();
+                        for (; it.valid(); it.next()) {
+                            Thread *t = *it.get();
+                            enum Thread::state tstate = (enum Thread::state)__atomic_load_n(&t->tstate, memory_order_acquire);
+                            if (tstate == Thread::state::PAUSED) {
+                                // Schedule the thread to run again.
+                                setthreadstate(t, Thread::state::READY, "signal:SIGCONT");
+                                NSched::schedulethread(t);
+                            }
+                        }
+                    }
+                    return;
+                }
             }
         } else if (action->handler == SIG_IGN) {
             return; // Explicitly ignored.
@@ -364,9 +411,51 @@ namespace NSched {
 
             pg->unref();
         } else if (pid == -1) { // Send to all processes we have permission to send to.
-            // XXX: Figure out how the hell to do this efficiently.
-            // This would basically be what is used when shutting down the system.
-            SYSCALL_RET(-ENOSYS); // Not implemented.
+            // It doesn't MATTER if we need to make it efficient, because - to my knowledge - kill(-1, sig) is only really used where time doesn't matter.
+            Process *current = NArch::CPU::get()->currthread->process;
+
+            current->lock.acquire();
+            int uid = current->euid;
+            current->lock.release();
+
+            int signalled = 0;
+            int lasterr = 0;
+
+            // Iterate through all processes and signal those we have permission for.
+            NLib::ScopeIRQSpinlock guard(&pidtablelock);
+            for (auto it = pidtable->begin(); it.valid(); it.next()) {
+                Process *proc = *it.value();
+
+                // Skip ourselves and the init process (PID 1).
+                if (proc == current || proc->id == 1) {
+                    continue;
+                }
+
+                // Skip kernel processes.
+                if (proc->kernel) {
+                    continue;
+                }
+
+                // Check permissions: root can signal anyone, otherwise check UIDs.
+                proc->lock.acquire();
+                bool hasperm = (uid == 0 || uid == proc->uid || uid == proc->suid);
+                proc->lock.release();
+
+                if (!hasperm) {
+                    lasterr = -EPERM;
+                    continue;
+                }
+
+                signalproc(proc, sig);
+                signalled++;
+            }
+
+            // If we signalled at least one process, return success.
+            // Otherwise return the last error (likely EPERM).
+            if (signalled > 0) {
+                SYSCALL_RET(0);
+            }
+            SYSCALL_RET(lasterr ? lasterr : -ESRCH);
         } else if (pid < -1) { // Send to specific process group.
             NLib::ScopeIRQSpinlock pidguard(&pidtablelock);
 
@@ -480,6 +569,7 @@ namespace NSched {
         // XXX: Investigate potentially incorrect syscall return values.
         return ctx->rax; // Return original RAX so interrupted system calls return their original value.
 #else
+        assert(false, "sys_sigreturn not implemented on this architecture.");
         SYSCALL_RET(-ENOSYS);
 #endif
     }
@@ -650,8 +740,7 @@ namespace NSched {
             SYSCALL_RET(-EFAULT);
         }
 
-        // Only ITIMER_REAL is implemented for now.
-        if (which != ITIMER_REAL) {
+        if (which != ITIMER_REAL && which != ITIMER_VIRTUAL && which != ITIMER_PROF) {
             SYSCALL_RET(-EINVAL);
         }
 
@@ -664,14 +753,34 @@ namespace NSched {
         NLib::ScopeIRQSpinlock guard(&proc->lock);
 
         struct itimerval kval;
+        uint64_t deadline = 0;
+        uint64_t interval = 0;
+        uint64_t currentticks = 0;
+
+#ifdef __x86_64__
+        switch (which) {
+            case ITIMER_REAL:
+                deadline = proc->itimerdeadline;
+                interval = proc->itimerintv;
+                currentticks = NArch::TSC::query();
+                break;
+            case ITIMER_VIRTUAL:
+                deadline = proc->itimervirtdeadline;
+                interval = proc->itimervirtintv;
+                currentticks = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed);
+                break;
+            case ITIMER_PROF:
+                deadline = proc->itimerprofdeadline;
+                interval = proc->itimerprofintv;
+                currentticks = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed);
+                break;
+        }
 
         // Calculate remaining time.
-        if (proc->itimerdeadline > 0) {
-#ifdef __x86_64__
-            uint64_t now = NArch::TSC::query();
-            if (proc->itimerdeadline > now) {
+        if (deadline > 0) {
+            if (deadline > currentticks) {
                 // Convert TSC ticks to microseconds.
-                uint64_t remaining_ticks = proc->itimerdeadline - now;
+                uint64_t remaining_ticks = deadline - currentticks;
                 uint64_t remaining_usec = (remaining_ticks * 1000000) / NArch::TSC::hz;
                 usectimeval(remaining_usec, &kval.it_value);
             } else {
@@ -679,17 +788,19 @@ namespace NSched {
                 kval.it_value.tv_sec = 0;
                 kval.it_value.tv_usec = 0;
             }
-#else
-            kval.it_value.tv_sec = 0;
-            kval.it_value.tv_usec = 0;
-#endif
         } else {
             kval.it_value.tv_sec = 0;
             kval.it_value.tv_usec = 0;
         }
 
         // Return the interval.
-        usectimeval(proc->itimerintv, &kval.it_interval);
+        usectimeval(interval, &kval.it_interval);
+#else
+        kval.it_value.tv_sec = 0;
+        kval.it_value.tv_usec = 0;
+        kval.it_interval.tv_sec = 0;
+        kval.it_interval.tv_usec = 0;
+#endif
 
         int ret = NMem::UserCopy::copyto(curr_value, &kval, sizeof(struct itimerval));
         if (ret < 0) {
@@ -702,8 +813,7 @@ namespace NSched {
     extern "C" int sys_setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value) {
         SYSCALL_LOG("sys_setitimer(%d, %p, %p).\n", which, new_value, old_value);
 
-        // Only ITIMER_REAL is implemented for now.
-        if (which != ITIMER_REAL) {
+        if (which != ITIMER_REAL && which != ITIMER_VIRTUAL && which != ITIMER_PROF) {
             SYSCALL_RET(-EINVAL);
         }
 
@@ -718,29 +828,44 @@ namespace NSched {
         // Return old value if requested.
         if (old_value) {
             struct itimerval kold;
+            uint64_t deadline = 0;
+            uint64_t interval = 0;
+            uint64_t currentticks = 0;
 
-            // Calculate remaining time.
-            if (proc->itimerdeadline > 0) {
 #ifdef __x86_64__
-                uint64_t now = NArch::TSC::query();
-                if (proc->itimerdeadline > now) {
-                    uint64_t remaining_ticks = proc->itimerdeadline - now;
-                    uint64_t remaining_usec = (remaining_ticks * 1000000) / NArch::TSC::hz;
-                    usectimeval(remaining_usec, &kold.it_value);
-                } else {
-                    kold.it_value.tv_sec = 0;
-                    kold.it_value.tv_usec = 0;
-                }
-#else
-                kold.it_value.tv_sec = 0;
-                kold.it_value.tv_usec = 0;
-#endif
+            switch (which) {
+                case ITIMER_REAL:
+                    deadline = proc->itimerdeadline;
+                    interval = proc->itimerintv;
+                    currentticks = NArch::TSC::query();
+                    break;
+                case ITIMER_VIRTUAL:
+                    deadline = proc->itimervirtdeadline;
+                    interval = proc->itimervirtintv;
+                    currentticks = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed);
+                    break;
+                case ITIMER_PROF:
+                    deadline = proc->itimerprofdeadline;
+                    interval = proc->itimerprofintv;
+                    currentticks = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed);
+                    break;
+            }
+
+            if (deadline > 0 && deadline > currentticks) {
+                uint64_t remaining_ticks = deadline - currentticks;
+                uint64_t remaining_usec = (remaining_ticks * 1000000) / NArch::TSC::hz;
+                usectimeval(remaining_usec, &kold.it_value);
             } else {
                 kold.it_value.tv_sec = 0;
                 kold.it_value.tv_usec = 0;
             }
-
-            usectimeval(proc->itimerintv, &kold.it_interval);
+            usectimeval(interval, &kold.it_interval);
+#else
+            kold.it_value.tv_sec = 0;
+            kold.it_value.tv_usec = 0;
+            kold.it_interval.tv_sec = 0;
+            kold.it_interval.tv_usec = 0;
+#endif
 
             int ret = NMem::UserCopy::copyto(old_value, &kold, sizeof(struct itimerval));
             if (ret < 0) {
@@ -765,22 +890,42 @@ namespace NSched {
             uint64_t value_usec = timevalusec(&knew.it_value);
             uint64_t interval_usec = timevalusec(&knew.it_interval);
 
-            proc->itimerintv = interval_usec;
-
-            if (value_usec > 0) {
 #ifdef __x86_64__
-                // Convert microseconds to TSC ticks and set deadline.
-                uint64_t ticks = (value_usec * NArch::TSC::hz) / 1000000;
-                proc->itimerdeadline = NArch::TSC::query() + ticks;
-#else
-                proc->itimerdeadline = 0;
-#endif
-            } else {
-                // Disarm the timer.
-                proc->itimerdeadline = 0;
-            }
+            uint64_t ticks = (value_usec * NArch::TSC::hz) / 1000000;
 
-            proc->itimerreal = value_usec;
+            switch (which) {
+                case ITIMER_REAL:
+                    proc->itimerintv = interval_usec;
+                    if (value_usec > 0) {
+                        proc->itimerdeadline = NArch::TSC::query() + ticks;
+                    } else {
+                        proc->itimerdeadline = 0;
+                    }
+                    proc->itimerreal = value_usec;
+                    break;
+                case ITIMER_VIRTUAL:
+                    proc->itimervirtintv = interval_usec;
+                    if (value_usec > 0) {
+                        // Deadline based on process CPU time.
+                        proc->itimervirtdeadline = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed) + ticks;
+                    } else {
+                        proc->itimervirtdeadline = 0;
+                    }
+                    break;
+                case ITIMER_PROF:
+                    proc->itimerprofintv = interval_usec;
+                    if (value_usec > 0) {
+                        // Deadline based on process CPU time.
+                        proc->itimerprofdeadline = __atomic_load_n(&proc->cputimeticks, memory_order_relaxed) + ticks;
+                    } else {
+                        proc->itimerprofdeadline = 0;
+                    }
+                    break;
+            }
+#else
+            (void)value_usec;
+            (void)interval_usec;
+#endif
         }
 
         SYSCALL_RET(0);

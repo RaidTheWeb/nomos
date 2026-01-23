@@ -10,6 +10,8 @@ namespace NSys {
             const uint8_t endianness = 1;
             const uint8_t bits = 2;
             const uint8_t isa = 0x3e;
+#else
+            assert(false, "verifyheader not implemented on this architecture.");
 #endif
 
             if (hdr->magic != MAGIC) {

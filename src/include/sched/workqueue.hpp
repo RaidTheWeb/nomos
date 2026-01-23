@@ -67,7 +67,7 @@ namespace NSched {
             void flush(void);
             void drain(void);
 
-            // Workqueue subsystem initialization.
+            // Workqueue subsystem initialisation.
             static void init(void);
         private:
             WorkerPool *getpoolforwork(void);
@@ -117,7 +117,7 @@ namespace NSched {
             void spawnworker(void);
             bool maybespawnworker(void); // Spawn worker if needed and under limit.
 
-            // Worker pool subsystem initialization.
+            // Worker pool subsystem initialisation.
             static void init(void);
     };
 

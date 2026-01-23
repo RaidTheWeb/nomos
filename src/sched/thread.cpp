@@ -42,7 +42,7 @@ namespace NSched {
         // Allocate thread ID.
         this->id = __atomic_fetch_add(&this->process->tidcounter, 1, memory_order_seq_cst);
 
-        // Initialize per-thread signal mask to 0 (no signals blocked).
+        // Initialise per-thread signal mask to 0 (no signals blocked).
         this->blocked = 0;
 
         // Zero context.
@@ -78,6 +78,8 @@ namespace NSched {
                 CPU::wrcr0(cr0); // Restore original CR0 (restores TS).
             }
         }
+#else
+        assert(false, "Thread init not implemented on this architecture.");
 #endif
     }
 

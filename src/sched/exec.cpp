@@ -784,6 +784,7 @@ namespace NSched {
 
         SYSCALL_RET(sysctx->rax);
 #else
+        assert(false, "sys_execve not implemented on this architecture.");
         // Other architectures not implemented yet.
         current->lock.release();
         if (procroot) {

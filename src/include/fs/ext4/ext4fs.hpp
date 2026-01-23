@@ -280,6 +280,15 @@ namespace NFS {
                 // Compute directory block checksum.
                 uint32_t dirblockchecksum(uint32_t ino, uint32_t gen, void *block, size_t len);
 
+                // Compute block bitmap checksum.
+                uint32_t blockbitmapchecksum(uint32_t group, const void *bitmap);
+
+                // Compute inode bitmap checksum.
+                uint32_t inodebitmapchecksum(uint32_t group, const void *bitmap);
+
+                // Compute extent block checksum.
+                uint32_t extentblockchecksum(uint32_t ino, uint32_t gen, const void *block, size_t len);
+
                 // Check if filesystem has HUGE_FILE feature.
                 bool hugefile(void) const {
                     return this->sb.featrocompat & EXT4_FEATUREROCOMPATHUGEFILE;

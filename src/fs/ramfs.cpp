@@ -6,6 +6,7 @@
 #include <lib/errno.hpp>
 #include <fs/pipefs.hpp>
 #include <mm/pagecache.hpp>
+#include <mm/ucopy.hpp>
 
 namespace NFS {
     namespace RAMFS {
@@ -52,7 +53,15 @@ namespace NFS {
                 count = this->attr.st_size - offset;
             }
 
-            NLib::memcpy(buf, this->data + offset, count);
+            if (NMem::UserCopy::iskernel(buf, count)) {
+                NLib::memcpy((uint8_t *)buf, this->data + offset, count);
+            } else {
+                ssize_t ret = NMem::UserCopy::copyto(buf, this->data + offset, count);
+                if (ret < 0) {
+                    this->datalock.release();
+                    return ret;
+                }
+            }
             this->datalock.release();
             return count;
         }
@@ -69,7 +78,15 @@ namespace NFS {
                 assert(this->data, "Failed to grow file data.\n");
             }
 
-            NLib::memcpy(this->data + offset, (void *)buf, count);
+            if (NMem::UserCopy::iskernel((void *)buf, count)) {
+                NLib::memcpy(this->data + offset, (void *)buf, count);
+            } else {
+                ssize_t ret = NMem::UserCopy::copyfrom(this->data + offset, (const void *)buf, count);
+                if (ret < 0) {
+                    this->datalock.release();
+                    return ret;
+                }
+            }
             this->datalock.release();
             return count;
         }
@@ -192,8 +209,11 @@ namespace NFS {
                 tocopy = bufsiz;
             }
 
-            NLib::memcpy(buf, this->data, tocopy);
+            ssize_t ret = NMem::UserCopy::copyto(buf, this->data, tocopy);
             this->datalock.release();
+            if (ret < 0) {
+                return ret;
+            }
             return tocopy;
         }
 
@@ -214,12 +234,19 @@ namespace NFS {
                     return bytesread;
                 }
                 struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
-                dentry->d_ino = this->attr.st_ino;
-                dentry->d_off = bytesread + reclen;
-                dentry->d_reclen = (uint16_t)reclen;
-                dentry->d_type = VFS::S_IFDIR >> 12;
-                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                dentry->d_name[0] = '.';
+
+                struct VFS::dirent kdentry;
+                kdentry.d_ino = this->attr.st_ino;
+                kdentry.d_off = bytesread + reclen;
+                kdentry.d_reclen = (uint16_t)reclen;
+                kdentry.d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                kdentry.d_name[0] = '.';
+
+                int ret = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                if (ret < 0) {
+                    return ret;
+                }
                 bytesread += reclen;
             }
             curroffset += reclen;
@@ -230,23 +257,30 @@ namespace NFS {
                     return bytesread;
                 }
                 struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
+                struct VFS::dirent kdentry;
 
                 INode *root = this->fs->getroot();
                 if (root == this) {
-                    dentry->d_ino = this->attr.st_ino; // Parent of root is root.
+                    kdentry.d_ino = this->attr.st_ino; // Parent of root is root.
                 } else if (this->parent) {
-                    dentry->d_ino = this->parent->getattr().st_ino;
+                    kdentry.d_ino = this->parent->getattr().st_ino;
                 } else {
-                    dentry->d_ino = 0; // No parent.
+                    kdentry.d_ino = 0; // No parent.
                 }
                 root->unref();
 
-                dentry->d_off = bytesread + reclen;
-                dentry->d_reclen = (uint16_t)reclen;
-                dentry->d_type = VFS::S_IFDIR >> 12;
-                NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                dentry->d_name[0] = '.';
-                dentry->d_name[1] = '.';
+                kdentry.d_off = bytesread + reclen;
+                kdentry.d_reclen = (uint16_t)reclen;
+                kdentry.d_type = VFS::S_IFDIR >> 12;
+                NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                kdentry.d_name[0] = '.';
+                kdentry.d_name[1] = '.';
+
+                int ret = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                if (ret < 0) {
+                    return ret;
+                }
+
                 bytesread += reclen;
             }
             curroffset += reclen;
@@ -261,12 +295,19 @@ namespace NFS {
                     }
 
                     struct VFS::dirent *dentry = (struct VFS::dirent *)((uint8_t *)buf + bytesread);
-                    dentry->d_ino = child->attr.st_ino;
-                    dentry->d_off = bytesread + reclen;
-                    dentry->d_reclen = (uint16_t)reclen;
-                    dentry->d_type = (child->attr.st_mode & VFS::S_IFMT) >> 12; // File type is stored in the high bits of st_mode.
-                    NLib::memset(dentry->d_name, 0, sizeof(dentry->d_name));
-                    NLib::strncpy(dentry->d_name, (char *)child->getname(), sizeof(dentry->d_name) - 1);
+                    struct VFS::dirent kdentry;
+
+                    kdentry.d_ino = child->attr.st_ino;
+                    kdentry.d_off = bytesread + reclen;
+                    kdentry.d_reclen = (uint16_t)reclen;
+                    kdentry.d_type = (child->attr.st_mode & VFS::S_IFMT) >> 12; // File type is stored in the high bits of st_mode.
+                    NLib::memset(kdentry.d_name, 0, sizeof(kdentry.d_name));
+                    NLib::strncpy(kdentry.d_name, (char *)child->getname(), sizeof(kdentry.d_name) - 1);
+
+                    int ret = NMem::UserCopy::copyto(dentry, &kdentry, sizeof(struct VFS::dirent));
+                    if (ret < 0) {
+                        return ret;
+                    }
 
                     bytesread += reclen;
                 }

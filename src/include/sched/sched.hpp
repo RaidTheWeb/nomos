@@ -90,6 +90,7 @@ namespace NSched {
 
             enum state {
                 RUNNING,
+                STOPPED,  // Process is stopped (via SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU).
                 ZOMBIE,
                 REAPING, // Being reaped by waitpid - prevents double-reap races.
                 DEAD
@@ -97,6 +98,7 @@ namespace NSched {
 
             enum state pstate = state::RUNNING;
             int exitstatus = 0;
+            int stopsig = 0; // Signal that caused the stop (for WUNTRACED reporting).
             WaitQueue exitwq; // Wait queue to await completion of this process.
 
             bool kernel = false;
@@ -142,6 +144,15 @@ namespace NSched {
             uint64_t itimerreal = 0; // Time until next SIGALRM for ITIMER_REAL.
             uint64_t itimerintv = 0; // Interval for ITIMER_REAL.
             uint64_t itimerdeadline = 0; // TSC deadline for ITIMER_REAL.
+
+            // CPU time tracking for CLOCK_PROCESS_CPUTIME_ID.
+            volatile uint64_t cputimeticks = 0; // Accumulated CPU time in TSC ticks.
+
+            // ITIMER_VIRTUAL and ITIMER_PROF support.
+            uint64_t itimervirtdeadline = 0; // TSC deadline for ITIMER_VIRTUAL (user CPU time).
+            uint64_t itimervirtintv = 0;     // Interval for ITIMER_VIRTUAL.
+            uint64_t itimerprofdeadline = 0; // TSC deadline for ITIMER_PROF (user + system CPU time).
+            uint64_t itimerprofintv = 0;     // Interval for ITIMER_PROF.
 
             Process(struct NArch::VMM::addrspace *space) {
                 this->init(space, NULL);
@@ -258,6 +269,9 @@ namespace NSched {
             NLib::sigset_t blocked = 0; // Signals blocked in this thread.
             NArch::IRQSpinlock waitingonlock; // Lock for waitingon property.
             WaitQueue *waitingon = NULL; // Waitqueue this thread is sleeping on (if any).
+
+            // CPU time tracking for CLOCK_THREAD_CPUTIME_ID (in TSC ticks).
+            volatile uint64_t cputimeticks = 0;
 
             // Alternate signal stack.
             void *altstackbase = NULL;

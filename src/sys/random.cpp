@@ -33,6 +33,8 @@ namespace NSys {
             if (target != NArch::CPU::get()->id) {
                 NArch::SMP::cpulist[target]->entropypool->addentropy(data, sizeof(data), 4);
             }
+#else
+            assert(false, "Input event entropy collection not implemented on this architecture.");
 #endif
         }
 
@@ -146,11 +148,11 @@ namespace NSys {
                 this->chacha20state[4 + i] = key[i * 4] | (key[i * 4 + 1] << 8) | (key[i * 4 + 2] << 16) | (key[i * 4 + 3] << 24);
             }
 
-            // Initialize counter to 0.
+            // Initialise counter to 0.
             this->chacha20state[12] = 0;
             this->chacha20state[13] = 0;
 
-            // Initialize nonce to 0.
+            // Initialise nonce to 0.
             this->chacha20state[14] = 0;
             this->chacha20state[15] = 0;
 
@@ -232,7 +234,19 @@ namespace NSys {
                     chacha20block(this->chacha20state, this->keystream);
                     this->keystreampos = 0;
                 }
-                buf[i] = this->keystream[this->keystreampos++];
+
+                if (NMem::UserCopy::iskernel(&buf[i], 1)) {
+                    buf[i] = this->keystream[this->keystreampos];
+                    this->keystreampos++;
+                    continue;
+                }
+
+                ssize_t ret = NMem::UserCopy::copyto(&buf[i], &this->keystream[this->keystreampos], 1);
+                if (ret < 0) {
+                    this->lock.release();
+                    return ret;
+                }
+                this->keystreampos++;
             }
 
             // For /dev/random, deduct entropy bits for the bytes we returned.
@@ -324,6 +338,8 @@ namespace NSys {
                     }
                 }
             }
+#else
+            assert(false, "Per-CPU entropy pool allocation not implemented on this architecture.");
 #endif
 
             // Subscribe to input events for entropy. Other sources of entropy are handled in their respective subsystems.

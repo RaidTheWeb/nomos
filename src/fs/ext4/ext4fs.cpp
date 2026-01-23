@@ -247,9 +247,9 @@ namespace NFS {
                             this->setinodebitmappadding(bitmap);
 
                             res = this->writeblock(bitmapblk, bitmap);
-                            delete[] bitmap;
 
                             if (res < 0) {
+                                delete[] bitmap;
                                 return 0;
                             }
 
@@ -257,6 +257,15 @@ namespace NFS {
                             freeinodes--;
                             gd->freeinodecountlo = freeinodes & 0xFFFF;
                             gd->freeinodecounthi = (freeinodes >> 16) & 0xFFFF;
+
+                            // Update inode bitmap checksum in group descriptor if checksums are enabled.
+                            if (this->haschecksums) {
+                                uint32_t bitmapchecksum = this->inodebitmapchecksum(group, bitmap);
+                                gd->inodebitmapcsumlo = bitmapchecksum & 0xFFFF;
+                                gd->inodebitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
+                            }
+
+                            delete[] bitmap;
 
                             // Update directory count if allocating for a directory.
                             if (isdir) {
@@ -323,9 +332,9 @@ namespace NFS {
             this->setinodebitmappadding(bitmap);
 
             res = this->writeblock(bitmapblk, bitmap);
-            delete[] bitmap;
 
             if (res < 0) {
+                delete[] bitmap;
                 return res;
             }
 
@@ -334,6 +343,15 @@ namespace NFS {
             freeinodes++;
             gd->freeinodecountlo = freeinodes & 0xFFFF;
             gd->freeinodecounthi = (freeinodes >> 16) & 0xFFFF;
+
+            // Update inode bitmap checksum in group descriptor if checksums are enabled.
+            if (this->haschecksums) {
+                uint32_t bitmapchecksum = this->inodebitmapchecksum(group, bitmap);
+                gd->inodebitmapcsumlo = bitmapchecksum & 0xFFFF;
+                gd->inodebitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
+            }
+
+            delete[] bitmap;
 
             // Update directory count if freeing a directory.
             if (isdir) {
@@ -394,73 +412,114 @@ namespace NFS {
         }
 
         void Ext4FileSystem::computecsumseed(void) {
-            // Initialize CRC32c table.
+            // Initialise CRC32c table.
             NLib::crc32cinit();
 
             if (this->sb.featincompat & EXT4_FEATUREINCOMPATCSUMSEED) {
                 // Use pre-computed seed from superblock.
                 this->csumseed = this->sb.csumseed;
             } else {
-                // Compute seed from filesystem UUID.
-                this->csumseed = NLib::crc32cfinal(this->sb.uuid, 16);
+                // Compute seed from filesystem UUID (raw CRC, no finalisation).
+                this->csumseed = NLib::crc32c(~0U, this->sb.uuid, 16);
             }
         }
 
         uint32_t Ext4FileSystem::sbchecksum(void) {
             // Superblock checksum covers bytes 0 to 0x3FC (checksum field at offset 0x3FC excluded).
-            return NLib::crc32cfinal(&this->sb, offsetof(struct superblock, checksum));
+            return NLib::crc32c(~0U, &this->sb, offsetof(struct superblock, checksum));
         }
 
         uint16_t Ext4FileSystem::gdchecksum(uint32_t group, struct groupdesc *gd) {
-            // Group descriptor checksum uses the checksum seed.
-            uint32_t crc = NLib::crc32c(~0U, &this->csumseed, sizeof(this->csumseed));
-            crc = NLib::crc32c(crc, &group, sizeof(group));
+            // Group descriptor checksum uses the checksum seed as initial CRC value.
+            uint32_t crc = NLib::crc32c(this->csumseed, &group, sizeof(group));
 
-            // Checksum covers everything except the checksum field itself.
+            // Checksum covers everything, with checksum field treated as zeros.
             uint16_t descsize = this->sb.descsize ? this->sb.descsize : 32;
             size_t csumoffset = offsetof(struct groupdesc, checksum);
 
             // Hash bytes before checksum field.
             crc = NLib::crc32c(crc, gd, csumoffset);
 
+            // Hash a dummy checksum (zeros) in place of the actual checksum field.
+            uint16_t dummy = 0;
+            crc = NLib::crc32c(crc, &dummy, sizeof(dummy));
+
             // Hash bytes after checksum field (if descriptor is larger than 32 bytes).
-            if (descsize > csumoffset + sizeof(gd->checksum)) {
-                size_t remaining = descsize - csumoffset - sizeof(gd->checksum);
-                crc = NLib::crc32c(crc, (uint8_t *)gd + csumoffset + sizeof(gd->checksum), remaining);
+            size_t afteroffset = csumoffset + sizeof(gd->checksum);
+            if (descsize > afteroffset) {
+                crc = NLib::crc32c(crc, (uint8_t *)gd + afteroffset, descsize - afteroffset);
             }
 
-            return ~crc & 0xFFFF;
+            // ext4 uses raw CRC32C without finalisation, just truncate to 16 bits.
+            return crc & 0xFFFF;
         }
 
         uint32_t Ext4FileSystem::inodechecksum(uint32_t ino, struct inode *diskino) {
-            // Inode checksum uses seed, inode number, and inode generation.
-            uint32_t crc = NLib::crc32c(~0U, &this->csumseed, sizeof(this->csumseed));
-            crc = NLib::crc32c(crc, &ino, sizeof(ino));
-            crc = NLib::crc32c(crc, &diskino->generation, sizeof(diskino->generation));
+            // Inode checksum uses seed as initial CRC, then inode number, generation, and inode data.
 
-            // Hash the inode structure, skipping the checksum fields.
-            // csumlo is at a fixed offset, csumhi is in the extended area.
-            size_t csumlooff = offsetof(struct inode, csumlo);
+            // Make a working copy to zero checksum fields without modifying original.
+            uint8_t *inodebuf = new uint8_t[this->inodesize];
+            size_t copysize = this->inodesize < sizeof(struct inode) ? this->inodesize : sizeof(struct inode);
+            NLib::memcpy(inodebuf, diskino, copysize);
 
-            // Hash bytes before csumlo.
-            crc = NLib::crc32c(crc, diskino, csumlooff);
-            // Skip csumlo (2 bytes) and rsvd (2 bytes).
-            crc = NLib::crc32c(crc, (uint8_t *)diskino + csumlooff + 4, sizeof(struct inode) - csumlooff - 4);
+            // Zero any remaining bytes beyond our struct (if on-disk inode is larger).
+            if (this->inodesize > sizeof(struct inode)) {
+                NLib::memset(inodebuf + sizeof(struct inode), 0, this->inodesize - sizeof(struct inode));
+            }
 
-            return ~crc;
+            struct inode *inocopy = (struct inode *)inodebuf;
+
+            // Zero the checksum fields (csumlo at offset 0x7C).
+            inocopy->csumlo = 0;
+
+            if (this->inodesize > 128 && inocopy->extrasize >= 4) { // Use checksum upper if big enough.
+                inocopy->csumhi = 0;
+            }
+
+            // Compute checksum: seed as init CRC, then inode number + generation + full inode data.
+            uint32_t crc = NLib::crc32c(this->csumseed, &ino, sizeof(ino));
+            crc = NLib::crc32c(crc, &inocopy->generation, sizeof(inocopy->generation));
+            crc = NLib::crc32c(crc, inodebuf, this->inodesize);
+
+            delete[] inodebuf;
+            // ext4 uses raw CRC32C without finalisation.
+            return crc;
         }
 
         uint32_t Ext4FileSystem::dirblockchecksum(uint32_t ino, uint32_t gen, void *block, size_t len) {
-            // Directory block checksum uses seed, inode number, and generation.
-            uint32_t crc = NLib::crc32c(~0U, &this->csumseed, sizeof(this->csumseed));
-            crc = NLib::crc32c(crc, &ino, sizeof(ino));
+            // Directory block checksum uses seed as initial CRC, then inode number, generation, and block data.
+            uint32_t crc = NLib::crc32c(this->csumseed, &ino, sizeof(ino));
             crc = NLib::crc32c(crc, &gen, sizeof(gen));
 
             // Hash block data excluding the dirtail checksum (last 12 bytes).
             size_t datalen = len - sizeof(struct dirtail);
             crc = NLib::crc32c(crc, block, datalen);
 
-            return ~crc;
+            return crc;
+        }
+
+        uint32_t Ext4FileSystem::blockbitmapchecksum(uint32_t group, const void *bitmap) {
+            // Block bitmap checksum uses seed as initial CRC, then bitmap data.
+            uint32_t crc = NLib::crc32c(this->csumseed, bitmap, this->blksize);
+            return crc;
+        }
+
+        uint32_t Ext4FileSystem::inodebitmapchecksum(uint32_t group, const void *bitmap) {
+            // Inode bitmap checksum uses seed as initial CRC, then bitmap data.
+            // Size is inodes_per_group / 8.
+            size_t sz = this->sb.inodespergroup / 8;
+            uint32_t crc = NLib::crc32c(this->csumseed, bitmap, sz);
+            return crc;
+        }
+
+        uint32_t Ext4FileSystem::extentblockchecksum(uint32_t ino, uint32_t gen, const void *block, size_t len) {
+            // Extent block checksum uses seed as initial CRC, then inode number, generation, and block data.
+            // The checksum covers all bytes except the extent_tail at the end.
+            uint32_t crc = NLib::crc32c(this->csumseed, &ino, sizeof(ino));
+            crc = NLib::crc32c(crc, &gen, sizeof(gen));
+            crc = NLib::crc32c(crc, block, len - sizeof(struct extenttail));
+            // ext4 uses raw CRC32C without finalisation, just truncate to 16 bits.
+            return crc;
         }
 
         ssize_t Ext4FileSystem::create(const char *name, VFS::INode **nodeout, struct VFS::stat attr) {
@@ -477,7 +536,7 @@ namespace NFS {
                 return -ENOSPC;
             }
 
-            // Initialize the on-disk inode structure.
+            // Initialise the on-disk inode structure.
             struct inode diskino;
             NLib::memset(&diskino, 0, sizeof(struct inode));
 
@@ -516,6 +575,16 @@ namespace NFS {
             diskino.ctime = ts.tv_sec;
             diskino.mtime = ts.tv_sec;
             diskino.dtime = 0;
+
+            // Set extended inode size for inodes larger than 128 bytes.
+            if (this->inodesize > 128) {
+                // Use the superblock's wantextraisize if set, otherwise use the maximum available space.
+                uint16_t maxextra = this->inodesize - 128;
+                diskino.extrasize = this->sb.wantextraisize ? this->sb.wantextraisize : maxextra;
+                if (diskino.extrasize > maxextra) {
+                    diskino.extrasize = maxextra;
+                }
+            }
 
             // Set up extent tree for new files.
             diskino.flags = EXT4_EXTENTSFL;
@@ -789,28 +858,45 @@ namespace NFS {
             uint64_t inodetable = ((uint64_t)gd->inodetablehi << 32) | gd->inodetablelo;
 
             // Calculate the offset of this inode within the inode table.
-            uint64_t inodeoff = inodetable * this->blksize + index * this->sb.inodesize;
+            uint64_t inodeoff = inodetable * this->blksize + index * this->inodesize;
 
-            // Read the inode.
-            struct inode diskino;
-            ssize_t res = this->blkdev->readbytes(&diskino, sizeof(struct inode), inodeoff, 0, NDev::IO_METADATA);
+            // Read the full on-disk inode (need full size for checksum verification).
+            uint8_t *inodebuf = new uint8_t[this->inodesize];
+            ssize_t res = this->blkdev->readbytes(inodebuf, this->inodesize, inodeoff, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to read inode %u: %d.\n", ino, (int)res);
+                delete[] inodebuf;
                 return NULL;
+            }
+
+            struct inode *diskino = (struct inode *)inodebuf;
+
+            // Verify inode checksum if checksums are enabled.
+            if (this->haschecksums) {
+                uint32_t expectedcsum = this->inodechecksum(ino, diskino);
+                uint32_t storedcsum = diskino->csumlo;
+                if (this->inodesize > 128 && diskino->extrasize >= 4) {
+                    storedcsum |= ((uint32_t)diskino->csumhi << 16);
+                }
+                if (storedcsum != expectedcsum) {
+                    NUtil::printf("[fs/ext4fs]: Inode %u checksum mismatch (got 0x%x, expected 0x%x).\n", ino, storedcsum, expectedcsum);
+                    delete[] inodebuf;
+                    return NULL;
+                }
             }
 
             // Build VFS stat structure.
             struct VFS::stat attr = {};
             attr.st_ino = ino;
-            attr.st_mode = inotomode(diskino.mode);
-            attr.st_nlink = diskino.linkscount;
-            attr.st_uid = diskino.uid | ((uint32_t)diskino.uidhi << 16);
-            attr.st_gid = diskino.gid | ((uint32_t)diskino.gidhi << 16);
-            attr.st_size = ((uint64_t)diskino.sizethi << 32) | diskino.sizelo;
+            attr.st_mode = inotomode(diskino->mode);
+            attr.st_nlink = diskino->linkscount;
+            attr.st_uid = diskino->uid | ((uint32_t)diskino->uidhi << 16);
+            attr.st_gid = diskino->gid | ((uint32_t)diskino->gidhi << 16);
+            attr.st_size = ((uint64_t)diskino->sizethi << 32) | diskino->sizelo;
             attr.st_blksize = this->blksize;
 
-            uint64_t rawblocks = ((uint64_t)diskino.blkshi << 32) | diskino.blockslo;
-            if (this->hugefile() && (diskino.flags & EXT4_HUGEFILEFL)) {
+            uint64_t rawblocks = ((uint64_t)diskino->blkshi << 32) | diskino->blockslo;
+            if (this->hugefile() && (diskino->flags & EXT4_HUGEFILEFL)) {
                 // Blocks stored in filesystem block units, convert to 512-byte sectors for VFS.
                 attr.st_blocks = rawblocks * (this->blksize / 512);
             } else {
@@ -818,11 +904,12 @@ namespace NFS {
                 attr.st_blocks = rawblocks;
             }
 
-            attr.st_atime = diskino.atime;
-            attr.st_mtime = diskino.mtime;
-            attr.st_ctime = diskino.ctime;
+            attr.st_atime = diskino->atime;
+            attr.st_mtime = diskino->mtime;
+            attr.st_ctime = diskino->ctime;
 
-            Ext4Node *node = new Ext4Node(this, name, attr, &diskino);
+            Ext4Node *node = new Ext4Node(this, name, attr, diskino);
+            delete[] inodebuf;
             return node;
         }
 
