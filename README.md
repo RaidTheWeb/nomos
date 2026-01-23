@@ -1,4 +1,8 @@
+# Nomos
+
 Nomos is a multi-architecture unix-like kernel written in C++, aiming for stability and efficiency.
+
+The name "Nomos" comes from the name of the [Ancient Greek daemon](https://en.wikipedia.org/wiki/Nomos_(mythology)) of Law.
 
 ## Features
 
