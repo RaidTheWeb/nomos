@@ -3,6 +3,11 @@ Nomos is a multi-architecture unix-like kernel written in C++, aiming for stabil
 ## Features
 
 - [CFS](https://en.wikipedia.org/wiki/Completely_Fair_Scheduler)-inspired SMP-capable scheduler.
+- [Demand Paging](https://en.wikipedia.org/wiki/Demand_paging) for files.
+- NVMe driver.
+- ext4 filesystem support.
+- Asynchronous I/O.
+- POSIX interface.
 
 ## Building
 
