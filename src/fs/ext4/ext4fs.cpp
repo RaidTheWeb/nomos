@@ -196,10 +196,9 @@ namespace NFS {
             }
 
             uint64_t bgdtblock = (this->blksize == 1024) ? 2 : 1;
-            uint16_t descsize = this->sb.descsize ? this->sb.descsize : 32;
-            uint64_t offset = bgdtblock * this->blksize + group * descsize;
+            uint64_t offset = bgdtblock * this->blksize + group * this->descsize;
 
-            ssize_t res = this->blkdev->writebytes(&this->groupdescs[group], descsize, offset, 0, NDev::IO_METADATA);
+            ssize_t res = this->blkdev->writebytes(&this->groupdescs[group], this->descsize, offset, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to write group descriptor %u: %d\n", group, (int)res);
                 return res;
@@ -586,14 +585,21 @@ namespace NFS {
                 }
             }
 
-            // Set up extent tree for new files.
-            diskino.flags = EXT4_EXTENTSFL;
-            struct extenthdr *hdr = (struct extenthdr *)diskino.block;
-            hdr->magic = EXT4_EXTMAGIC;
-            hdr->entries = 0;
-            hdr->max = (sizeof(diskino.block) - sizeof(struct extenthdr)) / sizeof(struct extent);
-            hdr->depth = 0;
-            hdr->generation = 0;
+            // Set up block mapping based on filesystem type.
+            if (this->hasextents) {
+                // Extent-based mapping for ext4.
+                diskino.flags = EXT4_EXTENTSFL;
+                struct extenthdr *hdr = (struct extenthdr *)diskino.block;
+                hdr->magic = EXT4_EXTMAGIC;
+                hdr->entries = 0;
+                hdr->max = (sizeof(diskino.block) - sizeof(struct extenthdr)) / sizeof(struct extent);
+                hdr->depth = 0;
+                hdr->generation = 0;
+            } else {
+                // Indirect block mapping for ext2/ext3.
+                diskino.flags = 0;
+                NLib::memset(diskino.block, 0, sizeof(diskino.block));
+            }
 
             // Write the inode to disk.
             int res = this->writeinode(ino, &diskino);
@@ -961,38 +967,63 @@ namespace NFS {
             }
             this->blksize = 1024 << this->sb.logblocksize;
 
-            // Store inode size with validation.
-            this->inodesize = this->sb.inodesize;
-            if (this->inodesize < 128) {
-                this->inodesize = 128; // Minimum per spec.
+            // Check superblock revision level for ext2/ext3 compatibility.
+            this->isrevision0 = (this->sb.revlevel == EXT2_GOODOLDREV);
+
+            if (this->isrevision0) {
+                // Revision 0 has fixed 128-byte inodes; the inodesize field doesn't exist.
+                this->inodesize = EXT2_GOODOLDINODESIZE;
+            } else {
+                // Store inode size with validation.
+                this->inodesize = this->sb.inodesize;
+                if (this->inodesize < 128) {
+                    this->inodesize = 128; // Minimum per spec.
+                }
             }
 
-            // Check for unsupported incompatible features, that we should COMPLETELY avoid mounting without support for.
-            uint32_t unsupportedincompat = this->sb.featincompat & ~EXT4_SUPPORTEDINCOMPAT;
-            if (unsupportedincompat) {
-                NUtil::printf("[fs/ext4fs]: Unsupported incompat features 0x%x.\n", unsupportedincompat);
+            // Feature validation only applies to revision 1+ filesystems.
+            // Revision 0 filesystems don't have meaningful feature flags.
+            if (!this->isrevision0) {
+                // Check for unsupported incompatible features, that we should COMPLETELY avoid mounting without support for.
+                uint32_t unsupportedincompat = this->sb.featincompat & ~EXT4_SUPPORTEDINCOMPAT;
+                if (unsupportedincompat) {
+                    NUtil::printf("[fs/ext4fs]: Unsupported incompat features 0x%x.\n", unsupportedincompat);
 
-                // Check for specific dangerous features.
-                if (unsupportedincompat & EXT4_FEATUREINCOMPATMMP) {
-                    NUtil::printf("[fs/ext4fs]: Multi-mount protection requires shared state, cannot mount.\n");
-                }
-                if (unsupportedincompat & EXT4_FEATUREINCOMPATENCRYPT) {
-                    NUtil::printf("[fs/ext4fs]: Encryption not supported.\n");
-                }
-                if (unsupportedincompat & EXT4_FEATUREINCOMPATCOMPRESSION) {
-                    NUtil::printf("[fs/ext4fs]: Compression not supported.\n");
+                    // Check for specific dangerous features.
+                    if (unsupportedincompat & EXT4_FEATUREINCOMPATMMP) {
+                        NUtil::printf("[fs/ext4fs]: Multi-mount protection requires shared state, cannot mount.\n");
+                    }
+                    if (unsupportedincompat & EXT4_FEATUREINCOMPATENCRYPT) {
+                        NUtil::printf("[fs/ext4fs]: Encryption not supported.\n");
+                    }
+                    if (unsupportedincompat & EXT4_FEATUREINCOMPATCOMPRESSION) {
+                        NUtil::printf("[fs/ext4fs]: Compression not supported.\n");
+                    }
+
+                    devnode->unref();
+                    return -EINVAL;
                 }
 
-                devnode->unref();
-                return -EINVAL;
+                // Check for any features that we don't support, and we should mount read-only for.
+                uint32_t unsupportedrocompat = this->sb.featrocompat & ~EXT4_SUPPORTEDROCOMPAT;
+                if (unsupportedrocompat) {
+                    NUtil::printf("[fs/ext4fs]: Unsupported ro_compat features: 0x%x, mounting read-only!\n", unsupportedrocompat);
+                    this->readonly = true;
+                }
             }
 
-            // Check for any features that we don't support, and we should mount read-only for.
-            uint32_t unsupportedrocompat = this->sb.featrocompat & ~EXT4_SUPPORTEDROCOMPAT;
-            if (unsupportedrocompat) {
-                NUtil::printf("[fs/ext4fs]: Unsupported ro_compat features: 0x%x, mounting read-only!\n", unsupportedrocompat);
-                this->readonly = true;
+            // Determine if filesystem supports extents (ext4 only).
+            // Ext2/ext3 filesystems don't have the extents feature.
+            this->hasextents = !this->isrevision0 && (this->sb.featincompat & EXT4_FEATUREINCOMPATEXTENTS);
+
+            // Log detected filesystem type.
+            const char *fstype = "ext4";
+            if (this->isrevision0) {
+                fstype = "ext2 (revision 0)";
+            } else if (!this->hasextents) {
+                fstype = (this->sb.featcompat & EXT4_FEATURECOMPATHASJOURNAL) ? "ext3" : "ext2";
             }
+            NUtil::printf("[fs/ext4fs]: Detected %s filesystem.\n", fstype);
 
             // Check if journal needs recovery. Safer to avoid mounting in a way that'd let us modify the journal.
             if (this->sb.featincompat & EXT4_FEATUREINCOMPATRECOVER) {
@@ -1033,16 +1064,26 @@ namespace NFS {
             // Read block group descriptor table.
             uint64_t bgdtblock = (this->blksize == 1024) ? 2 : 1;
             size_t bgdtsize = this->numgroups * descsize;
+            this->descsize = descsize; // Store for later use.
 
-            this->groupdescs = new struct groupdesc[this->numgroups];
-            res = blkdev->readbytes(this->groupdescs, bgdtsize, bgdtblock * this->blksize, 0, NDev::IO_METADATA);
+            // Read raw group descriptor data.
+            uint8_t *rawgd = new uint8_t[bgdtsize];
+            res = blkdev->readbytes(rawgd, bgdtsize, bgdtblock * this->blksize, 0, NDev::IO_METADATA);
             if (res < 0) {
                 NUtil::printf("[fs/ext4fs]: Failed to read block group descriptors\n");
-                delete[] this->groupdescs;
-                this->groupdescs = NULL;
+                delete[] rawgd;
                 devnode->unref();
                 return res;
             }
+
+            // Allocate group descriptor array and zero-initialize so high bits are 0 for 32-byte descriptors.
+            this->groupdescs = new struct groupdesc[this->numgroups]();
+            for (uint32_t i = 0; i < this->numgroups; i++) {
+                // Copy up to descsize bytes (may be less than sizeof(struct groupdesc)).
+                size_t copysize = descsize < sizeof(struct groupdesc) ? descsize : sizeof(struct groupdesc);
+                NLib::memcpy(&this->groupdescs[i], rawgd + i * descsize, copysize);
+            }
+            delete[] rawgd;
 
             // Validate group descriptor checksums if enabled.
             if (this->haschecksums) { // Checksums ARE enabled, so we need to get that setup.
@@ -1058,13 +1099,10 @@ namespace NFS {
                 }
             }
 
-            // XXX: Loading the root inode means we don't really have backward compatibility with ext3/ext2.
-            // Probably some screwed up structs or something. Needs investigation.
-
             // Load root inode (inode 2).
             this->root = this->loadinode(EXT4_ROOTINO, "");
             if (!this->root) {
-                NUtil::printf("[fs/ext4fs]: Failed to load root inode\n");
+                NUtil::printf("[fs/ext4fs]: Failed to load root inode.\n");
                 delete[] this->groupdescs;
                 this->groupdescs = NULL;
                 devnode->unref();
@@ -1079,7 +1117,7 @@ namespace NFS {
             this->mounted = true;
 
             // Print UUID.
-            NUtil::printf("[fs/ext4fs]: UUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+            NUtil::printf("[fs/ext4fs]: UUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x.\n",
                 this->sb.uuid[0], this->sb.uuid[1], this->sb.uuid[2], this->sb.uuid[3],
                 this->sb.uuid[4], this->sb.uuid[5],
                 this->sb.uuid[6], this->sb.uuid[7],
@@ -1095,6 +1133,19 @@ namespace NFS {
             .name = "ext4"
         };
 
+        // This driver supports backwards compatibility, so we can just slap extra registrations on here!
+        // XXX: This means that `mount -t ext2` on an ext4 filesystem will mount it as ext4, ignoring the fact that ext4-specific features may be in use. This isn't *bad* per se, but may be unexpected.
+        static struct VFS::fsreginfo ext3fsinfo = {
+            .name = "ext3"
+        };
+
+        // Ditto for ext2.
+        static struct VFS::fsreginfo ext2fsinfo = {
+            .name = "ext2"
+        };
+
         REGFS(ext4, Ext4FileSystem::instance, &ext4fsinfo);
+        REGFS(ext3, Ext4FileSystem::instance, &ext3fsinfo);
+        REGFS(ext2, Ext4FileSystem::instance, &ext2fsinfo);
     }
 }

@@ -54,14 +54,9 @@ namespace NSched {
     #define ITIMER_VIRTUAL 1  // Decrements in process virtual time (user CPU time), delivers SIGVTALRM.
     #define ITIMER_PROF    2  // Decrements in process virtual time (user + system CPU time), delivers SIGPROF.
 
-    struct timeval {
-        long tv_sec;   // Seconds.
-        long tv_usec;  // Microseconds.
-    };
-
     struct itimerval {
-        struct timeval it_interval;  // Timer interval (period for repeating timers).
-        struct timeval it_value;     // Current timer value (time until next expiration).
+        struct NSys::Clock::timeval it_interval;  // Timer interval (period for repeating timers).
+        struct NSys::Clock::timeval it_value;     // Current timer value (time until next expiration).
     };
 
     static const size_t NSIG = 64; // Total number of signals.

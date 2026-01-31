@@ -37,6 +37,11 @@ namespace NSys {
             long tv_nsec; // Nanoseconds.
         };
 
+        struct timeval {
+            long tv_sec;   // Seconds.
+            long tv_usec;  // Microseconds.
+        };
+
         class Clock {
             protected:
                 NArch::IRQSpinlock lock;

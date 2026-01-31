@@ -723,13 +723,13 @@ namespace NSched {
     }
 
     // Helper to convert microseconds to timeval.
-    static void usectimeval(uint64_t usec, struct timeval *tv) {
+    static void usectimeval(uint64_t usec, struct NSys::Clock::timeval *tv) {
         tv->tv_sec = usec / 1000000;
         tv->tv_usec = usec % 1000000;
     }
 
     // Helper to convert timeval to microseconds.
-    static uint64_t timevalusec(const struct timeval *tv) {
+    static uint64_t timevalusec(const struct NSys::Clock::timeval *tv) {
         return (uint64_t)tv->tv_sec * 1000000 + (uint64_t)tv->tv_usec;
     }
 

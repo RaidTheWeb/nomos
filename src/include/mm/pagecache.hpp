@@ -51,8 +51,9 @@ namespace NMem {
         PAGE_WRITEBACK  = (1 << 3),     // Page is being written back.
         PAGE_REFERENCED = (1 << 4),     // Page has been accessed recently (for LRU).
         PAGE_ERROR      = (1 << 5),     // I/O error occurred.
-        PAGE_PRIVATE    = (1 << 6),     // Page has private data (filesystem-specific).
-        PAGE_SWAPCACHE  = (1 << 7)      // Page is in swap cache (reserved for future).
+        PAGE_IOINFLIGHT = (1 << 6),     // Read I/O in progress (lock released during I/O).
+        PAGE_PRIVATE    = (1 << 7),     // Page has private data (filesystem-specific).
+        PAGE_SWAPCACHE  = (1 << 8)      // Page is in swap cache (reserved for future).
     };
 
     // LRU list membership tracking (pretty easy way to quickly determine which list a page belongs to).
@@ -66,6 +67,19 @@ namespace NMem {
     class CachePage {
         public:
             NArch::IRQSpinlock lock; // Per-page lock.
+
+            // Reference count for CachePage lifetime management.
+            // Initial ref of 1 is taken when page is added to cache.
+            // Additional refs are taken when:
+            // - Page is looked up and returned to caller (lookupandlock)
+            // - Page is collected into a batch for processing
+            // Final unref triggers deletion.
+            volatile int32_t refcount = 0;
+
+            // Generation counter for ABA protection in lookupandlock().
+            // Incremented each time page is removed from a radix tree.
+            // Allows detection of page reuse after eviction.
+            volatile uint32_t generation = 0;
 
             NFS::VFS::INode *inode = NULL; // Owning inode (for filesystem pages).
             NDev::BlockDevice *blockdev = NULL; // Owning block device (for device pages).
@@ -92,6 +106,11 @@ namespace NMem {
             CachePage(void) = default;
             ~CachePage(void) = default;
 
+            // Reference counting.
+            void ref(void);
+            void unref(void);  // May delete page when refcount hits 0.
+            int32_t getref(void) const;
+
             // Lock the page for exclusive access.
             void pagelock(void);
             // Unlock the page after I/O.
@@ -100,6 +119,11 @@ namespace NMem {
             bool trypagelock(void);
             // Wait for page to become unlocked.
             void waitunlocked(void);
+
+            // Wait for any in-flight I/O to complete. Caller must NOT hold the page lock.
+            void waitio(void);
+            // Signal that I/O has completed. Clears IOINFLIGHT and wakes waiters.
+            void signalio(void);
 
             // Flag manipulation.
             void setflag(uint16_t flag);
@@ -164,7 +188,7 @@ namespace NMem {
             // Lookup a page by index.
             CachePage *lookup(off_t index);
 
-            // Lookup a page and lock it atomically. Prevents race with eviction.
+            // Lookup a page and lock it atomically. Prevents race with eviction. Returns page with ref held, or NULL if not found.
             CachePage *lookupandlock(off_t index);
 
             // Remove a page by index.
@@ -201,14 +225,26 @@ namespace NMem {
             // Writeback thread management stuff.
             volatile bool running = true;
             volatile bool exited = false;
-            NSched::WaitQueue exitwq;
-            NSched::WaitQueue wakeupwq; // Wake writeback thread early.
+            volatile bool wakeupneeded = false; // Flag to wake writeback thread early.
+            volatile uint64_t throttlegeneration = 0; // Incremented when writeback makes progress.
+            NSched::WaitQueue exitwq;    // For shutdown synchronisation.
+            NSched::WaitQueue wakeupwq;  // For immediate writeback wakeup.
+            NSched::WaitQueue throttlewq; // For blocking throttled writers.
             NSched::Thread *wbthread = NULL;
 
             // Writeback configuration.
-            static constexpr uint64_t WRITEBACKINTERVALMS = 5000; // 5 seconds default.
-            static constexpr size_t MAXWRITEBACKPERCYCLE = 64; // Max pages per writeback cycle.
-            static constexpr size_t DIRTYTHRESHOLDPERCENT = 40; // Start throttling at 40% dirty.
+            static constexpr uint64_t WRITEBACKINTERVALMS = 500; // 500ms default (reduced from 1s).
+            static constexpr size_t MAXWRITEBACKPERCYCLE = 128; // Max pages per writeback cycle (increased from 64).
+            
+            // Two-tier dirty thresholds for soft/hard throttling.
+            static constexpr size_t DIRTYSOFTTHRESHOLDPERCENT = 25; // Wake writeback at 25% dirty.
+            static constexpr size_t DIRTYHARDTHRESHOLDPERCENT = 50; // Block writers at 50% dirty.
+            static constexpr size_t DIRTYTHRESHOLDPERCENT = 40; // Legacy threshold (kept for compatibility).
+            static constexpr size_t DIRTYTARGETPERCENT = 15; // Target dirty ratio after cleanup.
+            
+            // Batch sizes for writeback.
+            static constexpr size_t BATCHSIZENORMAL = 32; // Normal batch size.
+            static constexpr size_t BATCHSIZEPRESSURE = 128; // Batch size under pressure.
 
             void addtoactive(CachePage *page);
             void addtoinactive(CachePage *page);
@@ -216,8 +252,20 @@ namespace NMem {
             void promotepage(CachePage *page); // Move from inactive to active.
             void demotepage(CachePage *page); // Move from active to inactive.
 
-            CachePage *selectvictim(void); // Select page for eviction.
+            CachePage *selectvictim(void); // Select page for eviction (any page).
+
+            // Statistics from selectvictim operations for diagnostics.
+            struct selvictimstats {
+                size_t skippedlocked = 0;
+                size_t skippeddirty = 0;
+                size_t skippedwriteback = 0;
+                size_t skippedreferenced = 0;
+                size_t skippedioinflight = 0;
+            };
+
+            CachePage *selectvictimclean(struct selvictimstats *stats = NULL); // Select clean page for eviction (avoids writeback during shrink).
             int evictpage(CachePage *page); // Evict a single page.
+            void evictpagefromwriteback(CachePage *page); // Evict page from writeback context (page already locked+clean).
 
             int writebackpage(CachePage *page); // Write single page to backing store.
         public:
@@ -250,11 +298,11 @@ namespace NMem {
             // Immediately wake the writeback thread.
             void wakewriteback(void);
 
-            // Try to free 'count' pages. Returns number actually freed.
+            // Try to free 'count' clean pages. Returns number actually freed.
             size_t shrink(size_t count);
 
-            // Reclaim pages under memory pressure.
-            void reclaim(void);
+            // Try to free 'count' clean/dirty pages, with synchronous writeback fallback. Can tolerate blocking I/O.
+            size_t shrinkwithwriteback(size_t count);
 
             // Invalidate a single page.
             int invalidatepage(NFS::VFS::INode *inode, off_t offset);
@@ -262,8 +310,17 @@ namespace NMem {
             // Invalidate all pages for an inode.
             int invalidateinode(NFS::VFS::INode *inode);
 
-            // Check if dirty page throttling should occur.
+            // Check if dirty page throttling should occur (hard threshold).
             bool shouldthrottle(void) const;
+            
+            // Check if we should wake writeback proactively (soft threshold).
+            bool shouldwakewriteback(void) const;
+
+            // Block the caller until cache pressure is relieved.
+            void throttle(void);
+            
+            // Perform direct reclaim from calling thread. Returns pages written/freed.
+            size_t directreclaim(size_t target);
 
             size_t gettotalpages(void) const {
                 return this->totalpages;

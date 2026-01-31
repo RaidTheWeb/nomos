@@ -96,6 +96,7 @@ namespace NFS {
         }
 
         Ext4Node::Ext4Node(Ext4FileSystem *fs, const char *name, struct VFS::stat attr, struct inode *diskino) : VFS::INode((VFS::IFileSystem *)fs, name, attr) {
+            // XXX: Does not handle creating pipenode integrations, yet. This needs to be done for FIFOs.
             this->ext4fs = fs;
             if (diskino) {
                 NLib::memcpy(&this->diskino, diskino, sizeof(struct inode));
@@ -716,9 +717,8 @@ namespace NFS {
             // Zero the page first.
             NLib::memset(page->data(), 0, NArch::PAGESIZE);
 
-            // If offset is beyond file size, return empty page.
+            // If offset is beyond file size, return success with zeroed page.
             if ((uint64_t)offset >= filesize) {
-                page->setflag(NMem::PAGE_UPTODATE);
                 return 0;
             }
 
@@ -773,7 +773,6 @@ namespace NFS {
                 dest += chunk;
             }
 
-            page->setflag(NMem::PAGE_UPTODATE);
             return 0;
         }
 

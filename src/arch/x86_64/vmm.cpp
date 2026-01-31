@@ -51,16 +51,26 @@ namespace NArch {
                     break;
             }
 
-            if (!SMP::initialised || SMP::awakecpus < 2) {
+            if (!SMP::initialised) {
                 return;
             }
 
-            //  Acquire global shootdown lock (serialises all shootdowns).
-            NLib::ScopeIRQSpinlock guard(&shootdownlock);
+            // Read CPU count atomically once and use consistently.
+            size_t cpucount = __atomic_load_n(&SMP::awakecpus, memory_order_acquire);
+            if (cpucount < 2) {
+                return;
+            }
+
+            assertarg(CPU::get()->irqstackdepth == 0,
+                "doshootdown() called while holding IRQSpinlock (depth=%lu). Release all IRQSpinlocks before calling doshootdown().\n",
+                CPU::get()->irqstackdepth);
+
+            // Acquire global shootdown lock (serialises all shootdowns).
+            shootdownlock.acquire();
 
             // Set up the global request.
             size_t newgen = shootdownreq.generation + 1;
-            size_t target = SMP::awakecpus - 1;  // All CPUs except self.
+            size_t target = cpucount - 1;  // All CPUs except self.
 
             shootdownreq.type = type;
             shootdownreq.start = start;
@@ -76,6 +86,11 @@ namespace NArch {
             APIC::sendipi(0, 0xfc, APIC::IPIFIXED, APIC::IPIPHYS, APIC::IPIOTHER);
 
             // Wait for all CPUs to acknowledge.
+            bool oldpreempt = CPU::get()->preemptdisabled;
+            CPU::get()->preemptdisabled = true;
+            asm volatile("" ::: "memory");  // Ensure preemptdisabled is visible before enabling interrupts.
+            CPU::get()->setint(true);  // Allow IPIs to be received.
+
             uint64_t timeout = 100000000ULL;
 
             while (__atomic_load_n(&shootdownreq.acks, memory_order_acquire) < target) {
@@ -83,15 +98,28 @@ namespace NArch {
                 if (--timeout == 0) {
                     size_t acks = __atomic_load_n(&shootdownreq.acks, memory_order_relaxed);
                     NUtil::printf("TLB shootdown timeout: %lu/%lu acks (missing %lu responses).\n", acks, target, target - acks);
-                    NUtil::printf("At least one CPU has interrupts disabled and cannot respond to IPI.\n");
+                    NUtil::printf("Shootdown type=%d, generation=%lu, start=0x%lx, end=0x%lx\n", (int)shootdownreq.type, newgen, shootdownreq.start, shootdownreq.end);
+                    // Dump per-CPU tlbgeneration to identify which CPUs are behind.
+                    NUtil::printf("Per-CPU TLB generations (current gen=%lu):\n", newgen);
+                    for (size_t i = 0; i < cpucount; i++) {
+                        CPU::cpulocal *cpu = SMP::cpulist[i];
+                        if (cpu) {
+                            size_t cpugen = __atomic_load_n(&cpu->tlbgeneration, memory_order_relaxed);
+                            NUtil::printf("  CPU %lu: tlbgen=%lu %s\n", i, cpugen, (cpugen >= newgen) ? "(acked)" : "(MISSING)");
+                        }
+                    }
 #ifdef TSTATE_DEBUG
                     NUtil::printf("Dumping thread states:\n");
                     NSched::dumpthreads();
 #endif
                     panic("TLB shootdown timeout! Deadlock detected.");
-
                 }
             }
+
+            CPU::get()->setint(false);
+            CPU::get()->preemptdisabled = oldpreempt;
+
+            shootdownlock.release();
         }
 
         void tlbshootdown(struct Interrupts::isr *isr, struct CPU::context *ctx) {
@@ -111,8 +139,8 @@ namespace NArch {
                 return;
             }
 
-            // Read request parameters.
-            asm volatile("" ::: "memory");
+            // Read request parameters (acquire fence ensures we see writes before generation).
+            __atomic_thread_fence(memory_order_acquire);
             enum shootdowntype type = shootdownreq.type;
             uintptr_t start = shootdownreq.start;
             uintptr_t end = shootdownreq.end;
@@ -354,7 +382,7 @@ namespace NArch {
 
             struct dupwork work {
                 .src = src,
-                .dest = nullptr,
+                .dest = NULL,
                 .shootdownstart = 0,
                 .shootdownend = 0,
                 .needshootdown = false
@@ -399,20 +427,6 @@ namespace NArch {
             }
 
             return dest;
-        }
-
-        void enterucontext(struct pagetable *pt, struct addrspace *space) {
-            {
-                NLib::ScopeIRQSpinlock kguard(&kspace.lock);
-                NLib::ScopeIRQSpinlock uguard(&space->lock);
-
-                for (size_t i = 0; i < 256; i++) { // Copy lower half userspace tables to kernel map.
-                    pt->entries[i] = space->pml4->entries[i];
-                }
-            }
-
-            asm volatile("sfence" : : : "memory");
-            doshootdown(SHOOTDOWN_FULL, 0, 0);
         }
 
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt) {

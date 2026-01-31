@@ -22,6 +22,9 @@
 
 // This is SUPER easy to get wrong, be VERY careful when acquiring multiple locks.
 // Lock ordering hierarchy:
+//
+// Level 0 (special):
+// - VMM::shootdownlock (hold NO other locks when acquiring this one).
 // Level 1:
 // - pidtablelock
 // - futexlock
@@ -350,7 +353,20 @@ namespace NSched {
                 // Insert into target's queue.
                 __atomic_store_n(&thread->cid, target->id, memory_order_release);
 
-                target->runqueue.lock.acquire();
+                // Use trylock to avoid spinning with interrupts disabled on another CPU's lock.
+                // If we can't acquire the lock, put the thread back in our own queue.
+                if (!target->runqueue.lock.trylock()) {
+                    // Restore thread to our queue.
+                    __atomic_store_n(&thread->cid, cpu->id, memory_order_release);
+                    cpu->runqueue.lock.acquire();
+                    __atomic_store_n(&thread->inrunqueue, true, memory_order_release);
+                    cpu->runqueue._insert(&thread->node, vruntimecmp);
+                    updateminvruntimeoninsert(cpu, thread);
+                    // Continue to next candidate.
+                    candidate = cpu->runqueue._last();
+                    checked = 0;
+                    continue;
+                }
                 __atomic_store_n(&thread->inrunqueue, true, memory_order_release);
                 target->runqueue._insert(&thread->node, vruntimecmp);
                 updateminvruntimeoninsert(target, thread);
@@ -379,7 +395,10 @@ namespace NSched {
             return NULL;
         }
 
-        victim->runqueue.lock.acquire();
+        // Don't bother stealing if we can't get the best-possible-case lock.
+        if (!victim->runqueue.lock.trylock()) {
+            return NULL;
+        }
 
         // Scan from the back (highest vruntime = least urgent).
         RBTree::node *candidate = victim->runqueue._last();
@@ -779,6 +798,17 @@ namespace NSched {
         CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
 
+        // Allocate IST stacks for NMI and Double Fault handlers.
+        CPU::get()->ist1stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
+        assertarg(CPU::get()->ist1stack, "Failed to allocate IST1 (NMI) stack for CPU%lu.\n", CPU::get()->id);
+        CPU::get()->ist1stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist1stack));
+        CPU::get()->ist.ist1 = (uint64_t)CPU::get()->ist1stack + DEFAULTSTACKSIZE;
+
+        CPU::get()->ist2stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
+        assertarg(CPU::get()->ist2stack, "Failed to allocate IST2 (Double Fault) stack for CPU%lu.\n", CPU::get()->id);
+        CPU::get()->ist2stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist2stack));
+        CPU::get()->ist.ist2 = (uint64_t)CPU::get()->ist2stack + DEFAULTSTACKSIZE;
+
         CPU::get()->currthread = idlethread;
 
         CPU::get()->lastschedts = TSC::query();
@@ -802,6 +832,17 @@ namespace NSched {
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
         CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
+
+        // Allocate IST stacks for NMI and Double Fault handlers.
+        CPU::get()->ist1stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
+        assertarg(CPU::get()->ist1stack, "Failed to allocate IST1 (NMI) stack for CPU%lu.\n", CPU::get()->id);
+        CPU::get()->ist1stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist1stack));
+        CPU::get()->ist.ist1 = (uint64_t)CPU::get()->ist1stack + DEFAULTSTACKSIZE;
+
+        CPU::get()->ist2stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
+        assertarg(CPU::get()->ist2stack, "Failed to allocate IST2 (Double Fault) stack for CPU%lu.\n", CPU::get()->id);
+        CPU::get()->ist2stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist2stack));
+        CPU::get()->ist.ist2 = (uint64_t)CPU::get()->ist2stack + DEFAULTSTACKSIZE;
 
         CPU::get()->idlethread = idlethread;
         CPU::get()->currthread = idlethread;
@@ -863,7 +904,22 @@ namespace NSched {
         __atomic_store_n(&thread->cid, target->id, memory_order_release);
 
         // Insert into runqueue with inrunqueue guard.
-        target->runqueue.lock.acquire();
+        // Use trylock for cross-CPU targeting to avoid spinning with interrupts disabled.
+        // If we can't acquire the target's lock, fall back to our own runqueue.
+        bool acquiredtarget = false;
+        if (target == CPU::get()) {
+            target->runqueue.lock.acquire();
+            acquiredtarget = true;
+        } else {
+            acquiredtarget = target->runqueue.lock.trylock();
+            if (!acquiredtarget) {
+                // Fall back to current CPU.
+                target = CPU::get();
+                __atomic_store_n(&thread->cid, target->id, memory_order_release);
+                target->runqueue.lock.acquire();
+                acquiredtarget = true;
+            }
+        }
 
         // Double-check inrunqueue under lock (another CPU might have beaten us).
         if (!__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
@@ -1037,13 +1093,16 @@ namespace NSched {
                 size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
                 if (cid < SMP::awakecpus && __atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
                     struct CPU::cpulocal *cpu = SMP::cpulist[cid];
-                    cpu->runqueue.lock.acquire();
-                    if (__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
-                        cpu->runqueue._erase(&thread->node);
-                        __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
-                        updateminvruntime(cpu);
+                    // Use trylock for cross-CPU access to avoid spinning with interrupts disabled.
+                    bool acquired = (cpu == CPU::get()) ? (cpu->runqueue.lock.acquire(), true) : cpu->runqueue.lock.trylock();
+                    if (acquired) {
+                        if (__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
+                            cpu->runqueue._erase(&thread->node);
+                            __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+                            updateminvruntime(cpu);
+                        }
+                        cpu->runqueue.lock.release();
                     }
-                    cpu->runqueue.lock.release();
                 }
 
                 thread->enablemigrate();

@@ -7,10 +7,10 @@
 namespace NArch {
     namespace Module {
 
-        struct modinfo loadmodule(const char *path) {
+        Module *loadmodule(const char *path) {
 
             if (NLimine::modreq.response == NULL || NLimine::modreq.response->module_count <= 0) {
-                return { "", "", 0, 0 }; // Return invalid. No modules.
+                return NULL;
             }
 
             struct limine_file **modules = NLimine::modreq.response->modules;
@@ -19,11 +19,18 @@ namespace NArch {
                 struct limine_file *module = modules[i];
 
                 if (!NLib::strcmp(path, module->path)) { // If this matches the requested file path.
-                    return { module->path, module->string, module->size, (uintptr_t)module->address }; // Return our module information in a non-limine-specific format.
+                    // Check if it's LZ4 compressed.
+                    bool islz4 = NLib::LZ4::isframe((void *)module->address, (size_t)module->size);
+
+                    if (islz4) {
+                        return new CompressedModule(module->path, module->string, (size_t)module->size, (uintptr_t)module->address);
+                    } else {
+                        return new Module(module->path, module->string, (size_t)module->size, (uintptr_t)module->address);
+                    }
                 }
             }
 
-            return { "", "", 0, 0 };
+            return NULL;
         }
 
     }

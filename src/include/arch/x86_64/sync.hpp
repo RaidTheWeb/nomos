@@ -15,6 +15,7 @@ namespace NArch {
 
     // Bog-standard spinlock implementation, with included "backoff" to reduce load, while still consuming busy wait time.
     // Best suited for operations we can guarantee are short, but are still "critical sections".
+    // Can deadlock in interrupt context. Use IRQSpinlock instead if there is any chance an interrupt handler could try to acquire the same lock.
     class Spinlock {
         private:
             volatile uint32_t locked;
@@ -29,7 +30,9 @@ namespace NArch {
     };
 
     // Special wrapper class for spinlocks that blocks and disables interrupts while holding the lock. NOTE: Do NOT use in thread-thread synchronisation cases, only for thread-interrupt synchronisation cases.
+    // This should ONLY be used for *very* short critical sections, otherwise, we risk deadlocking on TLB shootdowns and other interrupt-context operations.
     class IRQSpinlock {
+
         private:
             NArch::Spinlock lock;
         public:

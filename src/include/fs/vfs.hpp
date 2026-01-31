@@ -561,7 +561,7 @@ namespace NFS {
                 NMem::CachePage *findcachedpage(off_t offset);
 
                 // Find or create a cached page.
-                NMem::CachePage *getorcacheepage(off_t offset);
+                NMem::CachePage *getorcachepage(off_t offset);
 
                 // Invalidate all cached pages for this inode.
                 void invalidatecache(void);

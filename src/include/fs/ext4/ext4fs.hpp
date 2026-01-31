@@ -188,8 +188,11 @@ namespace NFS {
                 uint32_t blksize; // Block size in bytes.
                 uint32_t csumseed; // Checksum seed for metadata checksums.
                 uint16_t inodesize; // On-disk inode size.
+                uint16_t descsize; // On-disk group descriptor size (32 for ext2/ext3, 64 for ext4 64-bit).
                 bool readonly; // Mounted read-only due to unsupported RO_COMPAT features.
                 bool haschecksums; // Filesystem has metadata checksums enabled.
+                bool hasextents; // Filesystem supports extents (ext4 only, not ext2/ext3).
+                bool isrevision0; // True if ext2 revision 0 filesystem.
 
                 Ext4FileSystem(VFS::VFS *vfs) {
                     this->vfs = vfs;
@@ -199,8 +202,11 @@ namespace NFS {
                     this->blksize = 0;
                     this->csumseed = 0;
                     this->inodesize = 128;
+                    this->descsize = 32; // Default to ext2/ext3 32-byte descriptors.
                     this->readonly = false;
                     this->haschecksums = false;
+                    this->hasextents = true; // Default to ext4 behaviour.
+                    this->isrevision0 = false;
                     this->root = NULL; // Will be set in mount().
                 }
 

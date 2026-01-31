@@ -198,7 +198,6 @@ namespace NArch {
         NSched::schedulethread(kthread);
 
         NUtil::printf("[arch/x86_64]: Jump into scheduler on kernel main.\n");
-        NUtil::dropwrite(); // We're past the useful information. Use only debugging outputs from here.
 
         NSched::await(); // End here. Any work afterwards occurs within the kernel thread.
     }

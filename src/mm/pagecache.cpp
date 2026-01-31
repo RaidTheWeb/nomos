@@ -12,6 +12,7 @@
 
 #ifdef __x86_64__
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/vmm.hpp>
 #endif
 
@@ -22,6 +23,24 @@ namespace NMem {
 
     // Global page cache instance.
     PageCache *pagecache = NULL;
+
+    // CachePage reference counting implementation.
+    void CachePage::ref(void) {
+        __atomic_add_fetch(&this->refcount, 1, memory_order_acq_rel);
+    }
+
+    void CachePage::unref(void) {
+        int32_t newref = __atomic_sub_fetch(&this->refcount, 1, memory_order_acq_rel);
+        assertarg(newref >= 0, "CachePage::unref: refcount went negative (%d)\n", newref);
+        if (newref == 0) {
+            // This was the last reference, delete the page.
+            delete this;
+        }
+    }
+
+    int32_t CachePage::getref(void) const {
+        return __atomic_load_n(&this->refcount, memory_order_acquire);
+    }
 
     void CachePage::pagelock(void) {
         while (true) {
@@ -60,6 +79,19 @@ namespace NMem {
     void CachePage::waitunlocked(void) {
         // Wait until page is unlocked using waitevent to avoid lost wakeups.
         waitevent(&this->waitq, !(__atomic_load_n(&this->flags, memory_order_acquire) & PAGE_LOCKED));
+    }
+
+    void CachePage::waitio(void) {
+        // Wait until IOINFLIGHT is clear. Caller must NOT hold the page lock.
+        waitevent(&this->waitq, !(__atomic_load_n(&this->flags, memory_order_acquire) & PAGE_IOINFLIGHT));
+    }
+
+    void CachePage::signalio(void) {
+        // Clear IOINFLIGHT and wake any waiters.
+        uint16_t oldflags = __atomic_fetch_and(&this->flags, ~PAGE_IOINFLIGHT, memory_order_release);
+        if (oldflags & PAGE_IOINFLIGHT) {
+            this->waitq.wake();
+        }
     }
 
     void CachePage::setflag(uint16_t flag) {
@@ -154,39 +186,67 @@ namespace NMem {
 
     size_t CachePage::unmapall(void) {
         // Unmap this page from all address spaces that have it mapped.
-        size_t count = 0;
+        // We collect mappings while holding page lock, then process without it to avoid lock order violation (page lock vs address space lock).
+        static constexpr size_t BATCHSIZE = 32;
+        vmamapping *batch[BATCHSIZE];
+        size_t totalcount = 0;
 
-        this->lock.acquire();
-        vmamapping *m = this->mappingshead;
-        while (m) {
-            vmamapping *next = m->next;
+        while (true) {
+            size_t collected = 0;
 
-            // Unmap from the address space (defer shootdown until all locks are released).
-            m->space->lock.acquire();
-            NArch::VMM::_unmappage(m->space, m->virtaddr, false);
-            m->space->lock.release();
-
-            // Decrement the page's reference count (process no longer has it mapped).
-            if (this->pagemeta) {
-                this->pagemeta->unref();
+            // Collect mappings under page lock.
+            this->lock.acquire();
+            vmamapping *m = this->mappingshead;
+            while (m && collected < BATCHSIZE) {
+                batch[collected++] = m;
+                vmamapping *next = m->next;
+                m = next;
             }
 
-            delete m;
-            count++;
-            m = next;
+            // Remove collected mappings from list.
+            if (collected > 0) {
+                // Update head to point past collected items.
+                vmamapping *last = batch[collected - 1];
+                this->mappingshead = last->next;
+                if (this->mapcount >= collected) {
+                    this->mapcount -= collected;
+                } else {
+                    this->mapcount = 0;
+                }
+            }
+            this->lock.release();
+
+            if (collected == 0) {
+                break; // No more mappings.
+            }
+
+            // Process collected mappings outside page lock.
+            for (size_t i = 0; i < collected; i++) {
+                vmamapping *mapping = batch[i];
+
+                // Unmap from the address space.
+                mapping->space->lock.acquire();
+                NArch::VMM::_unmappage(mapping->space, mapping->virtaddr, false);
+                mapping->space->lock.release();
+
+                // Decrement the page's reference count (process no longer has it mapped).
+                if (this->pagemeta) {
+                    this->pagemeta->unref();
+                }
+
+                delete mapping;
+                totalcount++;
+            }
         }
-        this->mappingshead = NULL;
-        this->mapcount = 0;
-        this->lock.release();
 
 #ifdef __x86_64__
         // Issue a full TLB shootdown since we may have unmapped from multiple address spaces.
-        if (count > 0) {
+        if (totalcount > 0) {
             NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_FULL, 0, 0);
         }
 #endif
 
-        return count;
+        return totalcount;
     }
 
     RadixTreeNode::~RadixTreeNode(void) {
@@ -329,22 +389,43 @@ namespace NMem {
             return NULL;
         }
 
-        // Take a reference on the page's pagemeta before releasing treelock.
-        // This prevents eviction from freeing the page while we try to lock it.
+        // Take a reference on the CachePage to prevent it from being deleted while we release the tree lock and try to acquire the page lock.
+        page->ref();
+
+        // Capture the generation counter to detect ABA (page evicted + memory reused).
+        uint32_t gen = __atomic_load_n(&page->generation, memory_order_acquire);
+        // Also ref the pagemeta to prevent physical page reclaim.
         if (page->pagemeta) {
             page->pagemeta->ref();
         }
 
         this->treelock.release();
 
-        // Now lock the page. We hold a ref so it won't be freed.
+        // Now lock the page. We hold refs so neither will be freed.
         page->pagelock();
 
-        // Release the ref we took (pagelock now protects us).
+        // Release the pagemeta ref (page lock now protects the physical page).
         if (page->pagemeta) {
             page->pagemeta->unref();
         }
 
+        // Verify the page is still in this cache (not evicted while we were locking).
+        // Check both that it's still at this index AND that generation hasn't changed
+        // (to detect ABA problem where memory is reused for a different page).
+        this->treelock.acquire();
+        CachePage *verify = lookupinternal(index);
+        uint32_t newgen = (verify == page) ? __atomic_load_n(&page->generation, memory_order_acquire) : 0;
+        this->treelock.release();
+
+        if (verify != page || newgen != gen) {
+            // Page was evicted and possibly replaced, or memory was reused. Release and return NULL.
+            page->pageunlock();
+            page->unref();
+            return NULL;
+        }
+
+        // Page is still valid. We keep the ref for the caller.
+        // Caller MUST call page->unref() after page->pageunlock().
         return page;
     }
 
@@ -387,6 +468,9 @@ namespace NMem {
         if (!page) {
             return NULL;
         }
+
+        // Increment generation counter for ABA protection.
+        __atomic_add_fetch(&page->generation, 1, memory_order_acq_rel);
 
         node->slots[slot] = NULL;
         node->count--;
@@ -544,9 +628,10 @@ namespace NMem {
 
                 // Apply filter if provided.
                 if (!filter || filter(page, ctx)) {
-                    // Take a reference before returning.
+                    // Take references before returning.
+                    page->ref();  // CachePage ref for caller.
                     if (page->pagemeta) {
-                        page->pagemeta->ref();
+                        page->pagemeta->ref();  // Pagemeta ref for physical page protection.
                     }
                     out[collected++] = page;
 
@@ -683,9 +768,31 @@ namespace NMem {
 
     CachePage *PageCache::selectvictim(void) {
         // Shrimple second-chance LRU clock algorithm.
+        // Dynamic iteration limit based on actual page count.
+        size_t maxiters = (this->activecount + this->inactivecount) * 2;
+        if (maxiters < 1024) {
+            maxiters = 1024;
+        }
+        if (maxiters > 65536) {
+            maxiters = 65536;
+        }
+        size_t iters = 0;
+        bool restarted = false;
 
         CachePage *candidate = this->inactivetail;
-        while (candidate) {
+        while (iters < maxiters) {
+            // If we've reached the head, restart from tail for second pass.
+            if (!candidate) {
+                if (restarted) {
+                    break;  // Already did second pass.
+                }
+                candidate = this->inactivetail;
+                restarted = true;
+                if (!candidate) {
+                    break;  // List is empty.
+                }
+            }
+            iters++;
             if (candidate->testflag(PAGE_LOCKED | PAGE_WRITEBACK)) {
                 // Skip locked or writeback pages.
                 candidate = candidate->lruprev;
@@ -693,19 +800,32 @@ namespace NMem {
             }
 
             if (candidate->testflag(PAGE_REFERENCED)) {
-                // Give second chance.
+                // Give second chance: clear flag but don't move.
+                // Page stays in place, will be evictable on next scan.
                 candidate->clearflag(PAGE_REFERENCED);
-                promotepage(candidate);
-                candidate = this->inactivetail;
+                candidate = candidate->lruprev;
                 continue;
             }
 
             return candidate;
         }
 
-        // Try active list if inactive is empty.
+        // Try active list if inactive is empty or exhausted.
+        iters = 0;
+        restarted = false;
         candidate = this->activetail;
-        while (candidate) {
+        while (iters < maxiters) {
+            if (!candidate) {
+                if (restarted) {
+                    break;
+                }
+                candidate = this->activetail;
+                restarted = true;
+                if (!candidate) {
+                    break;
+                }
+            }
+            iters++;
             if (candidate->testflag(PAGE_LOCKED | PAGE_WRITEBACK)) {
                 candidate = candidate->lruprev;
                 continue;
@@ -713,10 +833,147 @@ namespace NMem {
 
             if (candidate->testflag(PAGE_REFERENCED)) {
                 candidate->clearflag(PAGE_REFERENCED);
-                // Move to head (MRU).
-                removefromlru(candidate);
-                addtoactive(candidate);
+                CachePage *prev = candidate->lruprev;
+                demotepage(candidate);
+                candidate = prev ? prev : this->activetail;
+                continue;
+            }
+
+            // Demote to inactive for future eviction.
+            demotepage(candidate);
+            return candidate;
+        }
+
+        return NULL;
+    }
+
+    CachePage *PageCache::selectvictimclean(selvictimstats *stats) {
+        // Select a CLEAN victim page for eviction. Used by shrink() to avoid writeback stalls.
+        // Dynamic iteration limit based on actual page count.
+        size_t maxiters = (this->activecount + this->inactivecount) * 2;
+        if (maxiters < 1024) {
+            maxiters = 1024;
+        }
+        if (maxiters > 65536) {
+            maxiters = 65536;
+        }
+        size_t iters = 0;
+        bool restarted = false;
+
+        CachePage *candidate = this->inactivetail;
+        while (iters < maxiters) {
+            // If we've reached the head, restart from tail for second pass.
+            if (!candidate) {
+                if (restarted) {
+                    break;  // Already did second pass.
+                }
+                candidate = this->inactivetail;
+                restarted = true;
+                if (!candidate) {
+                    break;  // List is empty.
+                }
+            }
+            iters++;
+
+            // Track skip reasons for diagnostics.
+            if (candidate->testflag(PAGE_LOCKED)) {
+                if (stats) {
+                    stats->skippedlocked++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+            if (candidate->testflag(PAGE_IOINFLIGHT)) {
+                if (stats) {
+                    stats->skippedioinflight++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+            if (candidate->testflag(PAGE_WRITEBACK)) {
+                if (stats) {
+                    stats->skippedwriteback++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+            if (candidate->testflag(PAGE_DIRTY)) {
+                if (stats) {
+                    stats->skippeddirty++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+
+            if (candidate->testflag(PAGE_REFERENCED)) {
+                // Give second chance: clear flag but don't move.
+                if (stats) {
+                    stats->skippedreferenced++;
+                }
+                candidate->clearflag(PAGE_REFERENCED);
+                candidate = candidate->lruprev;
+                continue;
+            }
+
+            return candidate;
+        }
+
+        // Try active list if inactive is empty or exhausted.
+        iters = 0;
+        restarted = false;
+        candidate = this->activetail;
+        while (iters < maxiters) {
+            if (!candidate) {
+                if (restarted) {
+                    break;
+                }
                 candidate = this->activetail;
+                restarted = true;
+                if (!candidate) {
+                    break;
+                }
+            }
+            iters++;
+
+            // Track skip reasons for diagnostics.
+            if (candidate->testflag(PAGE_LOCKED)) {
+                if (stats) {
+                    stats->skippedlocked++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+            if (candidate->testflag(PAGE_IOINFLIGHT)) {
+                if (stats) {
+                    stats->skippedioinflight++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+            if (candidate->testflag(PAGE_WRITEBACK)) {
+                if (stats) {
+                    stats->skippedwriteback++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+            if (candidate->testflag(PAGE_DIRTY)) {
+                if (stats) {
+                    stats->skippeddirty++;
+                }
+                candidate = candidate->lruprev;
+                continue;
+            }
+
+            if (candidate->testflag(PAGE_REFERENCED)) {
+                // Demote to inactive tail instead of promoting to head.
+                if (stats) {
+                    stats->skippedreferenced++;
+                }
+                candidate->clearflag(PAGE_REFERENCED);
+                CachePage *prev = candidate->lruprev;
+                demotepage(candidate);
+                candidate = prev ? prev : this->activetail;
                 continue;
             }
 
@@ -729,6 +986,9 @@ namespace NMem {
     }
 
     int PageCache::evictpage(CachePage *page) {
+        // Verify refcount contract in debug builds.
+        assertarg(page->getref() >= 2, "evictpage: page refcount too low (%d), expected >= 2\n", page->getref());
+
         if (page->testflag(PAGE_DIRTY)) { // Dirty pages should be written back before evicting (so we don't end up losing data).
             int err = writebackpage(page);
             if (err < 0) {
@@ -765,17 +1025,79 @@ namespace NMem {
         if (page->pagemeta) {
             page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
             page->pagemeta->cacheentry = NULL;
-            page->pagemeta->unref();  // Release initial cache ref.
-            page->pagemeta->unref();  // Release ref taken by shrink() before calling evictpage.
+            page->pagemeta->unref();  // Release initial cache ref (taken in addpage).
+            page->pagemeta->unref();  // Release caller's collection ref.
         }
 
-        // Release reference to inode or blockdev to allow them to be freed.
+        // Release reference to inode (BlockDevice pages don't hold refs).
         if (page->inode) {
             page->inode->unref();
         }
 
-        delete page;
+        // Unlock page before final unref (unref may delete if refcount reaches 0).
+        page->pageunlock();
+
+        // Release caller's collection ref (taken in shrink collection phase).
+        page->unref();
+
+        // Release initial cache ref (taken in addpage). This may delete the page.
+        page->unref();
+
         return 0;
+    }
+
+    void PageCache::evictpagefromwriteback(CachePage *page) {
+        // Verify refcount contract in debug builds.
+        assertarg(page->getref() >= 2, "evictpagefromwriteback: page refcount too low (%d), expected >= 2\n", page->getref());
+
+        // Eviction logic that can perform blocking I/O (used by writeback thread).
+
+        if (page->hasmappings()) {
+            page->unmapall();
+        }
+
+        // Remove from owning radix tree.
+        off_t index = page->offset / NArch::PAGESIZE;
+        if (page->inode) {
+            RadixTree *cache = page->inode->getpagecache();
+            if (cache) {
+                cache->remove(index);
+            }
+        } else if (page->blockdev) {
+            RadixTree *cache = page->blockdev->getpagecache();
+            if (cache) {
+                cache->remove(index);
+            }
+        }
+
+        // Remove from LRU.
+        {
+            NLib::ScopeIRQSpinlock guard(&this->cachelock);
+            removefromlru(page);
+            this->totalpages--;
+        }
+
+        // Free the physical page.
+        if (page->pagemeta) {
+            page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+            page->pagemeta->cacheentry = NULL;
+            page->pagemeta->unref();  // Release initial cache ref.
+            page->pagemeta->unref();  // Release ref taken by writeback batch collection.
+        }
+
+        // Release reference to inode (BlockDevice pages don't hold refs).
+        if (page->inode) {
+            page->inode->unref();
+        }
+
+        // Unlock page before final unref.
+        page->pageunlock();
+
+        // Release caller's collection ref.
+        page->unref();
+
+        // Release initial cache ref. This may delete the page.
+        page->unref();
     }
 
     int PageCache::writebackpage(CachePage *page) {
@@ -839,6 +1161,17 @@ namespace NMem {
 
         CachePage *page = cache->lookupandlock(index);
         if (page) {
+            // Mark page as recently accessed for LRU.
+            page->setflag(PAGE_REFERENCED);
+
+            // Promote from inactive to active on cache hit (second access).
+            {
+                NLib::ScopeIRQSpinlock guard(&this->cachelock);
+                if (page->lrulist == LRU_INACTIVE) {
+                    promotepage(page);
+                }
+            }
+
             this->inchits();
             return page;
         }
@@ -852,10 +1185,10 @@ namespace NMem {
             return NULL;
         }
 
-        // Delegate to inode's getorcacheepage which properly handles the per-inode radix tree.
-        CachePage *page = inode->getorcacheepage(offset);
+        // Delegate to inode's getorcachepage which properly handles the per-inode radix tree.
+        CachePage *page = inode->getorcachepage(offset);
         if (page) {
-            // Page is returned locked by getorcacheepage.
+            // Page is returned locked by getorcachepage.
             return page;
         }
 
@@ -868,26 +1201,21 @@ namespace NMem {
             return -EINVAL;
         }
 
+        // Take initial reference for being in the cache.
+        page->ref();
+
         {
             NLib::ScopeIRQSpinlock guard(&this->cachelock);
 
-            addtoactive(page);
+            // New pages start in inactive list. They get promoted to active on second access (cache hit).
+            addtoinactive(page);
             this->totalpages++;
         }
 
-        // Check if we need to evict.
+
+        // We RELY on the writeback thread to write back dirty pages periodically, as we can't synchronously write them back here (would cause deadlocks).
+        // If we're over the limit, just wake the writeback thread.
         if (this->maxpages > 0 && this->totalpages > this->maxpages) {
-            // Calculate how many pages we need to evict to get back to targetfreepages below max.
-            size_t target = this->targetfreepages > 0 ? this->targetfreepages : 16;
-            size_t current = this->totalpages;
-            size_t limit = this->maxpages;
-
-            if (current > limit) {
-                size_t toevict = current - limit + target;
-                shrink(toevict);
-            }
-
-            // Also wake writeback thread to help flush dirty pages.
             wakewriteback();
         }
 
@@ -936,6 +1264,8 @@ namespace NMem {
                 while (page && count < MAXBATCH) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                        // Take refs on both CachePage and pagemeta to prevent deletion/reclaim.
+                        page->ref();
                         if (page->pagemeta) {
                             page->pagemeta->ref();
                         }
@@ -960,6 +1290,7 @@ namespace NMem {
                 if (page->pagemeta) {
                     page->pagemeta->unref();
                 }
+                page->unref();  // Release collection ref.
             }
         } while (count >= MAXBATCH);
 
@@ -973,6 +1304,8 @@ namespace NMem {
                 while (page && count < MAXBATCH) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                        // Take refs on both CachePage and pagemeta to prevent deletion/reclaim.
+                        page->ref();
                         if (page->pagemeta) {
                             page->pagemeta->ref();
                         }
@@ -997,6 +1330,7 @@ namespace NMem {
                 if (page->pagemeta) {
                     page->pagemeta->unref();
                 }
+                page->unref();  // Release collection ref.
             }
         } while (count >= MAXBATCH);
 
@@ -1004,22 +1338,43 @@ namespace NMem {
     }
 
     void PageCache::writebackthread(void) {
-        NUtil::printf("[mm/pagecache]: Writeback thread started.\n");
-
         while (this->isrunning()) {
-            // Wait for either timeout or explicit wakeup.
-            // XXX: Doesn't actively wake on explicit wakeup yet.
-            NSched::sleep(WRITEBACKINTERVALMS);
+            // Clear the wakeup flag BEFORE waiting to avoid losing wakes.
+            __atomic_store_n(&this->wakeupneeded, false, memory_order_release);
+
+            // Wait until either:
+            // 1. wakeupneeded flag is set (immediate wake from wakewriteback())
+            // 2. Timeout expires (periodic writeback interval)
+            // 3. Shutdown requested (!isrunning())
+            int waitresult;
+            waiteventtimeout(&this->wakeupwq,
+                __atomic_load_n(&this->wakeupneeded, memory_order_acquire) || !this->isrunning(),
+                WRITEBACKINTERVALMS,
+                waitresult);
+            // waitresult is 0 (woken by condition) or -ETIMEDOUT (periodic interval)
+            (void)waitresult;  // We don't care which triggered the wake.
+
+            bool wokeforthrottle = this->shouldthrottle();
+            bool wakeforsoftthreshold = this->shouldwakewriteback();
+            // Capture whether we're over the page limit at the START of the cycle.
+            // This is used later to decide if we need to shrink for headroom.
+            bool wasovertotallimit = (this->maxpages > 0 && this->totalpages > this->maxpages);
 
             if (!this->isrunning()) {
                 break;
             }
 
+            // Check if we're under memory pressure (over limit OR hard dirty threshold exceeded).
+            bool underpressure = wasovertotallimit || wokeforthrottle;
+
             // Write back dirty pages using collect-then-process pattern.
+            // Under pressure, remove the per-cycle limit to flush more aggressively.
+            size_t maxpercycle = underpressure ? __SIZE_MAX__ : MAXWRITEBACKPERCYCLE;
             size_t written = 0;
 
-            static constexpr size_t BATCHSIZE = 32;
-            CachePage *batch[BATCHSIZE];
+            // Use larger batch size under pressure.
+            size_t batchsize = underpressure ? BATCHSIZEPRESSURE : BATCHSIZENORMAL;
+            CachePage *batch[BATCHSIZEPRESSURE]; // Allocate for max size.
             size_t count;
 
             // Collect from active list.
@@ -1028,9 +1383,11 @@ namespace NMem {
 
                 count = 0;
                 CachePage *page = this->activehead;
-                while (page && count < BATCHSIZE && written + count < MAXWRITEBACKPERCYCLE) {
+                while (page && count < batchsize && written + count < maxpercycle) {
                     CachePage *next = page->lrunext;
-                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK) && !page->testflag(PAGE_LOCKED)) {
+                        // Only take refs, NOT locks. We'll lock one at a time during processing.
+                        page->ref();
                         if (page->pagemeta) {
                             page->pagemeta->ref();
                         }
@@ -1041,30 +1398,51 @@ namespace NMem {
             }
 
             // Process active batch outside of lock.
+            // Lock one page at a time, write it, then unlock before moving to next.
             for (size_t i = 0; i < count; i++) {
                 CachePage *page = batch[i];
-                if (page->trypagelock()) {
-                    if (page->testflag(PAGE_DIRTY)) {
-                        writebackpage(page);
-                        written++;
+
+                // Try to lock the page. If we can't, skip it.
+                if (!page->trypagelock()) {
+                    // Page is locked by someone else, skip.
+                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
                     }
-                    page->pageunlock();
+                    continue;
                 }
-                if (page->pagemeta) {
-                    page->pagemeta->unref();
+
+                // Re-check dirty flag after acquiring lock (page may have been cleaned).
+                if (page->testflag(PAGE_DIRTY)) {
+                    writebackpage(page);
+                    written++;
+                }
+
+                // If under pressure and page is now clean, evict immediately.
+                if (underpressure && !page->testflag(PAGE_DIRTY) && this->totalpages > this->maxpages) {
+                    // Evict the page. evictpagefromwriteback handles unlock and unref.
+                    evictpagefromwriteback(page);
+                } else {
+                    page->pageunlock();
+                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
+                    }
                 }
             }
 
             // Collect from inactive list if we haven't hit the limit.
-            if (written < MAXWRITEBACKPERCYCLE) {
+            if (written < maxpercycle) {
                 {
                     NLib::ScopeIRQSpinlock guard(&this->cachelock);
 
                     count = 0;
                     CachePage *page = this->inactivehead;
-                    while (page && count < BATCHSIZE && written + count < MAXWRITEBACKPERCYCLE) {
+                    while (page && count < batchsize && written + count < maxpercycle) {
                         CachePage *next = page->lrunext;
-                        if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                        if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK) && !page->testflag(PAGE_LOCKED)) {
+                            // Only take refs, NOT locks. We'll lock one at a time during processing.
+                            page->ref();
                             if (page->pagemeta) {
                                 page->pagemeta->ref();
                             }
@@ -1075,27 +1453,98 @@ namespace NMem {
                 }
 
                 // Process inactive batch outside of lock.
+                // Lock one page at a time, write it, then unlock before moving to next.
                 for (size_t i = 0; i < count; i++) {
                     CachePage *page = batch[i];
-                    if (page->trypagelock()) {
-                        if (page->testflag(PAGE_DIRTY)) {
-                            writebackpage(page);
-                            written++;
+
+                    // Try to lock the page. If we can't, skip it.
+                    if (!page->trypagelock()) {
+                        // Page is locked by someone else, skip.
+                        page->unref();
+                        if (page->pagemeta) {
+                            page->pagemeta->unref();
                         }
-                        page->pageunlock();
+                        continue;
                     }
-                    if (page->pagemeta) {
-                        page->pagemeta->unref();
+
+                    // Re-check dirty flag after acquiring lock (page may have been cleaned).
+                    if (page->testflag(PAGE_DIRTY)) {
+                        writebackpage(page);
+                        written++;
+                    }
+
+                    // If under pressure and page is now clean, evict immediately.
+                    if (underpressure && !page->testflag(PAGE_DIRTY) && this->totalpages > this->maxpages) {
+                        // evictpagefromwriteback handles unlock and unref.
+                        evictpagefromwriteback(page);
+                    } else {
+                        page->pageunlock();
+                        page->unref();
+                        if (page->pagemeta) {
+                            page->pagemeta->unref();
+                        }
                     }
                 }
             }
 
-            if (written > 0) {
-                NUtil::printf("[mm/pagecache]: Wrote back %lu dirty pages.\n", written);
+            // After writeback, check if we need to shrink.
+            // The writeback thread is a safe context for shrinking because:
+            // 1. It's not in any I/O call chain
+            // 2. shrink() only evicts clean pages, so no recursive I/O
+            // 3. Even if shrink triggers some I/O, we're not holding any page locks
+
+            // Also shrink if dirty ratio is high and we're near page limit (make room for new dirty pages).
+            size_t dirtytarget = (this->maxpages * DIRTYTARGETPERCENT) / 100;
+            bool overdirtytarget = this->dirtypages > dirtytarget;
+            bool needshrink = wasovertotallimit ||
+                              (this->maxpages > 0 && this->totalpages > this->maxpages) ||
+                              (overdirtytarget && this->totalpages > (this->maxpages * 90) / 100);
+            if (needshrink) {
+                size_t target = this->targetfreepages > 0 ? this->targetfreepages : 16;
+                size_t current = this->totalpages;
+                size_t limit = this->maxpages;
+
+                // Calculate how many to evict to get below the limit plus headroom.
+                size_t toevict = current - limit + target;
+
+                size_t freed = shrink(toevict);
+
+                // If shrink didn't free enough, use aggressive writeback+shrink.
+                // This writes back dirty pages and evicts them immediately.
+                if (freed < toevict && this->totalpages > this->maxpages) {
+                    size_t remaining = toevict - freed;
+                    size_t morefreed = shrinkwithwriteback(remaining);
+                    freed += morefreed;
+                }
+
+                // Wake any throttled writers now that we've freed pages.
+                // Increment generation BEFORE wake so waiters see the change.
+                if (freed > 0) {
+                    __atomic_fetch_add(&this->throttlegeneration, 1, memory_order_release);
+                    this->throttlewq.wake();
+                }
             }
+
+            // Also wake throttled writers if we wrote back dirty pages
+            // (reduces dirty page count below threshold even without shrink).
+            // Increment generation BEFORE wake so waiters see the change.
+            if (written > 0) {
+                __atomic_fetch_add(&this->throttlegeneration, 1, memory_order_release);
+                this->throttlewq.wake();
+            }
+
+            // CRITICAL: Always increment generation and wake at end of each cycle.
+            // This ensures waiters don't get stuck if writeback couldn't make progress
+            // (e.g., all pages are locked, or no clean pages to evict).
+            // The timeout in throttle() will retry, but we need to signal that we ran.
+            // Only do this if we didn't already wake above.
+            if (written == 0) {
+                __atomic_fetch_add(&this->throttlegeneration, 1, memory_order_release);
+                this->throttlewq.wake();
+            }
+
         }
 
-        NUtil::printf("[mm/pagecache]: Writeback thread exiting.\n");
         this->signalexit();
     }
 
@@ -1120,31 +1569,66 @@ namespace NMem {
 
         // Schedule the thread.
         NSched::schedulethread(this->wbthread);
-        NUtil::printf("[mm/pagecache]: Writeback thread scheduled.\n");
     }
 
     void PageCache::wakewriteback(void) {
-        // Wake writeback thread if it's sleeping.
+        // Set flag and immediately wake the writeback thread.
+        // The thread uses waiteventtimeout so it will wake immediately.
+        __atomic_store_n(&this->wakeupneeded, true, memory_order_release);
         this->wakeupwq.wake();
     }
 
     size_t PageCache::shrink(size_t count) {
+        // CRITICAL: Prevent recursive shrink calls.
+        NSched::Thread *shrinkthread = NArch::CPU::get() ? NArch::CPU::get()->currthread : NULL;
+        if (shrinkthread && shrinkthread->inshrink) {
+            // Already in shrink in this thread, bail out to prevent recursion.
+            return 0;
+        }
+
+        // Set recursion guard.
+        if (shrinkthread) {
+            shrinkthread->inshrink = true;
+        }
+
         // Use collect-then-process pattern to avoid holding cachelock during I/O.
+        // We lock each page during collection to prevent double-collection and
+        // to ensure pages remain valid until we process them.
         static constexpr size_t BATCHSIZE = 16;
+        static constexpr size_t MAX_LOCKED_RETRIES = 3;
         CachePage *batch[BATCHSIZE];
         size_t freed = 0;
+        size_t lockedretries = 0;
+        size_t loopiter = 0;
 
         while (freed < count) {
-            size_t collected = 0;
+            loopiter++;
+            if (loopiter > 1000) {
+                break;
+            }
 
-            // Collect victim pages.
+            size_t collected = 0;
+            struct selvictimstats stats = {};
+
+            // Collect victim pages. Only collect CLEAN pages to avoid writeback during shrink.
+            // Dirty pages will be handled by the writeback thread.
+            // We lock each page during collection to prevent the same page being
+            // collected twice and to ensure it remains valid.
             {
                 NLib::ScopeIRQSpinlock guard(&this->cachelock);
                 while (collected < BATCHSIZE && freed + collected < count) {
-                    CachePage *victim = selectvictim();
+                    CachePage *victim = selectvictimclean(&stats);
                     if (!victim) {
                         break;
                     }
+                    // Try to lock the page while holding cachelock.
+                    // This prevents double-collection: locked pages are skipped by selectvictimclean.
+                    if (!victim->trypagelock()) {
+                        // Page is already locked, skip it.
+                        continue;
+                    }
+                    // Take refs to keep page and pagemeta alive.
+                    victim->ref();
                     if (victim->pagemeta) {
                         victim->pagemeta->ref();
                     }
@@ -1153,26 +1637,40 @@ namespace NMem {
             }
 
             if (collected == 0) {
-                break; // We can't free any more pages.
+                // Check if we failed because pages exist but are locked.
+                if ((stats.skippedlocked > 0 || stats.skippedioinflight > 0) && lockedretries < MAX_LOCKED_RETRIES) {
+                    lockedretries++;
+                    // Yield to let I/O threads complete.
+                    NSched::yield();
+                    continue;
+                }
+                break; // No more clean pages to free.
             }
 
+            lockedretries = 0; // Reset on successful collection.
+
             // Evict collected pages outside of lock.
+            // Pages are already locked from collection phase.
             for (size_t i = 0; i < collected; i++) {
                 CachePage *page = batch[i];
-                if (page->trypagelock()) {
-                    int err = evictpage(page);
-                    if (err == 0) {
-                        freed++;
-                        // Page is now deleted.
-                    } else {
-                        // Eviction failed, page still valid.
-                        page->pageunlock();
-                        if (page->pagemeta) {
-                            page->pagemeta->unref();
-                        }
+                // Double-check page is still clean (may have been dirtied since collection).
+                if (page->testflag(PAGE_DIRTY)) {
+                    // Page became dirty, skip it.
+                    page->pageunlock();
+                    page->unref();
+                    if (page->pagemeta) {
+                        page->pagemeta->unref();
                     }
+                    continue;
+                }
+                int err = evictpage(page);
+                if (err == 0) {
+                    freed++;
+                    // Evict page handles unlock and unref.
                 } else {
-                    // Couldn't lock page, skip it.
+                    // Eviction failed, page still valid.
+                    page->pageunlock();
+                    page->unref();
                     if (page->pagemeta) {
                         page->pagemeta->unref();
                     }
@@ -1180,21 +1678,103 @@ namespace NMem {
             }
         }
 
+        // Clear recursion guard.
+        if (shrinkthread) {
+            shrinkthread->inshrink = false;
+        }
+
         return freed;
     }
 
-    void PageCache::reclaim(void) {
-        // Called under memory pressure.
-        size_t targetfree = this->targetfreepages;
-        if (targetfree == 0) {
-            targetfree = 16; // Default.
+    size_t PageCache::shrinkwithwriteback(size_t count) {
+        // First try clean-only shrink (fast, no I/O).
+        size_t freed = shrink(count);
+        if (freed >= count) {
+            return freed;
         }
 
-        size_t current = this->totalpages;
-        if (this->maxpages > 0 && current > this->maxpages - targetfree) { // We NEED to evict to keep our limits.
-            size_t toevict = current - (this->maxpages - targetfree);
-            shrink(toevict);
+        // Clean-only shrink insufficient. Write back dirty pages and retry.
+        // This is more aggressive and may block on I/O.
+        static constexpr size_t MAXRETRIES = 3;
+        static constexpr size_t BATCHSIZE = 32;
+        CachePage *batch[BATCHSIZE];
+
+        for (size_t retry = 0; retry < MAXRETRIES && freed < count; retry++) {
+            size_t batchcount = 0;
+
+            // Collect dirty pages from inactive list first (prefer cold pages).
+            // Then scan active list if we didn't fill the batch.
+            // Lock pages during collection and take refs.
+            {
+                NLib::ScopeIRQSpinlock guard(&this->cachelock);
+
+                // First scan inactive list (cold pages preferred).
+                CachePage *page = this->inactivetail;
+                while (page && batchcount < BATCHSIZE) {
+                    CachePage *prev = page->lruprev;
+                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                        // Lock page during collection to prevent double-collection.
+                        if (!page->trypagelock()) {
+                            page = prev;
+                            continue;
+                        }
+                        page->ref();
+                        if (page->pagemeta) {
+                            page->pagemeta->ref();
+                        }
+                        batch[batchcount++] = page;
+                    }
+                    page = prev;
+                }
+
+                // If inactive list didn't fill the batch, also scan active list.
+                // This handles the case where dirty pages have been promoted.
+                if (batchcount < BATCHSIZE) {
+                    page = this->activetail;
+                    while (page && batchcount < BATCHSIZE) {
+                        CachePage *prev = page->lruprev;
+                        if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK)) {
+                            if (!page->trypagelock()) {
+                                page = prev;
+                                continue;
+                            }
+                            page->ref();
+                            if (page->pagemeta) {
+                                page->pagemeta->ref();
+                            }
+                            batch[batchcount++] = page;
+                        }
+                        page = prev;
+                    }
+                }
+            }
+
+            if (batchcount == 0) {
+                // No dirty pages to write.
+                break;
+            }
+
+            // Write back the batch synchronously.
+            // Pages are already locked from collection phase.
+            for (size_t i = 0; i < batchcount; i++) {
+                CachePage *page = batch[i];
+                // Page is already locked from collection.
+                if (page->testflag(PAGE_DIRTY)) {
+                    writebackpage(page);
+                }
+                page->pageunlock();
+                page->unref();
+                if (page->pagemeta) {
+                    page->pagemeta->unref();
+                }
+            }
+
+            // Retry clean-only shrink.
+            size_t morefreed = shrink(count - freed);
+            freed += morefreed;
         }
+
+        return freed;
     }
 
     int PageCache::invalidatepage(NFS::VFS::INode *inode, off_t offset) {
@@ -1211,6 +1791,7 @@ namespace NMem {
         }
 
         // Use lookupandlock to atomically look up and lock, preventing race with eviction.
+        // lookupandlock takes a ref on the page for us.
         CachePage *page = cache->lookupandlock(index);
         if (!page) {
             return 0; // Page not cached.
@@ -1229,21 +1810,28 @@ namespace NMem {
             this->totalpages--;
         }
 
-        // Free physical page.
+        // Free physical page via pagemeta unref.
         if (page->pagemeta) {
             page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
             page->pagemeta->cacheentry = NULL;
-        }
-        if (page->physaddr) {
-            NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
+            page->pagemeta->unref();  // Release initial cache ref.
+            page->pagemeta->unref();  // Release ref from lookupandlock.
         }
 
-        // Release reference to inode.
+        // Release reference to inode (BlockDevice pages don't hold refs).
         if (page->inode) {
             page->inode->unref();
         }
 
-        delete page;
+        // Unlock page before final unref.
+        page->pageunlock();
+
+        // Release ref from lookupandlock.
+        page->unref();
+
+        // Release initial cache ref (from addpage). This may delete the page.
+        page->unref();
+
         return 0;
     }
 
@@ -1259,68 +1847,68 @@ namespace NMem {
 
         int errors = 0;
 
-        // Callback to invalidate each page.
-        struct invalidatectx {
-            PageCache *pc;
-            int errors;
-        };
-
-        struct invalidatectx ctx = { this, 0 };
-
-        // We need to collect pages first since we can't modify tree during iteration.
+        // We can't modify tree during iteration, so use foreach to find one page at a time and remove it. Repeat until no pages remain.
         while (true) {
-            CachePage *page = cache->lookup(0);
-            // Walk tree to find any page.
-            bool found = false;
+            CachePage *foundpage = NULL;
 
+            // Find first page in the cache.
             cache->foreach([](CachePage *page, void *arg) -> bool {
-                CachePage **foundpage = (CachePage **)arg;
-                *foundpage = page;
+                CachePage **result = (CachePage **)arg;
+                // Take a ref to keep the page alive.
+                page->ref();
+                *result = page;
                 return false; // Stop at first page.
-            }, &page);
+            }, &foundpage);
 
-            if (!page) {
+            if (!foundpage) {
                 break; // No more pages.
             }
-            found = true;
 
-            page->pagelock();
+            // Lock the page. We hold a ref so page won't be freed.
+            foundpage->pagelock();
+
+            // Verify page is still in cache (may have been evicted while we waited for lock).
+            off_t index = foundpage->offset / NArch::PAGESIZE;
+            CachePage *check = cache->lookup(index);
+            if (check != foundpage) {
+                // Page was evicted, release our ref and continue.
+                foundpage->pageunlock();
+                foundpage->unref();
+                continue;
+            }
 
             // Write back if dirty.
-            if (page->testflag(PAGE_DIRTY)) {
-                int err = writebackpage(page);
+            if (foundpage->testflag(PAGE_DIRTY)) {
+                int err = writebackpage(foundpage);
                 if (err < 0) {
                     errors++;
                 }
             }
 
-            off_t index = page->offset / NArch::PAGESIZE;
             cache->remove(index);
 
             {
                 NLib::ScopeIRQSpinlock guard(&this->cachelock);
-                removefromlru(page);
+                removefromlru(foundpage);
                 this->totalpages--;
             }
 
-            if (page->pagemeta) {
-                page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
-                page->pagemeta->cacheentry = NULL;
-            }
-            if (page->physaddr) {
-                NArch::PMM::free((void *)page->physaddr, NArch::PAGESIZE);
-            }
-
-            // Release reference to inode.
-            if (page->inode) {
-                page->inode->unref();
+            // Free physical page via pagemeta unref.
+            if (foundpage->pagemeta) {
+                foundpage->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
+                foundpage->pagemeta->cacheentry = NULL;
+                foundpage->pagemeta->unref();  // Release initial cache ref.
             }
 
-            delete page;
-
-            if (!found) {
-                break;
+            // Release reference to inode (BlockDevice pages don't hold refs).
+            if (foundpage->inode) {
+                foundpage->inode->unref();
             }
+
+            // Unlock and release refs.
+            foundpage->pageunlock();
+            foundpage->unref();  // Release our lookup ref.
+            foundpage->unref();  // Release initial cache ref. May delete page.
         }
 
         return errors;
@@ -1331,16 +1919,188 @@ namespace NMem {
             return false; // No limit.
         }
 
-        size_t dirty = __atomic_load_n(&this->dirtypages, memory_order_acquire);
-        size_t threshold = (this->maxpages * DIRTYTHRESHOLDPERCENT) / 100;
+        // Throttle if we're over the total page limit.
+        size_t total = __atomic_load_n(&this->totalpages, memory_order_acquire);
+        if (total > this->maxpages) {
+            return true;
+        }
 
-        return dirty > threshold;
+        // Use hard threshold (50%) for blocking writers.
+        size_t dirty = __atomic_load_n(&this->dirtypages, memory_order_acquire);
+        size_t hardthreshold = (this->maxpages * DIRTYHARDTHRESHOLDPERCENT) / 100;
+
+        return dirty > hardthreshold;
+    }
+
+    bool PageCache::shouldwakewriteback(void) const {
+        if (this->maxpages == 0) {
+            return false; // No limit.
+        }
+
+        // Wake writeback at soft threshold (25%), proactive writeback.
+        size_t dirty = __atomic_load_n(&this->dirtypages, memory_order_acquire);
+        size_t softthreshold = (this->maxpages * DIRTYSOFTTHRESHOLDPERCENT) / 100;
+
+        return dirty > softthreshold;
+    }
+
+    void PageCache::throttle(void) {
+        static constexpr uint64_t THROTTLETIMEOUTMS = 25;
+        static constexpr size_t MAXNOPROGRESSCYCLES = 20;
+        static constexpr size_t DIRECTRECLAIMBATCH = 16; // Pages to write back directly per cycle.
+
+        size_t noprogresscycles = 0;
+
+        // Keep waiting until we're no longer throttled or shutdown requested.
+        // We don't have a retry limit - we MUST wait until pages are freed.
+        while (this->shouldthrottle() && this->isrunning()) {
+            // Capture state BEFORE signalling writeback thread.
+            size_t startdirty = this->dirtypages;
+            size_t startpages = this->totalpages;
+            uint64_t startgen = __atomic_load_n(&this->throttlegeneration, memory_order_acquire);
+
+            // First, try direct reclaim ourselves to avoid blocking on writeback thread.
+            size_t reclaimed = this->directreclaim(DIRECTRECLAIMBATCH);
+            if (reclaimed > 0) {
+                // We made progress, check condition again immediately.
+                noprogresscycles = 0;
+                continue;
+            }
+
+            // Direct reclaim didn't help, wake the writeback thread.
+            this->wakewriteback();
+
+            // Wait until:
+            // 1. No longer throttled (condition satisfied), OR
+            // 2. Generation changed (writeback made progress, possibly before we entered wait), OR
+            // 3. Shutdown requested, OR
+            // 4. Timeout expires (fallback)
+            int result;
+            waiteventtimeout(&this->throttlewq,
+                !this->shouldthrottle() ||
+                !this->isrunning() ||
+                __atomic_load_n(&this->throttlegeneration, memory_order_acquire) != startgen,
+                THROTTLETIMEOUTMS,
+                result);
+
+            // Check for progress.
+            if (this->shouldthrottle() && this->totalpages >= startpages && this->dirtypages >= startdirty) {
+                noprogresscycles++;
+
+                if (noprogresscycles >= MAXNOPROGRESSCYCLES) {
+                    // Reset counter to avoid wasted comparisons, but keep trying.
+                    noprogresscycles = 0;
+                }
+            } else {
+                noprogresscycles = 0;
+            }
+
+            // If timeout expired and still throttled, just wake writeback again.
+            if (result == -ETIMEDOUT && this->shouldthrottle()) {
+                // Wake writeback more aggressively, it will handle shrinking.
+                this->wakewriteback();
+            }
+        }
+    }
+
+    // Direct reclaim: write back dirty pages from the calling thread.
+    size_t PageCache::directreclaim(size_t target) {
+        static constexpr size_t BATCHSIZE = 16;
+        CachePage *batch[BATCHSIZE];
+        size_t written = 0;
+        size_t toprocess = target < BATCHSIZE ? target : BATCHSIZE;
+
+        // Collect dirty pages from inactive list (prefer cold pages).
+        size_t collected = 0;
+        {
+            NLib::ScopeIRQSpinlock guard(&this->cachelock);
+
+            CachePage *page = this->inactivetail;
+            while (page && collected < toprocess) {
+                CachePage *prev = page->lruprev;
+                if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK) && !page->testflag(PAGE_LOCKED)) {
+                    if (page->trypagelock()) {
+                        page->ref();
+                        if (page->pagemeta) {
+                            page->pagemeta->ref();
+                        }
+                        batch[collected++] = page;
+                    }
+                }
+                page = prev;
+            }
+
+            // If inactive didn't fill batch, try active list.
+            if (collected < toprocess) {
+                page = this->activetail;
+                while (page && collected < toprocess) {
+                    CachePage *prev = page->lruprev;
+                    if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK) && !page->testflag(PAGE_LOCKED)) {
+                        if (page->trypagelock()) {
+                            page->ref();
+                            if (page->pagemeta) {
+                                page->pagemeta->ref();
+                            }
+                            batch[collected++] = page;
+                        }
+                    }
+                    page = prev;
+                }
+            }
+        }
+
+        if (collected == 0) {
+            return 0;
+        }
+
+        // Write back collected pages (already locked).
+        for (size_t i = 0; i < collected; i++) {
+            CachePage *page = batch[i];
+            if (page->testflag(PAGE_DIRTY)) {
+                int err = writebackpage(page);
+                if (err == 0) {
+                    written++;
+                }
+            }
+            page->pageunlock();
+            page->unref();
+            if (page->pagemeta) {
+                page->pagemeta->unref();
+            }
+        }
+
+        // Signal progress to other throttled waiters.
+        if (written > 0) {
+            __atomic_fetch_add(&this->throttlegeneration, 1, memory_order_release);
+            this->throttlewq.wake();
+        }
+
+        return written;
     }
 
     void initpagecache(void) {
         pagecache = new PageCache();
         if (pagecache) {
-            pagecache->init(16384, 256); // XXX: Set based on total system memory?
+            // Scale page cache size based on total system memory.
+            // Use ~33% of total RAM for page cache, with 64 MiB minimum.
+            NArch::PMM::stats memstats;
+            NArch::PMM::getstats(&memstats);
+
+            size_t totalpages = memstats.buddytotal / NArch::PAGESIZE;
+            size_t maxpages = totalpages / 3; // 33% of buddy split RAM.
+            if (maxpages < 16384) {
+                maxpages = 16384; // Minimum 64 MiB.
+            }
+
+            // Target keeping ~1.5% of maxpages free for headroom.
+            size_t targetfree = maxpages / 64;
+            if (targetfree < 64) {
+                targetfree = 64;
+            }
+
+            pagecache->init(maxpages, targetfree);
+            NUtil::printf("[mm/pagecache]: Page cache sized to %lu pages (%lu MiB), target free %lu.\n",
+                         maxpages, (maxpages * NArch::PAGESIZE) / (1024 * 1024), targetfree);
         }
     }
 
@@ -1354,7 +2114,15 @@ namespace NMem {
         if (!pagecache) {
             return 0;
         }
-        return pagecache->shrink(count);
+        // First try clean-only shrink (fast, no I/O).
+        size_t freed = pagecache->shrink(count);
+        if (freed >= count) {
+            return freed;
+        }
+        // Fall back to writeback-enabled shrink for remaining pages.
+        // This is called from PMM under memory pressure, so blocking is acceptable.
+        // XXX: Could possibly deadlock if called with interrupts disabled?
+        return freed + pagecache->shrinkwithwriteback(count - freed);
     }
 
 }

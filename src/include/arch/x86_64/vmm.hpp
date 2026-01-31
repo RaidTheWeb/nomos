@@ -42,7 +42,7 @@ namespace NArch {
     }
 
     // Invalidate an entire range of pages.
-    // XXX: Slow! With big ranges, we should just be flushing the entire TLB.
+    // NOTE: Above a certain threshold, a full TLB flush is preferred for performance.
     static inline void invlrange(uintptr_t addr, size_t size) {
         size_t len = addr + size;
         for (; addr < len; addr += PAGESIZE) {
@@ -114,9 +114,9 @@ namespace NArch {
 
         // Global shootdown request structure.
         struct shootdownreq {
-            enum shootdowntype type;
-            uintptr_t start;
-            uintptr_t end;
+            volatile enum shootdowntype type;
+            volatile uintptr_t start;
+            volatile uintptr_t end;
             volatile size_t generation;     // Incremented on each new request.
             volatile size_t acks;           // Number of CPUs that have processed.
             size_t targetcpus;              // Number of CPUs that must acknowledge.
@@ -128,6 +128,7 @@ namespace NArch {
         static const size_t SHOOTDOWN_RANGETHRESHOLD = 32; // Threshold for when we should use a full TLB flush instead of a range shootdown (in pages).
 
         // Perform a TLB shootdown across all CPUs.
+        // Must not be called with any IRQSpinlocks held! (Will assert against that case, but fair warning nonetheless).
         void doshootdown(enum shootdowntype type, uintptr_t start, uintptr_t end);
 
         struct pagetable {
@@ -262,7 +263,6 @@ namespace NArch {
         // Clone address space's page table map to a different location, the address space itself can be referred to just fine.
         void clonecontext(struct addrspace *space, struct pagetable **pt);
         void uclonecontext(struct addrspace *src, struct addrspace **dest);
-        void enterucontext(struct pagetable *pt, struct addrspace *space);
 
         struct addrspace *forkcontext(struct addrspace *src);
 

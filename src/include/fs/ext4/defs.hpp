@@ -169,6 +169,13 @@ namespace NFS {
         #define EXT4_TINDBLOCK (EXT4_DINDBLOCK + 1)
         #define EXT4_NBLOCKS (EXT4_TINDBLOCK + 1)
 
+        // Superblock revision levels.
+        #define EXT2_GOODOLDREV         0 // Original ext2 format.
+        #define EXT2_DYNAMICREV         1 // V2 format with dynamic inode sizes.
+
+        // Ext2 revision 0 constants.
+        #define EXT2_GOODOLDINODESIZE   128 // Fixed inode size for revision 0.
+
         // Compatible feature flags (can mount read-write even if unknown).
         #define EXT4_FEATURECOMPATDIRPREALLOC   0x0001
         #define EXT4_FEATURECOMPATIMAGIC        0x0002

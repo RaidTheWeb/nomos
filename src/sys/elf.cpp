@@ -1,4 +1,5 @@
 #include <lib/align.hpp>
+#include <mm/vmalloc.hpp>
 #include <sys/elf.hpp>
 #include <util/kprint.hpp>
 
@@ -248,8 +249,8 @@ namespace NSys {
 
             // Track successfully loaded segments for cleanup on failure.
             struct loadedsegment {
-                uintptr_t vaddr;
-                uintptr_t phys;
+                uintptr_t vaddr; // ELF virtual address.
+                uintptr_t valloc; // VMalloc returned address.
                 size_t size;
                 size_t misalign;
             };
@@ -314,21 +315,32 @@ namespace NSys {
 
                     // XXX: VMalloc instead? We really don't *need* fully contiguous physical memory here.
                     // XXX: Better yet, implement page mapping without allocation, and allocate pages on-demand when accessed.
-                    void *phys = NArch::PMM::alloc(NLib::alignup(phdrs[i].msize + misalign, NArch::PAGESIZE)); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
-                    if (!phys) {
+                    void *valloc = NMem::VMalloc::alloc(NLib::alignup(phdrs[i].msize + misalign, NArch::PAGESIZE)); // We should allocate enough to work around the misalignment, so we can place the data at the right location. Aside from the file data copy, this is the only place we need to account for misalignment.
+                    if (!valloc) {
                         goto fail;
                     }
 
                     // Reserve region in VMA space.
-                    space->vmaspace->reserve(
+                    /*space->vmaspace->reserve(
                         NLib::aligndown(vaddr, NArch::PAGESIZE),
                         NLib::alignup(vaddr + phdrs[i].msize, NArch::PAGESIZE),
                         NMem::Virt::VIRT_USER |
                         (phdrs[i].flags & flag::EF_EXEC ? 0 : NMem::Virt::VIRT_NX) |
                         (phdrs[i].flags & flag::EF_WRITE ? NMem::Virt::VIRT_RW : 0)
+                    );*/
+
+
+                    NMem::VMalloc::mapintospace(
+                        space,
+                        (uintptr_t)valloc,
+                        vaddr,
+                        phdrs[i].msize + misalign,
+                        NMem::Virt::VIRT_USER |
+                        (phdrs[i].flags & flag::EF_EXEC ? 0 : NMem::Virt::VIRT_NX) |
+                        (phdrs[i].flags & flag::EF_WRITE ? NMem::Virt::VIRT_RW : 0)
                     );
 
-                    if(!NArch::VMM::maprange(space, vaddr, (uintptr_t)phys,
+                    /*if(!NArch::VMM::maprange(space, vaddr, (uintptr_t)phys,
                         NArch::VMM::PRESENT | NArch::VMM::USER |
                         (phdrs[i].flags & flag::EF_EXEC ? 0 : NArch::VMM::NOEXEC) |
                         (phdrs[i].flags & flag::EF_WRITE ? NArch::VMM::WRITEABLE : 0),
@@ -337,26 +349,26 @@ namespace NSys {
                         // Failed to map. Free physical memory.
                         NArch::PMM::free(phys, phdrs[i].msize + misalign);
                         goto fail;
-                    }
+                    }*/
 
                     // Read file data if there is any.
                     if (phdrs[i].fsize > 0) {
-                        if (node->read((void *)((uintptr_t)NArch::hhdmoff(phys) + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
+                        if (node->read((void *)((uintptr_t)valloc + misalign), phdrs[i].fsize, phdrs[i].doff, 0) != (ssize_t)phdrs[i].fsize) {
                             // Failed. Unmap and free.
                             NArch::VMM::unmaprange(space, vaddr, phdrs[i].msize);
-                            NArch::PMM::free(phys, phdrs[i].msize + misalign);
+                            NMem::VMalloc::free((void *)valloc, phdrs[i].msize + misalign);
                             goto fail;
                         }
                     }
 
                     if (phdrs[i].msize > phdrs[i].fsize) {
                         // Fill remaining region of allocation with zeroes (BSS).
-                        NLib::memset((void *)((uintptr_t)NArch::hhdmoff(phys) + phdrs[i].fsize + misalign), 0, (phdrs[i].msize - phdrs[i].fsize));
+                        NLib::memset((void *)((uintptr_t)valloc + phdrs[i].fsize + misalign), 0, (phdrs[i].msize - phdrs[i].fsize));
                     }
 
                     // Track this successfully loaded segment.
                     loaded[loadcount].vaddr = vaddr;
-                    loaded[loadcount].phys = (uintptr_t)phys;
+                    loaded[loadcount].valloc = (uintptr_t)valloc;
                     loaded[loadcount].size = phdrs[i].msize;
                     loaded[loadcount].misalign = misalign;
                     loadcount++;
@@ -391,7 +403,7 @@ namespace NSys {
             // Clean up all successfully loaded segments.
             for (size_t j = 0; j < loadcount; j++) {
                 NArch::VMM::unmaprange(space, loaded[j].vaddr, loaded[j].size);
-                NArch::PMM::free((void *)loaded[j].phys, loaded[j].size + loaded[j].misalign);
+                NMem::VMalloc::free((void *)loaded[j].valloc, loaded[j].size + loaded[j].misalign);
             }
             delete[] loaded;
             delete[] phdrs;

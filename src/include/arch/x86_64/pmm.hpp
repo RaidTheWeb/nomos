@@ -86,6 +86,21 @@ namespace NArch {
 
         // Commit new bitmap zone for allocations (used for reclaimable memory).
         void newzone(uintptr_t addr, size_t size);
+
+        // Memory statistics.
+        struct stats {
+            size_t buddytotal; // Total bytes managed by buddy allocator.
+            size_t buddyfree; // Free bytes in buddy allocator.
+            size_t buddyused; // Used bytes in buddy allocator.
+            size_t bitmaptotal; // Total bytes managed by bitmap allocator.
+            size_t bitmapfree; // Free bytes in bitmap allocator.
+            size_t bitmapused; // Used bytes in bitmap allocator.
+            size_t total; // Total managed memory.
+            size_t free; // Total free memory.
+            size_t used; // Total used memory.
+        };
+
+        void getstats(struct stats *out);
     }
 }
 

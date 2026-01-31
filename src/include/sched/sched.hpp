@@ -256,6 +256,7 @@ namespace NSched {
             volatile bool wokenbeforewait = false; // Set by wake() to prevent scheduler from transitioning to WAITING if wake raced ahead.
 
             volatile bool migratedisabled = false; // Outright prevent migration of this thread.
+            volatile bool inshrink = false; // Thread is currently in page cache shrink. Prevents recursive shrink calls.
             volatile size_t locksheld = 0; // Lock tracking to prevent work stealing from tasks holding locks.
 
 #ifdef TSTATE_DEBUG
@@ -297,11 +298,14 @@ namespace NSched {
                 NArch::CPU::writemb();
             }
 
+            // Enable migration of this thread to other CPUs.
             void enablemigrate(void) {
                 NArch::CPU::writemb();
                 __atomic_store_n(&this->migratedisabled, false, memory_order_release);
             }
 
+            // Disable migration of this thread to other CPUs.
+            // Highly advised when performing sections of code that expect all logic to be on one CPU (e.g. registering IRQ handlers in drivers).
             void disablemigrate(void) {
                 __atomic_store_n(&this->migratedisabled, true, memory_order_release);
                 NArch::CPU::writemb();
@@ -320,18 +324,22 @@ namespace NSched {
                 __atomic_store_n(&this->vruntime, newvrt, memory_order_release);
             }
 
+            // Pick which CPU (by ID) this thread should run on.
             void setaffinity(uint32_t target) {
                 this->target = target;
             }
 
+            // Get which CPU (by ID) this thread is targeted to run on.
             uint32_t gettarget(void) {
                 return this->target;
             }
 
+            // Set targeting mode (STRICT or RELAXED).
             void settmode(enum target mode) {
                 this->targetmode = mode;
             }
 
+            // Get targeting mode (STRICT or RELAXED).
             enum target gettargetmode(void) {
                 return this->targetmode;
             }

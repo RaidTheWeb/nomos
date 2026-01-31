@@ -53,17 +53,29 @@ namespace NMem {
 
             SubAllocator *sub = &this->slabs[idx];
 
+        retry:
             sub->lock.acquire();  // Lock this slab.
 
             if (sub->freelist == NULL) { // No free blocks in this slab! Allocate some more.
                 // XXX: When slabs grow, they're never shrunk, so memory usage can grow without bound (memory reclamation?).
 
+                sub->lock.release();
+
                 void *ptr = NArch::PMM::alloc(NArch::PAGESIZE); // Allocate a single page (this works because all slabs are smaller than a page).
                 if (ptr == NULL) {
-                    sub->lock.release();
                     return NULL;
                 }
                 ptr = NArch::hhdmoff(ptr);
+
+                // Re-acquire lock and check if someone else already grew the freelist.
+                sub->lock.acquire();
+
+                if (sub->freelist != NULL) {
+                    // Another thread already grew the freelist while we released the lock.
+                    sub->lock.release();
+                    NArch::PMM::free(NArch::hhdmsub(ptr), NArch::PAGESIZE);
+                    goto retry;
+                }
 
                 // Try to prepare as many slab blocks in this page as we can.
                 uintptr_t current = (uintptr_t)ptr;

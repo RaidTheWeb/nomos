@@ -2,6 +2,7 @@
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/e9.hpp>
+#include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/stacktrace.hpp>
 #include <arch/x86_64/tsc.hpp>

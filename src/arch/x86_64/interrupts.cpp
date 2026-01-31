@@ -128,7 +128,17 @@ namespace NArch {
                     : "=r"(addr) : : "memory"
                 );
 
+                if (!NArch::CPU::get()->currthread || !NArch::CPU::get()->currthread->process) {
+                    NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p with no current process.\n", exceptions[isr->id & 0xffffffff], addr);
+                    panic(errbuffer);
+                }
+
                 struct VMM::addrspace *space = NArch::CPU::get()->currthread->process->addrspace;
+                if (!space) {
+                    NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p with no address space.\n", exceptions[isr->id & 0xffffffff], addr);
+                    panic(errbuffer);
+                }
+
                 space->lock.acquire();
                 uint64_t *pte = VMM::_resolvepte(space, addr);
 
@@ -160,7 +170,7 @@ namespace NArch {
 
                         off_t fileoff = vmafileoffset + pageoffsetinvma;
 
-                        NMem::CachePage *cachepage = backingfile->getorcacheepage(fileoff);
+                        NMem::CachePage *cachepage = backingfile->getorcachepage(fileoff);
                         if (!cachepage) {
                             backingfile->unref();
                             if (isuserspace) {
@@ -175,6 +185,7 @@ namespace NArch {
                             int err = backingfile->readpage(cachepage);
                             if (err < 0) {
                                 cachepage->pageunlock();
+                                cachepage->unref();
                                 backingfile->unref();
                                 if (isuserspace) {
                                     NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
@@ -200,6 +211,7 @@ namespace NArch {
                             // VMA was changed while we were sleeping, discard mapping.
                             space->lock.release();
                             cachepage->pageunlock();
+                            cachepage->unref();
                             backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
@@ -227,6 +239,7 @@ namespace NArch {
                         space->lock.release();
 
                         cachepage->pageunlock();
+                        cachepage->unref();
                         backingfile->unref();
 
                         // Trigger readahead for sequential access patterns.
@@ -289,7 +302,7 @@ namespace NArch {
 
                 space->lock.release();
 pffault:
-                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", NArch::CPU::get()->currthread->process->id);
+                NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", NArch::CPU::get()->currthread ? NArch::CPU::get()->currthread->process->id : 0);
                 sig = SIGSEGV;
             } else if ((isr->id & 0xffffffff) == 13) { // #GP
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nGeneral Protection Fault occurred at %p.\n", exceptions[isr->id & 0xffffffff], ctx->rip);

@@ -23,6 +23,7 @@
 #include <lib/assert.hpp>
 #include <lib/bitmap.hpp>
 #include <lib/cmdline.hpp>
+#include <lib/lz4.hpp>
 #include <mm/pagecache.hpp>
 #include <mm/slab.hpp>
 #include <mm/vmalloc.hpp>
@@ -80,8 +81,8 @@ void kpostarch(void) {
 
     const char *initramfs = NArch::cmdline.get("initramfs");
     if (initramfs) { // Exists, load it.
-        struct NArch::Module::modinfo mod = NArch::Module::loadmodule(initramfs); // Try to load.
-        assertarg(ISMODULE(mod), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
+        NArch::Module::Module *mod = NArch::Module::loadmodule(initramfs); // Try to load.
+        assertarg(mod->valid(), "Failed to load `initramfs` specified: `%s`.\n", initramfs);
 
         if (NArch::cmdline.get("root") && !NLib::strcmp(NArch::cmdline.get("root"), "initramfs")) { // If the boot command line specifies that the initramfs should be used as the filesystem root, we should load it.
             NFS::POSIXTAR::POSIXTARFileSystem *fs = new NFS::POSIXTAR::POSIXTARFileSystem(NFS::VFS::vfs, mod); // Use heap for allocation, keeps it alive past this scope.
@@ -206,6 +207,7 @@ void kpostarch(void) {
     // THREAD
     NSched::Thread *uthread = new NSched::Thread(proc, NSched::DEFAULTSTACKSIZE);
 
+    NUtil::dropwrite(); // We're past the useful information. Use only debugging outputs from here.
 
 #ifdef __x86_64__
     uthread->ctx.rip = (uint64_t)result.entry;

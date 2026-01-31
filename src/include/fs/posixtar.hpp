@@ -45,9 +45,9 @@ namespace NFS {
 
         class POSIXTARFileSystem : public RAMFS::RAMFileSystem {
             private:
-                struct NArch::Module::modinfo modinfo;
+                NArch::Module::Module *modinfo;
             public:
-                POSIXTARFileSystem(VFS::VFS *vfs, struct NArch::Module::modinfo mod) : RAMFS::RAMFileSystem(vfs) {
+                POSIXTARFileSystem(VFS::VFS *vfs, NArch::Module::Module *mod) : RAMFS::RAMFileSystem(vfs) {
                     this->modinfo = mod;
                 }
 

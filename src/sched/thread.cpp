@@ -131,15 +131,17 @@ namespace NSched {
             size_t cid = __atomic_load_n(&thread->cid, memory_order_acquire);
             if (cid < SMP::awakecpus) {
                 struct CPU::cpulocal *cpu = SMP::cpulist[cid];
-                cpu->runqueue.lock.acquire();
-
-                // Re-check under lock.
-                if (__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
-                    cpu->runqueue._erase(&thread->node);
-                    __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+                // Use trylock for cross-CPU access to avoid spinning with interrupts disabled.
+                // If we can't get the lock, the thread will be cleaned up when that CPU schedules.
+                bool acquired = (cpu == CPU::get()) ? (cpu->runqueue.lock.acquire(), true) : cpu->runqueue.lock.trylock();
+                if (acquired) {
+                    // Re-check under lock.
+                    if (__atomic_load_n(&thread->inrunqueue, memory_order_acquire)) {
+                        cpu->runqueue._erase(&thread->node);
+                        __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
+                    }
+                    cpu->runqueue.lock.release();
                 }
-
-                cpu->runqueue.lock.release();
             }
         }
 
@@ -153,5 +155,45 @@ namespace NSched {
         if (cid < SMP::awakecpus && cid != CPU::get()->id) {
             APIC::sendipi(SMP::cpulist[cid]->lapicid, 0xfe, APIC::IPIFIXED, APIC::IPIPHYS, 0);
         }
+    }
+
+    extern "C" uint64_t sys_yield(void) {
+        SYSCALL_LOG("sys_yield().\n");
+        yield();
+        SYSCALL_RET(0);
+    }
+
+    extern "C" ssize_t sys_newthread(void *entry, void *stack) {
+        SYSCALL_LOG("sys_newthread(%p, %p).\n", entry, stack);
+
+        Process *proc = NArch::CPU::get()->currthread->process;
+
+        Thread *newthread = new Thread(proc, NSched::DEFAULTSTACKSIZE);
+        if (!newthread) {
+            SYSCALL_RET(-ENOMEM);
+        }
+
+        newthread->ctx.rip = (uint64_t)entry;
+        newthread->ctx.rsp = (uint64_t)stack;
+
+        NSched::schedulethread(newthread);
+        SYSCALL_RET(newthread->id);
+    }
+
+    extern "C" ssize_t sys_exitthread(void) {
+        SYSCALL_LOG("sys_exitthread().\n");
+
+        // Mark ourselves as dead and yield.
+        NSched::setthreadstate(NArch::CPU::get()->currthread, Thread::state::DEAD, "sys_exitthread");
+        yield();
+
+        __builtin_unreachable();
+    }
+
+    extern "C" uint64_t sys_exit(int status) {
+        SYSCALL_LOG("sys_exit(%d).\n", status);
+
+        exit(status); // Exit.
+        __builtin_unreachable();
     }
 }

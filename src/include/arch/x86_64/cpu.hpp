@@ -143,7 +143,7 @@ namespace NArch {
             NSched::WorkerPool *workpool = NULL; // Per-CPU worker pool.
             NSched::WorkerPool *prioworkpool = NULL; // Per-CPU high-priority worker pool.
 
-            bool preemptdisabled = true; // Is preemption disabled on this CPU?
+            volatile bool preemptdisabled = true; // Is preemption disabled on this CPU?
             volatile bool inschedule = false; // Is this CPU currently in the scheduler? Prevents nested scheduler invocations.
 
             bool setint(bool status) {

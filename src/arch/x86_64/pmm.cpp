@@ -1,4 +1,5 @@
 #include <arch/limine/requests.hpp>
+#include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
@@ -197,10 +198,10 @@ namespace NArch {
             // If we allocate, and then immediately free, the next allocation of the same size should be the same pointer (free list logic).
             void *test1 = alloc(4096);
             assert(test1 != NULL, "Failed to allocate small buddy allocation.\n");
-            free(test1);
+            free(test1, 4096);
             void *test2 = alloc(4096);
             assert(test2 != NULL, "Failed to allocate small buddy allocation.\n");
-            free(test2);
+            free(test2, 4096);
             assertarg(test1 == test2, "Buddy allocator does not return last freed (%p != %p).\n", test1, test2);
 
             NUtil::printf("[arch/x86_64/pmm]: Buddy allocator self-test passed.\n");
@@ -281,15 +282,7 @@ namespace NArch {
             }
 
             if (found == ALLOCLEVEL) { // If we have actually reached the maximum allocation level, then we couldn't find anything.
-                // Try to reclaim pages from the page cache before giving up.
-                size_t reclaimed = NMem::reclaimcachepages(16);
-                if (reclaimed > 0) {
-                    // Retry allocation after reclaim.
-                    return buddyalloc(size, flags);
-                }
-                panic("PMM Buddy allocator OOM.\n");
-
-                return NULL; // OOM.
+                return NULL;
             }
 
             while (found > level) { // While we haven't yet split down to the comfiest level.
@@ -382,43 +375,140 @@ namespace NArch {
                     page++;
                 }
             }
-            // Try to reclaim pages from the page cache before giving up.
-            {
-                size_t reclaimed = NMem::reclaimcachepages(needed > 16 ? needed : 16);
-                if (reclaimed > 0) {
-                    // Retry allocation after reclaim.
-                    return bmapalloc(size, flags);
-                }
-            }
-            panic("PMM Bitmap allocator OOM.\n");
 done:
             return res;
         }
 
         void *alloc(size_t size, uint8_t flags) {
-            NLib::ScopeIRQSpinlock guard(&alloclock);
+            void *result = NULL;
+            bool usebuddy = size <= (SMALLESTBLOCK << (ALLOCLEVEL - 1));
 
-            if (size <= (SMALLESTBLOCK << (ALLOCLEVEL - 1))) { // Allocation could theoretically be made with the buddy allocator.
-                return buddyalloc(size, flags);
+            // First attempt with lock held.
+            {
+                NLib::ScopeIRQSpinlock guard(&alloclock);
+                if (usebuddy) {
+                    result = buddyalloc(size, flags);
+                } else {
+                    result = bmapalloc(size, flags);
+                }
             }
-            return bmapalloc(size, flags);
+
+            if (result != NULL) {
+                return result;
+            }
+
+            // If FLAGS_NOWAIT is set, don't attempt reclaim (caller can't wait).
+            if (flags & FLAGS_NOWAIT) {
+                return NULL;
+            }
+
+            if (NArch::CPU::get()->irqstackdepth > 0) {
+                struct stats memstats;
+                getstats(&memstats);
+                NUtil::printf("[arch/x86_64/pmm]: OOM in IRQ context! Dumping PMM stats:\n");
+                NUtil::printf("  Total: %lu MiB\n", memstats.total / 1024 / 1024);
+                NUtil::printf("  Free: %lu MiB\n", memstats.free / 1024 / 1024);
+                NUtil::printf("  Used: %lu MiB\n", memstats.used / 1024 / 1024);
+                NUtil::printf("  Buddy Total: %lu MiB\n", memstats.buddytotal / 1024 / 1024);
+                NUtil::printf("  Buddy Free: %lu MiB\n", memstats.buddyfree / 1024 / 1024);
+                NUtil::printf("  Buddy Used: %lu MiB\n", memstats.buddyused / 1024 / 1024);
+                NUtil::printf("  Bitmap Total: %lu MiB\n", memstats.bitmaptotal / 1024 / 1024);
+                NUtil::printf("  Bitmap Free: %lu MiB\n", memstats.bitmapfree / 1024 / 1024);
+                NUtil::printf("  Bitmap Used: %lu MiB\n", memstats.bitmapused / 1024 / 1024);
+
+                panic("PMM allocation with reclaim called from within IRQSpinlock context.\n");
+            }
+
+            // Retry loop with escalating reclaim attempts.
+            // This gives the page cache writeback thread time to make pages clean.
+            size_t needed = usebuddy ? 16 : NLib::alignup(size, PAGESIZE) / PAGESIZE;
+            static constexpr int MAXRETRIES = 4;
+
+            for (int attempt = 0; attempt < MAXRETRIES; attempt++) {
+                // Escalating reclaim: request more pages each attempt.
+                size_t toreclaim = (needed > 16 ? needed : 16) * (1 << attempt);
+                size_t reclaimed = NMem::reclaimcachepages(toreclaim);
+
+                // Retry allocation.
+                {
+                    NLib::ScopeIRQSpinlock guard(&alloclock);
+                    if (usebuddy) {
+                        result = buddyalloc(size, flags);
+                    } else {
+                        result = bmapalloc(size, flags);
+                    }
+                }
+
+                if (result != NULL) {
+                    return result;
+                }
+
+                // If shrink didn't free anything, pages are probably dirty.
+                // Wake the writeback thread and give it time to flush.
+                if (reclaimed == 0 && NMem::pagecache) {
+                    NMem::pagecache->wakewriteback();
+                    // This is a blocking wait, but we're OOM so we have to wait.
+                    for (volatile int i = 0; i < 1000000 * (attempt + 1); i++) {
+                        asm volatile("pause");
+                    }
+                }
+            }
+
+            struct stats memstats;
+            getstats(&memstats);
+            NUtil::printf("[arch/x86_64/pmm]: OOM when allocating %lu bytes. Dumping PMM stats:\n", size);
+            NUtil::printf("  Total: %lu MiB\n", memstats.total / 1024 / 1024);
+            NUtil::printf("  Free: %lu MiB\n", memstats.free / 1024 / 1024);
+            NUtil::printf("  Used: %lu MiB\n", memstats.used / 1024 / 1024);
+            NUtil::printf("  Buddy Total: %lu MiB\n", memstats.buddytotal / 1024 / 1024);
+            NUtil::printf("  Buddy Free: %lu MiB\n", memstats.buddyfree / 1024 / 1024);
+            NUtil::printf("  Buddy Used: %lu MiB\n", memstats.buddyused / 1024 / 1024);
+            NUtil::printf("  Bitmap Total: %lu MiB\n", memstats.bitmaptotal / 1024 / 1024);
+            NUtil::printf("  Bitmap Free: %lu MiB\n", memstats.bitmapfree / 1024 / 1024);
+            NUtil::printf("  Bitmap Used: %lu MiB\n", memstats.bitmapused / 1024 / 1024);
+
+            // Still OOM after all retries.
+            panic("PMM allocator OOM after retries.\n");
+            return NULL;
         }
 
-        void buddyfree(void *ptr, bool track) {
+        void buddyfree(void *ptr, size_t allocsize, bool track) {
             uintptr_t addr = (uintptr_t)ptr + NLimine::hhdmreq.response->offset;
             assertarg(((struct block *)addr)->canary != CANARY, "Double free occurred on address %p.\n", ptr);
 
             // Check if the pointer actually exists in the allocator zone, if it's not, it's an invalid pointer.
             assert(addr >= zone.addr && addr < zone.addr + zone.size, "Free on invalid pointer.\n");
 
+            // Calculate the starting level from the allocation size (same logic as buddyalloc).
+            size_t actual = SMALLESTBLOCK;
             size_t level = 0;
-            size_t size = SMALLESTBLOCK;
+            while (actual < allocsize && level < ALLOCLEVEL - 1) {
+                actual <<= 1;
+                level++;
+            }
+
+            // Store original allocation size for page unreferencing.
+            size_t pagestounref = actual / PAGESIZE;
+            // Store original address for page unreferencing.
+            uintptr_t origaddr = addr;
+
+            // Current block size at this level.
+            size_t size = actual;
 
             // Iterate over levels to find a "buddy" to merge with.
             // This buddy can be a higher level, or not, but the idea is to keep it contiguous.
             // Greedily merge all the contiguous pages together (helps get rid of fragmentation).
             while (level < ALLOCLEVEL - 1) {
-                uintptr_t buddyaddr = addr ^ size; // Attempt to get a paired block.
+                // Calculate buddy address relative to zone base to ensure it stays within bounds.
+                uintptr_t offset = addr - zone.addr;
+                uintptr_t buddyoffset = offset ^ size;
+                uintptr_t buddyaddr = zone.addr + buddyoffset;
+
+                // Verify buddy is within zone bounds.
+                if (buddyaddr < zone.addr || buddyaddr >= zone.addr + zone.size) {
+                    break;
+                }
+
                 struct block *buddy = (struct block *)buddyaddr;
 
                 if (buddy->canary != CANARY) {
@@ -451,9 +541,9 @@ done:
             zone.freelist[level] = block;
 
             if (track) {
-                // Unref pages in allocation.
-                for (size_t i = 0; i < size / PAGESIZE; i++) {
-                    PageMeta *meta = &zone.meta[((uintptr_t)hhdmsub((void *)addr) + (i * PAGESIZE) - (uintptr_t)hhdmsub((void *)zone.addr)) / PAGESIZE];
+                // Unref pages in allocation using the ORIGINAL allocation size, not merged size.
+                for (size_t i = 0; i < pagestounref; i++) {
+                    PageMeta *meta = &zone.meta[((uintptr_t)hhdmsub((void *)origaddr) + (i * PAGESIZE) - (uintptr_t)hhdmsub((void *)zone.addr)) / PAGESIZE];
                     meta->zeroref();
                 }
             }
@@ -490,14 +580,161 @@ done:
             NLib::ScopeIRQSpinlock guard(&alloclock);
 
             if ((uintptr_t)ptr >= (uintptr_t)hhdmsub((void *)zone.addr) && (uintptr_t)ptr < (uintptr_t)hhdmsub((void *)zone.addr) + zone.size) { // If our pointer exists within the buddy allocator region, we can assume it'll be freed by it.
-                buddyfree(ptr, track);
+                size_t actualsize = (size == 0) ? SMALLESTBLOCK : size;
+                buddyfree(ptr, actualsize, track);
             } else {
                 assert(size > 0, "Attempting to free bitmap allocation without size.\n");
                 bitmapfree(ptr, size, track);
             }
         }
 
+        // Try to merge a new region with an existing bitmap zone.
+        static bool trymergebzone(uintptr_t addr, size_t size) {
+            // Check if new region is contiguous with an existing zone (either after or before).
+
+            for (size_t i = 0; i < numbitmapzones; i++) {
+                uintptr_t zoneend = bitmapzones[i].addr + bitmapzones[i].size;
+                uintptr_t bitmapstart = (uintptr_t)bitmapzones[i].bitmap;
+
+                if (addr == zoneend) { // We begin right after the zone.
+                    size_t newpages = size / PAGESIZE;
+                    size_t oldpages = bitmapzones[i].size / PAGESIZE;
+                    size_t totalpages = oldpages + newpages;
+
+                    // Calculate new bitmap size requirements.
+                    size_t newbmapsize = (totalpages + 7) / 8;
+                    size_t oldbmapsize = (oldpages + 7) / 8;
+
+                    // Check if the existing bitmap allocation can accommodate the extension.
+                    // The bitmap was allocated rounded up to page size.
+                    size_t oldbmapalloc = NLib::alignup(oldbmapsize, PAGESIZE);
+                    size_t newbmapalloc = NLib::alignup(newbmapsize, PAGESIZE);
+
+                    if (newbmapalloc <= oldbmapalloc) {
+                        // Bitmap fits! We can extend the zone.
+
+                        // Allocate additional page metadata.
+                        size_t metasize = newpages * sizeof(PageMeta);
+                        PageMeta *newmeta = (PageMeta *)PMM::alloc(metasize, FLAGS_NOTRACK);
+                        if (!newmeta) {
+                            return false;
+                        }
+                        newmeta = (PageMeta *)hhdmoff(newmeta);
+                        NLib::fastzero(newmeta, metasize);
+
+                        // Allocate a combined metadata array.
+                        size_t totalmetasize = totalpages * sizeof(PageMeta);
+                        PageMeta *combinedmeta = (PageMeta *)PMM::alloc(totalmetasize, FLAGS_NOTRACK);
+                        if (!combinedmeta) {
+                            PMM::free(hhdmsub(newmeta), metasize, false);
+                            return false;
+                        }
+                        combinedmeta = (PageMeta *)hhdmoff(combinedmeta);
+
+                        // Copy old metadata and initialise new entries.
+                        NLib::memcpy(combinedmeta, bitmapzones[i].meta, oldpages * sizeof(PageMeta));
+
+                        uintptr_t baseaddr = (uintptr_t)hhdmsub((void *)addr);
+                        for (size_t j = 0; j < newpages; j++) {
+                            combinedmeta[oldpages + j].addr = baseaddr + (j * PAGESIZE);
+                            combinedmeta[oldpages + j].refcount = 0;
+                            combinedmeta[oldpages + j].flags = 0;
+                            combinedmeta[oldpages + j].cacheentry = NULL;
+                        }
+
+                        // Free old metadata and temporary allocation.
+                        PMM::free(hhdmsub(bitmapzones[i].meta), oldpages * sizeof(PageMeta), false);
+                        PMM::free(hhdmsub(newmeta), metasize, false);
+
+                        // Extend bitmap to cover new pages (mark as free).
+                        for (size_t j = oldpages; j < totalpages; j++) {
+                            bitmapzones[i].bitmap[j / 8] &= ~(1 << (j % 8));
+                        }
+
+                        // Update zone.
+                        bitmapzones[i].size += size;
+                        bitmapzones[i].meta = combinedmeta;
+
+                        return true;
+                    }
+                }
+
+                if (addr + size == bitmapstart) { // We end right before the zone. This one is more complex, because we need to shift over the original bitmap and metadata.
+                    size_t newpages = size / PAGESIZE;
+                    size_t oldpages = bitmapzones[i].size / PAGESIZE;
+                    size_t totalpages = oldpages + newpages;
+
+                    // For prepending, we need to relocate the bitmap to the new region start.
+                    size_t newbmapsize = (totalpages + 7) / 8;
+                    size_t newbmappages = NLib::alignup(newbmapsize, PAGESIZE) / PAGESIZE;
+
+                    // Check if we have enough space in the new region for the bitmap.
+                    if (newbmappages * PAGESIZE >= size) {
+                        return false; // Not enough space for bitmap in new region.
+                    }
+
+                    // Calculate available pages after bitmap in new region.
+                    size_t availnewpages = (size - newbmappages * PAGESIZE) / PAGESIZE;
+                    size_t finaltotalpages = oldpages + availnewpages;
+
+                    // Allocate combined metadata.
+                    size_t totalmetasize = finaltotalpages * sizeof(PageMeta);
+                    PageMeta *combinedmeta = (PageMeta *)PMM::alloc(totalmetasize, FLAGS_NOTRACK);
+                    if (!combinedmeta) {
+                        return false;
+                    }
+                    combinedmeta = (PageMeta *)hhdmoff(combinedmeta);
+
+                    // Initialise new entries first (they come before old entries now).
+                    uintptr_t newbaseaddr = (uintptr_t)hhdmsub((void *)(addr + newbmappages * PAGESIZE));
+                    for (size_t j = 0; j < availnewpages; j++) {
+                        combinedmeta[j].addr = newbaseaddr + (j * PAGESIZE);
+                        combinedmeta[j].refcount = 0;
+                        combinedmeta[j].flags = 0;
+                        combinedmeta[j].cacheentry = NULL;
+                    }
+
+                    // Copy old metadata after new entries.
+                    NLib::memcpy(&combinedmeta[availnewpages], bitmapzones[i].meta, oldpages * sizeof(PageMeta));
+
+                    // Create new bitmap at new location.
+                    uint8_t *newbitmap = (uint8_t *)addr;
+                    NLib::memset(newbitmap, 0, newbmappages * PAGESIZE);
+
+                    // Mark bitmap pages as allocated.
+                    for (size_t j = 0; j < newbmappages; j++) {
+                        newbitmap[j / 8] |= (1 << (j % 8));
+                    }
+
+                    // Copy old allocation state over, shifted by availnewpages.
+                    for (size_t j = 0; j < oldpages; j++) {
+                        if (bitmapzones[i].bitmap[j / 8] & (1 << (j % 8))) {
+                            newbitmap[(availnewpages + j) / 8] |= (1 << ((availnewpages + j) % 8));
+                        }
+                    }
+
+                    // Free old metadata.
+                    PMM::free(hhdmsub(bitmapzones[i].meta), oldpages * sizeof(PageMeta), false);
+
+                    // Update zone.
+                    bitmapzones[i].bitmap = newbitmap;
+                    bitmapzones[i].addr = addr + newbmappages * PAGESIZE;
+                    bitmapzones[i].size = finaltotalpages * PAGESIZE;
+                    bitmapzones[i].meta = combinedmeta;
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         void newzone(uintptr_t addr, size_t size) {
+            // First, attempt to merge with an existing zone.
+            if (trymergebzone(addr, size)) {
+                return;
+            }
+
             assert(numbitmapzones < 16, "Exceeded maximum number of bitmap zones.\n");
 
             size_t pages = size / PAGESIZE;
@@ -536,6 +773,45 @@ done:
             }
 
             numbitmapzones++;
+        }
+
+        void getstats(struct stats *out) {
+            NLib::ScopeIRQSpinlock guard(&alloclock);
+
+            out->buddytotal = zone.size;
+            out->buddyfree = 0;
+            out->bitmaptotal = 0;
+            out->bitmapfree = 0;
+
+            // Count free bytes in buddy allocator by walking freelists.
+            for (size_t level = 0; level < ALLOCLEVEL; level++) {
+                size_t blocksize = SMALLESTBLOCK << level;
+                struct block *b = zone.freelist[level];
+                while (b) {
+                    out->buddyfree += blocksize;
+                    b = b->next;
+                }
+            }
+            out->buddyused = out->buddytotal - out->buddyfree;
+
+            // Count free bytes in bitmap allocator zones.
+            for (size_t i = 0; i < numbitmapzones; i++) {
+                size_t zonepages = bitmapzones[i].size / PAGESIZE;
+                out->bitmaptotal += bitmapzones[i].size;
+
+                size_t freepages = 0;
+                for (size_t p = 0; p < zonepages; p++) {
+                    if (!(bitmapzones[i].bitmap[p / 8] & (1 << (p % 8)))) {
+                        freepages++;
+                    }
+                }
+                out->bitmapfree += freepages * PAGESIZE;
+            }
+            out->bitmapused = out->bitmaptotal - out->bitmapfree;
+
+            out->total = out->buddytotal + out->bitmaptotal;
+            out->free = out->buddyfree + out->bitmapfree;
+            out->used = out->buddyused + out->bitmapused;
         }
     }
 }

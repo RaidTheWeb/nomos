@@ -37,7 +37,7 @@ namespace NFS {
             return cache->lookupandlock(index);
         }
 
-        NMem::CachePage *INode::getorcacheepage(off_t offset) {
+        NMem::CachePage *INode::getorcachepage(off_t offset) {
             NMem::RadixTree *cache = this->getpagecache();
             if (!cache) {
                 return NULL;
@@ -114,6 +114,10 @@ namespace NFS {
                 NMem::pagecache->addpage(page);
             }
 
+            // Take a ref for the caller, matching the contract of lookupandlock.
+            // The cache holds one ref (from addpage), caller gets another.
+            page->ref();
+
             page->pagelock();
             return page;
         }
@@ -132,7 +136,7 @@ namespace NFS {
             size_t count;
 
             // Collect all pages (no filter needed).
-            while ((count = cache->foreachcollect(batch, BATCHSIZE, nullptr, nullptr, &resumeindex)) > 0) {
+            while ((count = cache->foreachcollect(batch, BATCHSIZE, NULL, NULL, &resumeindex)) > 0) {
                 // Process pages outside of treelock.
                 for (size_t i = 0; i < count; i++) {
                     NMem::CachePage *page = batch[i];
@@ -151,7 +155,7 @@ namespace NFS {
                     if (page->pagemeta) {
                         page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
                         page->pagemeta->cacheentry = NULL;
-                        page->pagemeta->unref();  // Release initial cache ref.
+                        page->pagemeta->unref();  // Release cache's pagemeta ref.
                     }
 
                     // Release reference to inode.
@@ -161,9 +165,11 @@ namespace NFS {
 
                     page->pageunlock();
                     if (page->pagemeta) {
-                        page->pagemeta->unref();  // Release ref from foreachcollect.
+                        page->pagemeta->unref();  // Release foreachcollect's pagemeta ref.
                     }
-                    delete page;
+                    // Release refs: foreachcollect ref + cache ref (from addpage).
+                    page->unref();  // foreachcollect ref.
+                    page->unref();  // cache ref, this triggers delete.
                 }
 
                 if (resumeindex < 0) {
@@ -199,12 +205,13 @@ namespace NFS {
             size_t count;
 
             // Iterate in batches, releasing treelock between batches.
-            while ((count = cache->foreachcollect(collected, MAX_BATCH, dirtyfilter, nullptr, &resumeindex)) > 0) {
+            while ((count = cache->foreachcollect(collected, MAX_BATCH, dirtyfilter, NULL, &resumeindex)) > 0) {
                 for (size_t i = 0; i < count; i++) {
                     NMem::CachePage *page = collected[i];
 
                     // Try to lock the page. If we can't, skip it.
                     if (!page->trypagelock()) {
+                        page->unref();
                         if (page->pagemeta) {
                             page->pagemeta->unref();
                         }
@@ -214,6 +221,7 @@ namespace NFS {
                     // Re-check dirty flag after acquiring page lock.
                     if (!page->testflag(NMem::PAGE_DIRTY)) {
                         page->pageunlock();
+                        page->unref();
                         if (page->pagemeta) {
                             page->pagemeta->unref();
                         }
@@ -234,6 +242,7 @@ namespace NFS {
                         // Unlock and unref flushed pages.
                         for (size_t j = 0; j < batchcount; j++) {
                             batch[j]->pageunlock();
+                            batch[j]->unref();
                             if (batch[j]->pagemeta) {
                                 batch[j]->pagemeta->unref();
                             }
@@ -257,6 +266,7 @@ namespace NFS {
                         }
                         for (size_t j = 0; j < batchcount; j++) {
                             batch[j]->pageunlock();
+                            batch[j]->unref();
                             if (batch[j]->pagemeta) {
                                 batch[j]->pagemeta->unref();
                             }
@@ -279,6 +289,7 @@ namespace NFS {
                 }
                 for (size_t i = 0; i < batchcount; i++) {
                     batch[i]->pageunlock();
+                    batch[i]->unref();
                     if (batch[i]->pagemeta) {
                         batch[i]->pagemeta->unref();
                     }
@@ -310,8 +321,9 @@ namespace NFS {
                 page->errorcount++;
             }
 
-            // Release page lock (was held since getorcacheepage).
+            // Release page lock (was held since getorcachepage).
             page->pageunlock();
+            page->unref();
 
             // Free the bioreq.
             delete req;
@@ -356,7 +368,7 @@ namespace NFS {
                 }
 
                 // Allocate and insert new page.
-                NMem::CachePage *page = inode->getorcacheepage(pageoff);
+                NMem::CachePage *page = inode->getorcachepage(pageoff);
                 if (!page) {
                     continue; // Allocation failed.
                 }
@@ -364,6 +376,7 @@ namespace NFS {
                 // If already up-to-date (race), skip.
                 if (page->testflag(NMem::PAGE_UPTODATE)) {
                     page->pageunlock();
+                    page->unref();
                     continue;
                 }
 
@@ -372,6 +385,7 @@ namespace NFS {
                 uint64_t lba = inode->getpagelbacached(pageoff, &needsio);
                 if (needsio) {
                     page->pageunlock();
+                    page->unref();
                     continue;
                 }
 
@@ -380,6 +394,7 @@ namespace NFS {
                     NLib::memset(page->data(), 0, NArch::PAGESIZE);
                     page->setflag(NMem::PAGE_UPTODATE);
                     page->pageunlock();
+                    page->unref();
                     continue;
                 }
 
@@ -392,6 +407,7 @@ namespace NFS {
                 if (res < 0) {
                     page->setflag(NMem::PAGE_ERROR);
                     page->pageunlock();
+                    page->unref();
                     delete req;
                 }
             }
@@ -510,8 +526,8 @@ namespace NFS {
                 // Trigger readahead if applicable.
                 this->readahead(offset);
 
-                // Get or create page.
-                NMem::CachePage *page = this->getorcacheepage(offset);
+                // Get or create page (returns locked).
+                NMem::CachePage *page = this->getorcachepage(offset);
                 if (!page) {
                     if (totalread > 0) {
                         return totalread;
@@ -519,26 +535,56 @@ namespace NFS {
                     return -ENOMEM;
                 }
 
-                // If page not up to date, we may need to wait for readahead or do sync read.
+                // Handle page fill with lock-free I/O pattern.
                 if (!page->testflag(NMem::PAGE_UPTODATE)) {
-                    // Check if page has an error from a previous readahead attempt.
+                    // Check if another thread is already doing I/O.
+                    if (page->testflag(NMem::PAGE_IOINFLIGHT)) {
+                        // Release lock and wait for the other thread's I/O to complete.
+                        page->pageunlock();
+                        page->waitio();
+                        page->pagelock();
+
+                        // After re-acquiring lock, check if I/O succeeded.
+                        if (page->testflag(NMem::PAGE_ERROR)) {
+                            page->clearflag(NMem::PAGE_ERROR);
+                            // Fall through to retry I/O ourselves.
+                        } else if (page->testflag(NMem::PAGE_UPTODATE)) {
+                            // I/O completed successfully, continue to copy.
+                            goto copydata;
+                        }
+                        // Otherwise, IOINFLIGHT was cleared but page not UPTODATE, retry.
+                    }
+
+                    // Clear any previous error before retrying.
                     if (page->testflag(NMem::PAGE_ERROR)) {
-                        // Clear error and retry with sync read.
                         page->clearflag(NMem::PAGE_ERROR);
                     }
 
+                    // We need to do I/O. Set IOINFLIGHT and release lock.
+                    page->setflag(NMem::PAGE_IOINFLIGHT);
+                    page->pageunlock();
 
-                    // Do synchronous read to fill the page.
+                    // Do I/O without holding page lock.
                     int err = this->readpage(page);
+
+                    // Re-acquire lock to update flags.
+                    page->pagelock();
+                    page->signalio();  // Clears IOINFLIGHT and wakes waiters.
+
                     if (err < 0) {
+                        page->setflag(NMem::PAGE_ERROR);
                         page->pageunlock();
+                        page->unref();
                         if (totalread > 0) {
                             return totalread;
                         }
                         return err;
                     }
+
+                    page->setflag(NMem::PAGE_UPTODATE);
                 }
 
+copydata:
                 // Copy data to user buffer.
                 if (NMem::UserCopy::iskernel(dest, toread)) { // XXX: This way of doing things is scary, because we now have to protect every user-facing read with a validation before letting it ever touch readcached().
                     NLib::memcpy(dest, (uint8_t *)page->data() + offwithinpage, toread);
@@ -546,6 +592,7 @@ namespace NFS {
                     int ret = NMem::UserCopy::copyto(dest, (uint8_t *)page->data() + offwithinpage, toread);
                     if (ret < 0) {
                         page->pageunlock();
+                        page->unref();
                         if (totalread > 0) {
                             return totalread;
                         }
@@ -555,6 +602,7 @@ namespace NFS {
 
                 page->setflag(NMem::PAGE_REFERENCED);
                 page->pageunlock();
+                page->unref();
 
                 dest += toread;
                 offset += toread;
@@ -573,6 +621,10 @@ namespace NFS {
             ssize_t totalwritten = 0;
             const uint8_t *src = (const uint8_t *)buf;
 
+            // Batched throttle checking, check every N pages instead of every page.
+            static constexpr size_t THROTTLECHECKINTERVAL = 16;
+            size_t pagessincethrottlecheck = 0;
+
             while (count > 0) {
                 off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
                 size_t offwithinpage = offset % NArch::PAGESIZE;
@@ -581,8 +633,8 @@ namespace NFS {
                     towrite = count;
                 }
 
-                // Get or create page.
-                NMem::CachePage *page = this->getorcacheepage(offset);
+                // Get or create page (returns locked).
+                NMem::CachePage *page = this->getorcachepage(offset);
                 if (!page) {
                     if (totalwritten > 0) {
                         return totalwritten;
@@ -590,21 +642,55 @@ namespace NFS {
                     return -ENOMEM;
                 }
 
-                // If partial page write and page not up to date, fill it first.
-                if (!page->testflag(NMem::PAGE_UPTODATE) && (offwithinpage != 0 || towrite < NArch::PAGESIZE)) {
-                    int err = this->readpage(page);
-                    if (err < 0 && err != -ENOENT) {
+                // For partial page writes, we need to read the existing content first.
+                bool needsread = (offwithinpage != 0 || towrite < NArch::PAGESIZE) &&
+                                 !page->testflag(NMem::PAGE_UPTODATE);
+
+                if (needsread) {
+                    // Use lock-free I/O pattern for partial page reads.
+                    if (page->testflag(NMem::PAGE_IOINFLIGHT)) {
+                        // Release lock and wait for the other thread's I/O to complete.
                         page->pageunlock();
+                        page->waitio();
+                        page->pagelock();
+
+                        if (page->testflag(NMem::PAGE_UPTODATE)) {
+                            goto dowrite;
+                        }
+                        // Clear any error and retry.
+                        if (page->testflag(NMem::PAGE_ERROR)) {
+                            page->clearflag(NMem::PAGE_ERROR);
+                        }
+                    }
+
+                    // We need to do I/O. Set IOINFLIGHT and release lock.
+                    page->setflag(NMem::PAGE_IOINFLIGHT);
+                    page->pageunlock();
+
+                    // Do I/O without holding page lock.
+                    int err = this->readpage(page);
+
+                    // Re-acquire lock to update flags.
+                    page->pagelock();
+                    page->signalio();  // Clears IOINFLIGHT and wakes waiters.
+
+                    if (err < 0 && err != -ENOENT) {
+                        page->setflag(NMem::PAGE_ERROR);
+                        page->pageunlock();
+                        page->unref();
                         if (totalwritten > 0) {
                             return totalwritten;
                         }
                         return err;
                     }
-                    if (err == -ENOENT) { // Zero the page if it doesn't exist.
+                    if (err == -ENOENT) {
+                        // Page doesn't exist on backing store, zero it.
                         NLib::memset(page->data(), 0, NArch::PAGESIZE);
                     }
+                    page->setflag(NMem::PAGE_UPTODATE);
                 }
 
+dowrite:
                 // Copy data from user buffer.
                 if (NMem::UserCopy::iskernel(src, towrite)) { // XXX: This way of doing things is scary, because we now have to protect every user-facing write with a validation before letting it ever touch writecached().
                     NLib::memcpy((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
@@ -612,6 +698,7 @@ namespace NFS {
                     int ret = NMem::UserCopy::copyfrom((uint8_t *)page->data() + offwithinpage, src, towrite);
                     if (ret < 0) {
                         page->pageunlock();
+                        page->unref();
                         if (totalwritten > 0) {
                             return totalwritten;
                         }
@@ -622,17 +709,32 @@ namespace NFS {
                 page->setflag(NMem::PAGE_UPTODATE);
                 page->markdirty();
                 page->pageunlock();
+                page->unref();
 
-                // Throttle if too many dirty pages to prevent unbounded dirty page growth.
-                if (NMem::pagecache && NMem::pagecache->shouldthrottle()) {
-                    NMem::pagecache->wakewriteback();
-                    NSched::yield(); // Give writeback thread a chance to run.
+                pagessincethrottlecheck++;
+
+                if (pagessincethrottlecheck >= THROTTLECHECKINTERVAL) {
+                    pagessincethrottlecheck = 0;
+                    if (NMem::pagecache) {
+                        if (NMem::pagecache->shouldthrottle()) {
+                            // Hard threshold exceeded, block until pressure is relieved.
+                            NMem::pagecache->throttle();
+                        } else if (NMem::pagecache->shouldwakewriteback()) {
+                            // Soft threshold exceeded, proactively wake writeback.
+                            NMem::pagecache->wakewriteback();
+                        }
+                    }
                 }
 
                 src += towrite;
                 offset += towrite;
                 count -= towrite;
                 totalwritten += towrite;
+            }
+
+            // Final throttle check at end of write.
+            if (NMem::pagecache && NMem::pagecache->shouldthrottle()) {
+                NMem::pagecache->throttle();
             }
 
             return totalwritten;

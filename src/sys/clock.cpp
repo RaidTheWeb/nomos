@@ -353,5 +353,70 @@ namespace NSys {
                     SYSCALL_RET(-EINVAL);
             }
         }
+
+        // XXX: Only guaranteed millisecond precision, as we convert from timespec to milliseconds.
+        extern "C" ssize_t sys_sleep(struct NSys::Clock::timespec *req, struct NSys::Clock::timespec *rem) {
+            SYSCALL_LOG("sys_sleep(%p, %p)\n", req, rem);
+
+            if (!req) {
+                SYSCALL_RET(-EFAULT);
+            }
+
+            // Copy timespec from userspace.
+            struct NSys::Clock::timespec kreq;
+            if (NMem::UserCopy::copyfrom(&kreq, req, sizeof(struct NSys::Clock::timespec)) < 0) {
+                SYSCALL_RET(-EFAULT);
+            }
+
+            // Validate timespec.
+            if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || kreq.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
+                SYSCALL_RET(-EINVAL);
+            }
+
+            // Convert to milliseconds, rounding up.
+            uint64_t ms = (uint64_t)kreq.tv_sec * NSys::Clock::MSEC_PER_SEC;
+            uint64_t ns_to_ms = (kreq.tv_nsec + 999999) / 1000000; // Round up nanoseconds to milliseconds.
+            ms += ns_to_ms;
+
+            // Record start time if we need to compute remaining time.
+            struct NSys::Clock::timespec start_time;
+            if (rem) {
+                NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+                if (clock && clock->gettime(&start_time) < 0) {
+                    SYSCALL_RET(-EFAULT);
+                }
+            }
+
+            // Perform sleep.
+            int ret = NSched::sleep(ms);
+
+            // If interrupted and rem is provided, calculate remaining time.
+            if (ret == -EINTR && rem) {
+                struct NSys::Clock::timespec end_time;
+                NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
+                if (clock && clock->gettime(&end_time) == 0) {
+                    // Calculate elapsed time in nanoseconds.
+                    uint64_t elapsed_ns = ((uint64_t)end_time.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)end_time.tv_nsec) -
+                                        ((uint64_t)start_time.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)start_time.tv_nsec);
+
+                    // Calculate requested time in nanoseconds.
+                    uint64_t requested_ns = (uint64_t)kreq.tv_sec * NSys::Clock::NSEC_PER_SEC + (uint64_t)kreq.tv_nsec;
+
+                    // Calculate remaining time.
+                    uint64_t remaining_ns = (elapsed_ns < requested_ns) ? (requested_ns - elapsed_ns) : 0;
+
+                    struct NSys::Clock::timespec krem;
+                    krem.tv_sec = remaining_ns / NSys::Clock::NSEC_PER_SEC;
+                    krem.tv_nsec = remaining_ns % NSys::Clock::NSEC_PER_SEC;
+
+                    if (NMem::UserCopy::copyto(rem, &krem, sizeof(struct NSys::Clock::timespec)) < 0) {
+                        // If we can't copy the remaining time, we still return -EINTR.
+                        // POSIX allows this behavior.
+                    }
+                }
+            }
+
+            SYSCALL_RET(ret);
+        }
     }
 }

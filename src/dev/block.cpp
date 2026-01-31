@@ -110,6 +110,10 @@ namespace NDev {
             NMem::pagecache->addpage(page);
         }
 
+        // Take a ref for the caller, matching the contract of lookupandlock.
+        // The cache holds one ref (from addpage), caller gets another.
+        page->ref();
+
         page->pagelock();
         return page;
     }
@@ -146,14 +150,16 @@ namespace NDev {
                 if (page->pagemeta) {
                     page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
                     page->pagemeta->cacheentry = NULL;
-                    page->pagemeta->unref();  // Release initial cache ref.
+                    page->pagemeta->unref();  // Release cache's pagemeta ref.
                 }
 
                 page->pageunlock();
                 if (page->pagemeta) {
-                    page->pagemeta->unref();  // Release ref from foreachcollect.
+                    page->pagemeta->unref();  // Release foreachcollect's pagemeta ref.
                 }
-                delete page;
+                // Release refs: foreachcollect ref + cache ref (from addpage).
+                page->unref();  // foreachcollect ref.
+                page->unref();  // cache ref, this triggers delete.
             }
 
             if (resumeindex < 0) {
@@ -479,6 +485,7 @@ namespace NDev {
                 int err = this->readpagedata(page->data(), pageoffset);
                 if (err < 0) {
                     page->pageunlock();
+                    page->unref();
                     if (totalread > 0) {
                         return totalread;
                     }
@@ -494,6 +501,7 @@ namespace NDev {
                 ssize_t res = NMem::UserCopy::copyto(dest, (uint8_t *)page->data() + offwithinpage, toread);
                 if (res < 0) {
                     page->pageunlock();
+                    page->unref();
                     if (totalread > 0) {
                         return totalread;
                     }
@@ -503,6 +511,7 @@ namespace NDev {
 
             page->setflag(NMem::PAGE_REFERENCED);
             page->pageunlock();
+            page->unref();
 
             dest += toread;
             offset += toread;
@@ -554,6 +563,7 @@ namespace NDev {
                 ssize_t res = NMem::UserCopy::copyfrom((uint8_t *)page->data() + offwithinpage, (void *)src, towrite);
                 if (res < 0) {
                     page->pageunlock();
+                    page->unref();
                     if (totalwritten > 0) {
                         return totalwritten;
                     }
@@ -564,6 +574,7 @@ namespace NDev {
             page->setflag(NMem::PAGE_UPTODATE);
             page->markdirty();
             page->pageunlock();
+            page->unref();
 
             // Throttle if too many dirty pages to prevent unbounded dirty page growth.
             if (NMem::pagecache && NMem::pagecache->shouldthrottle()) {
@@ -695,7 +706,7 @@ namespace NDev {
         };
 
         // Iterate in batches, releasing treelock between batches.
-        while ((count = cache->foreachcollect(collected, MAXBATCH, dirtyfilter, nullptr, &resumeindex)) > 0) {
+        while ((count = cache->foreachcollect(collected, MAXBATCH, dirtyfilter, NULL, &resumeindex)) > 0) {
             size_t submitted = 0;
 
             // Try-lock and submit I/O (NO treelock held).
@@ -704,6 +715,7 @@ namespace NDev {
 
                 // Try to lock the page. If we can't, skip it (another thread has it).
                 if (!page->trypagelock()) {
+                    page->unref();
                     if (page->pagemeta) {
                         page->pagemeta->unref();
                     }
@@ -713,6 +725,7 @@ namespace NDev {
                 // Re-check dirty flag after acquiring page lock (may have been cleaned).
                 if (!page->testflag(NMem::PAGE_DIRTY)) {
                     page->pageunlock();
+                    page->unref();
                     if (page->pagemeta) {
                         page->pagemeta->unref();
                     }
@@ -733,6 +746,7 @@ namespace NDev {
                 if (!req) {
                     page->clearflag(NMem::PAGE_WRITEBACK);
                     page->pageunlock();
+                    page->unref();
                     if (page->pagemeta) {
                         page->pagemeta->unref();
                     }
@@ -752,6 +766,7 @@ namespace NDev {
                         page->setflag(NMem::PAGE_ERROR);
                     }
                     page->pageunlock();
+                    page->unref();
                     if (page->pagemeta) {
                         page->pagemeta->unref();
                     }
@@ -785,6 +800,7 @@ namespace NDev {
                         pg->errorcount = 0;
                     }
                     pg->pageunlock();
+                    pg->unref();
                     if (pg->pagemeta) {
                         pg->pagemeta->unref();
                     }

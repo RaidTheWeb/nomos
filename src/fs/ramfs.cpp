@@ -7,6 +7,7 @@
 #include <fs/pipefs.hpp>
 #include <mm/pagecache.hpp>
 #include <mm/ucopy.hpp>
+#include <mm/vmalloc.hpp>
 
 namespace NFS {
     namespace RAMFS {
@@ -43,14 +44,18 @@ namespace NFS {
             assert(buf, "Reading into invalid buffer.\n");
             assert(count, "Invalid count.\n");
 
+            this->metalock.acquire();
+            off_t fsize = this->attr.st_size;
+            this->metalock.release();
+
             this->datalock.acquire();
 
-            if (offset >= this->attr.st_size) {
+            if (offset >= fsize) {
                 this->datalock.release();
                 return 0;
             }
-            if ((off_t)(offset + count) > this->attr.st_size) {
-                count = this->attr.st_size - offset;
+            if ((off_t)(offset + count) > fsize) {
+                count = fsize - offset;
             }
 
             if (NMem::UserCopy::iskernel(buf, count)) {
@@ -68,14 +73,40 @@ namespace NFS {
 
         ssize_t RAMNode::write(const void *buf, size_t count, off_t offset, int fdflags) {
             (void)fdflags;
+
+            off_t requiredsize = offset + count;
+            uint8_t *newdata = NULL;
+
             this->datalock.acquire();
 
-            if ((off_t)(offset + count) > this->attr.st_size) {
-                this->attr.st_size = offset + count;
-                this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
+            // XXX: Growing really big deadlocks the system, probably due to memory exhaustion.
+            if (requiredsize > this->attr.st_size) {
+                uint8_t *olddata = this->data;
+                off_t oldsize = this->attr.st_size;
 
-                this->data = (uint8_t *)NMem::allocator.realloc(this->data, this->attr.st_size);
-                assert(this->data, "Failed to grow file data.\n");
+                // Release lock before allocation to prevent deadlock.
+                this->datalock.release();
+
+
+                newdata = (uint8_t *)NMem::allocator.realloc(olddata, requiredsize);
+                if (!newdata) {
+                    // Allocation failed, but we must not corrupt state.
+                    return -ENOMEM;
+                }
+
+                // Re-acquire lock and check if someone else resized the file.
+                this->datalock.acquire();
+
+                if (this->data != olddata || this->attr.st_size != oldsize) {
+                    this->datalock.release();
+                    NMem::allocator.free(newdata);
+                    return this->write(buf, count, offset, fdflags); // Retry.
+                }
+
+                // Commit the reallocation.
+                this->data = newdata;
+                this->attr.st_size = requiredsize;
+                this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
             }
 
             if (NMem::UserCopy::iskernel((void *)buf, count)) {
@@ -92,28 +123,49 @@ namespace NFS {
         }
 
         int RAMNode::truncate(off_t length) {
-            this->datalock.acquire();
-
             if (length < 0) {
-                this->datalock.release();
                 return -EINVAL;
             }
 
             if (length == 0) {
+                this->datalock.acquire();
                 if (this->data != NULL) {
-                    delete this->data;
+                    uint8_t *olddata = this->data;
                     this->data = NULL;
+                    this->attr.st_size = 0;
+                    this->attr.st_blocks = 0;
+                    this->datalock.release();
+                    // Free outside of lock to avoid deadlock.
+                    NMem::allocator.free(olddata);
+                } else {
+                    this->attr.st_size = 0;
+                    this->attr.st_blocks = 0;
+                    this->datalock.release();
                 }
-                this->attr.st_size = 0;
-                this->attr.st_blocks = 0;
-
-                this->datalock.release();
                 return 0;
             }
 
-            this->data = (uint8_t *)NMem::allocator.realloc(this->data, length);
-            assert(this->data, "Failed to truncate file data.\n");
+            // For growing truncate, allocate outside of lock to avoid deadlock.
+            this->datalock.acquire();
+            uint8_t *olddata = this->data;
+            off_t oldsize = this->attr.st_size;
+            this->datalock.release();
 
+            uint8_t *newdata = (uint8_t *)NMem::allocator.realloc(olddata, length);
+            if (!newdata) {
+                return -ENOMEM;
+            }
+
+            // Re-acquire lock and verify state hasn't changed.
+            this->datalock.acquire();
+            if (this->data != olddata || this->attr.st_size != oldsize) {
+                // State changed while we released lock, retry.
+                this->datalock.release();
+                NMem::allocator.free(newdata);
+                return this->truncate(length);
+            }
+
+            this->data = newdata;
             this->attr.st_size = length;
             this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
 
@@ -167,18 +219,33 @@ namespace NFS {
             off_t offset = page->offset;
             void *src = page->data();
 
+            // Check if we need to grow the file.
+            off_t newend = offset + NArch::PAGESIZE;
+
             this->datalock.acquire();
 
-            // Grow file if needed.
-            off_t newend = offset + NArch::PAGESIZE;
             if (newend > this->attr.st_size) {
-                this->attr.st_size = newend;
-                this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
-                this->data = (uint8_t *)NMem::allocator.realloc(this->data, this->attr.st_size);
-                if (!this->data) {
-                    this->datalock.release();
+                uint8_t *olddata = this->data;
+                off_t oldsize = this->attr.st_size;
+                this->datalock.release();
+
+                uint8_t *newdata = (uint8_t *)NMem::allocator.realloc(olddata, newend);
+                if (!newdata) {
                     return -ENOMEM;
                 }
+
+                // Re-acquire lock and verify state.
+                this->datalock.acquire();
+                if (this->data != olddata || this->attr.st_size != oldsize) {
+                    // State changed, free our allocation and retry.
+                    this->datalock.release();
+                    NMem::allocator.free(newdata);
+                    return this->writepage(page);
+                }
+
+                this->data = newdata;
+                this->attr.st_size = newend;
+                this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
             }
 
             // Copy data from cache page to internal buffer.

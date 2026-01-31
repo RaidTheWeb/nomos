@@ -1347,12 +1347,7 @@ namespace NFS {
             SYSCALL_RET(res); // Return result of unlink operation.
         }
 
-        struct timespec {
-            long tv_sec;
-            long tv_nsec;
-        };
-
-        extern "C" uint64_t sys_ppoll(struct pollfd *fds, size_t nfds, struct timespec *timeout, NLib::sigset_t *sigmask) {
+        extern "C" uint64_t sys_ppoll(struct pollfd *fds, size_t nfds, struct NSys::Clock::timespec *timeout, NLib::sigset_t *sigmask) {
             SYSCALL_LOG("sys_ppoll(%p, %u, %p, %p).\n", fds, nfds, timeout, sigmask);
 
             struct pollfd *kfds = NULL;
@@ -1378,12 +1373,12 @@ namespace NFS {
                 }
             } else {
                 // No fds to poll.
-                struct timespec ktmo;
+                struct NSys::Clock::timespec ktmo;
                 if (timeout) { // Simply just wait for the timeout period.
-                    if (!NMem::UserCopy::valid(timeout, sizeof(struct timespec))) {
+                    if (!NMem::UserCopy::valid(timeout, sizeof(struct NSys::Clock::timespec))) {
                         SYSCALL_RET(-EFAULT);
                     }
-                    int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct timespec));
+                    int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct NSys::Clock::timespec));
                     if (res < 0) {
                         SYSCALL_RET(res);
                     }
@@ -1456,13 +1451,13 @@ namespace NFS {
                 NLib::memset(&ksigmask, 0, sizeof(ksigmask));
             }
 
-            struct timespec ktmo;
+            struct NSys::Clock::timespec ktmo;
             if (timeout) { // Simply just wait for the timeout period.
-                if (!NMem::UserCopy::valid(timeout, sizeof(struct timespec))) {
+                if (!NMem::UserCopy::valid(timeout, sizeof(struct NSys::Clock::timespec))) {
                     delete[] kfds;
                     SYSCALL_RET(-EFAULT);
                 }
-                int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct timespec));
+                int res = NMem::UserCopy::copyfrom(&ktmo, timeout, sizeof(struct NSys::Clock::timespec));
                 if (res < 0) {
                     delete[] kfds;
                     SYSCALL_RET(res);
@@ -1486,7 +1481,7 @@ namespace NFS {
             uint64_t deadlinens = 0;
             bool hastimeout = (timeout != NULL);
             if (hastimeout) {
-                NSys::Clock::timespec now;
+                struct NSys::Clock::timespec now;
                 NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
                 if (clock && clock->gettime(&now) == 0) {
                     deadlinens = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
@@ -1536,7 +1531,7 @@ namespace NFS {
                 // No events ready yet, check if we have a timeout.
                 if (hastimeout) {
                     // Check remaining time.
-                    NSys::Clock::timespec now;
+                    struct NSys::Clock::timespec now;
                     NSys::Clock::Clock *clock = NSys::Clock::getclock(NSys::Clock::CLOCK_MONOTONIC);
                     uint64_t nowns = 0;
                     if (clock && clock->gettime(&now) == 0) {

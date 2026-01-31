@@ -128,7 +128,9 @@ namespace NFS {
                     if (hdr->entries > 0) {
                         found = &indices[0];
                     } else {
-                        if (allocbuf) delete[] allocbuf;
+                        if (allocbuf) {
+                            delete[] allocbuf;
+                        }
                         *leafbufout = NULL;
                         return 0;
                     }
@@ -136,7 +138,9 @@ namespace NFS {
 
                 leafblk = ((uint64_t)found->leafhi << 32) | found->leaflo;
 
-                if (allocbuf) delete[] allocbuf;
+                if (allocbuf) {
+                    delete[] allocbuf;
+                }
                 allocbuf = new uint8_t[this->ext4fs->blksize];
 
                 this->metalock.release();
