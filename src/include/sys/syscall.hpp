@@ -15,6 +15,8 @@
                 NUtil::printf("[sys/syscall]: (%lu) => %ld\n", NArch::CPU::get()->currthread->process->id, (long)(ret)); \
             } \
             return (ret);
+    #else
+        #define SYSCALL_RET(ret) return (ret);
     #endif
 #else
     #define SYSCALL_LOG(fmt, ...) do { } while (0)

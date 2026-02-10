@@ -1419,10 +1419,8 @@ namespace NFS {
                     NLib::sigset_t oldmask = __atomic_load_n(&thread->blocked, memory_order_acquire);
                     __atomic_store_n(&thread->blocked, ksigmask, memory_order_release);
 
-                    NArch::CPU::get()->setint(false);
                     // Untracked sleep state, so we won't be woken up until a signal arrives.
-                    __atomic_store_n(&NArch::CPU::get()->currthread->tstate, NSched::Thread::PAUSED, memory_order_release);
-                    NArch::CPU::get()->setint(true);
+                    NSched::setthreadstate(NArch::CPU::get()->currthread, NSched::Thread::PAUSED, "sys_ppoll");
                     NSched::yield();
 
                     // Restore old signal mask before returning (per-thread).
@@ -1496,20 +1494,25 @@ namespace NFS {
                     }
 
                     NSched::Process *proc = NArch::CPU::get()->currthread->process;
-                    NLib::ScopeIRQSpinlock guard(&proc->lock);
+                    INode *node = NULL;
+                    int flags = 0;
 
-                    FileDescriptor *desc = proc->fdtable->get(kfds[i].fd);
-                    if (!desc) {
-                        // Restore old signal mask before returning (per-thread).
-                        __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
-                        delete[] kfds;
-                        SYSCALL_RET(-EBADF);
+                    // Hold proc->lock only for FD lookup, release before poll().
+                    {
+                        NLib::ScopeIRQSpinlock guard(&proc->lock);
+                        FileDescriptor *desc = proc->fdtable->get(kfds[i].fd);
+                        if (!desc) {
+                            // Restore old signal mask before returning (per-thread).
+                            __atomic_store_n(&thread->blocked, oldmask, memory_order_release);
+                            delete[] kfds;
+                            SYSCALL_RET(-EBADF);
+                        }
+                        node = desc->getnode();
+                        flags = desc->getflags();
                     }
 
                     struct pollfd *pfd = &kfds[i];
-
-                    INode *node = desc->getnode();
-                    int res = node->poll(pfd->events, &pfd->revents, desc->getflags());
+                    int res = node->poll(pfd->events, &pfd->revents, flags);
                     node->unref();
                     if (res < 0) {
                         // Restore old signal mask before returning (per-thread).

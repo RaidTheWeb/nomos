@@ -143,7 +143,7 @@ namespace NMem {
 
     void CachePage::addmapping(NArch::VMM::addrspace *space, uintptr_t virtaddr) {
         // Allocate a new mapping entry.
-        vmamapping *mapping = new vmamapping(space, virtaddr);
+        struct vmamapping *mapping = new struct vmamapping(space, virtaddr);
         if (!mapping) {
             return; // OOM, mapping won't be tracked.
         }
@@ -162,7 +162,7 @@ namespace NMem {
 
     void CachePage::removemapping(NArch::VMM::addrspace *space, uintptr_t virtaddr) {
         this->lock.acquire();
-        vmamapping *m = this->mappingshead;
+        struct vmamapping *m = this->mappingshead;
         while (m) {
             if (m->space == space && m->virtaddr == virtaddr) {
                 // Found the mapping, remove it from the list.
@@ -188,7 +188,7 @@ namespace NMem {
         // Unmap this page from all address spaces that have it mapped.
         // We collect mappings while holding page lock, then process without it to avoid lock order violation (page lock vs address space lock).
         static constexpr size_t BATCHSIZE = 32;
-        vmamapping *batch[BATCHSIZE];
+        struct vmamapping *batch[BATCHSIZE];
         size_t totalcount = 0;
 
         while (true) {
@@ -196,17 +196,17 @@ namespace NMem {
 
             // Collect mappings under page lock.
             this->lock.acquire();
-            vmamapping *m = this->mappingshead;
+            struct vmamapping *m = this->mappingshead;
             while (m && collected < BATCHSIZE) {
                 batch[collected++] = m;
-                vmamapping *next = m->next;
+                struct vmamapping *next = m->next;
                 m = next;
             }
 
             // Remove collected mappings from list.
             if (collected > 0) {
                 // Update head to point past collected items.
-                vmamapping *last = batch[collected - 1];
+                struct vmamapping *last = batch[collected - 1];
                 this->mappingshead = last->next;
                 if (this->mapcount >= collected) {
                     this->mapcount -= collected;
@@ -222,7 +222,7 @@ namespace NMem {
 
             // Process collected mappings outside page lock.
             for (size_t i = 0; i < collected; i++) {
-                vmamapping *mapping = batch[i];
+                struct vmamapping *mapping = batch[i];
 
                 // Unmap from the address space.
                 mapping->space->lock.acquire();
@@ -1100,6 +1100,98 @@ namespace NMem {
         page->unref();
     }
 
+    size_t PageCache::writebackbatch(CachePage **pages, size_t count) {
+        if (count == 0) {
+            return 0;
+        }
+
+        static constexpr size_t ASYNCBATCHSIZE = BATCHSIZENORMAL;
+        struct NDev::bioreq *reqs[ASYNCBATCHSIZE];
+        CachePage *asyncpages[ASYNCBATCHSIZE];
+        size_t asynccount = 0;
+        size_t syncwritten = 0;
+
+        for (size_t i = 0; i < count && asynccount < ASYNCBATCHSIZE; i++) {
+            CachePage *page = pages[i];
+
+            if (!page->testflag(PAGE_DIRTY)) {
+                continue; // Skip clean pages.
+            }
+
+            NDev::BlockDevice *bdev = page->blockdev;
+            if (!bdev && page->inode) {
+                bdev = page->inode->getblockdevice(); // Attempt to get inode's backing device.
+            }
+
+            if (bdev && bdev->hasasyncio()) {
+                // Prepare batch.
+
+                page->setflag(PAGE_WRITEBACK | PAGE_IOINFLIGHT);
+
+                size_t blksperpage = NArch::PAGESIZE / bdev->blksize;
+                uint64_t lba = page->offset / bdev->blksize;
+
+                struct NDev::bioreq *req = new NDev::bioreq();
+                if (!req) {
+                    page->clearflag(PAGE_WRITEBACK | PAGE_IOINFLIGHT);
+                    continue;
+                }
+
+                req->init(bdev, NDev::bioreq::BIO_WRITE, lba, blksperpage, page->data(), NArch::PAGESIZE);
+                req->udata = page;
+                req->callback = NULL; // We're basically scatter gathering, so we don't need true asynchronicity here.
+
+                NUtil::printf("[pagecache]: Submitting async writeback for page at offset %lu (LBA %lu, %lu blocks)\n", page->offset, lba, blksperpage);
+                int res = bdev->submitbio(req);
+                if (res < 0) {
+                    delete req;
+                    page->clearflag(PAGE_WRITEBACK | PAGE_IOINFLIGHT);
+                    continue;
+                }
+                reqs[asynccount] = req;
+                asyncpages[asynccount] = page;
+                asynccount++;
+            } else { // No async I/O support, do synchronous writeback.
+                NUtil::printf("[pagecache]: Performing sync writeback for page at offset %lu\n", page->offset);
+                int err = writebackpage(page);
+                if (err == 0) {
+                    syncwritten++;
+                }
+            }
+        }
+
+        size_t asyncwritten = 0;
+        for (size_t i = 0; i < asynccount; i++) {
+            struct NDev::bioreq *req = reqs[i];
+            CachePage *page = asyncpages[i];
+            NDev::BlockDevice *bdev = page->blockdev;
+            if (!bdev && page->inode) {
+                bdev = page->inode->getblockdevice();
+            }
+
+            int res = bdev->waitbio(req);
+
+            page->clearflag(PAGE_WRITEBACK);
+            page->signalio(); // Clear IOINFLIGHT flag. Wake waiters.
+
+            if (res == 0 && req->status == 0) {
+                page->markclean();
+                page->errorcount = 0;
+                asyncwritten++;
+            } else {
+                page->errorcount++;
+                if (page->errorcount >= 10) {
+                    page->setflag(PAGE_ERROR);
+                }
+            }
+
+            delete req;
+        }
+
+        // Return total.
+        return syncwritten + asyncwritten;
+    }
+
     int PageCache::writebackpage(CachePage *page) {
         if (!page->testflag(PAGE_DIRTY)) {
             return 0;
@@ -1342,6 +1434,8 @@ namespace NMem {
             // Clear the wakeup flag BEFORE waiting to avoid losing wakes.
             __atomic_store_n(&this->wakeupneeded, false, memory_order_release);
 
+            NUtil::printf("[pagecache]: Writeback thread going to sleep...\n");
+
             // Wait until either:
             // 1. wakeupneeded flag is set (immediate wake from wakewriteback())
             // 2. Timeout expires (periodic writeback interval)
@@ -1352,7 +1446,7 @@ namespace NMem {
                 WRITEBACKINTERVALMS,
                 waitresult);
             // waitresult is 0 (woken by condition) or -ETIMEDOUT (periodic interval)
-            (void)waitresult;  // We don't care which triggered the wake.
+            (void)waitresult; // We don't care which triggered the wake.
 
             bool wokeforthrottle = this->shouldthrottle();
             bool wakeforsoftthreshold = this->shouldwakewriteback();
@@ -1360,6 +1454,10 @@ namespace NMem {
             // This is used later to decide if we need to shrink for headroom.
             bool wasovertotallimit = (this->maxpages > 0 && this->totalpages > this->maxpages);
 
+            NUtil::printf("[pagecache]: Writeback thread woke up (throttle=%d, softthreshold=%d, overlimit=%d)\n",
+                wokeforthrottle ? 1 : 0,
+                wakeforsoftthreshold ? 1 : 0,
+                wasovertotallimit ? 1 : 0);
             if (!this->isrunning()) {
                 break;
             }
@@ -1377,12 +1475,11 @@ namespace NMem {
             CachePage *batch[BATCHSIZEPRESSURE]; // Allocate for max size.
             size_t count;
 
-            // Collect from active list.
+            // First cycle, try to collect from the inactive list (better for I/O efficiency, I reckon, because inactive pages are more likely *not* to be dirtied again soon).
             {
                 NLib::ScopeIRQSpinlock guard(&this->cachelock);
-
                 count = 0;
-                CachePage *page = this->activehead;
+                CachePage *page = this->inactivehead;
                 while (page && count < batchsize && written + count < maxpercycle) {
                     CachePage *next = page->lrunext;
                     if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK) && !page->testflag(PAGE_LOCKED)) {
@@ -1397,8 +1494,9 @@ namespace NMem {
                 }
             }
 
-            // Process active batch outside of lock.
-            // Lock one page at a time, write it, then unlock before moving to next.
+            // Process inactive batch outside of lock.
+
+            size_t lockedcount = 0;
             for (size_t i = 0; i < count; i++) {
                 CachePage *page = batch[i];
 
@@ -1412,17 +1510,16 @@ namespace NMem {
                     continue;
                 }
 
-                // Re-check dirty flag after acquiring lock (page may have been cleaned).
-                if (page->testflag(PAGE_DIRTY)) {
-                    writebackpage(page);
-                    written++;
-                }
+                // Overwrite batch entry with locked entry.
+                batch[lockedcount++] = page;
+            }
 
-                // If under pressure and page is now clean, evict immediately.
-                if (underpressure && !page->testflag(PAGE_DIRTY) && this->totalpages > this->maxpages) {
-                    // Evict the page. evictpagefromwriteback handles unlock and unref.
-                    evictpagefromwriteback(page);
-                } else {
+            // Process the locked pages from this batch.
+            if (lockedcount > 0) {
+                written = this->writebackbatch(batch, lockedcount);
+
+                for (size_t i = 0; i < lockedcount; i++) {
+                    CachePage *page = batch[i];
                     page->pageunlock();
                     page->unref();
                     if (page->pagemeta) {
@@ -1431,13 +1528,14 @@ namespace NMem {
                 }
             }
 
-            // Collect from inactive list if we haven't hit the limit.
+
+            // Still not enough? Second cycle, try to collect from active list. At this point, we don't care about I/O efficiency as much as we just need to get dirty pages written back.
             if (written < maxpercycle) {
                 {
                     NLib::ScopeIRQSpinlock guard(&this->cachelock);
 
                     count = 0;
-                    CachePage *page = this->inactivehead;
+                    CachePage *page = this->activehead;
                     while (page && count < batchsize && written + count < maxpercycle) {
                         CachePage *next = page->lrunext;
                         if (page->testflag(PAGE_DIRTY) && !page->testflag(PAGE_WRITEBACK) && !page->testflag(PAGE_LOCKED)) {
@@ -1452,8 +1550,9 @@ namespace NMem {
                     }
                 }
 
-                // Process inactive batch outside of lock.
-                // Lock one page at a time, write it, then unlock before moving to next.
+                // Process active batch outside of lock.
+
+                lockedcount = 0;
                 for (size_t i = 0; i < count; i++) {
                     CachePage *page = batch[i];
 
@@ -1467,17 +1566,15 @@ namespace NMem {
                         continue;
                     }
 
-                    // Re-check dirty flag after acquiring lock (page may have been cleaned).
-                    if (page->testflag(PAGE_DIRTY)) {
-                        writebackpage(page);
-                        written++;
-                    }
+                    // Overwrite batch entry with locked entry.
+                    batch[lockedcount++] = page;
+                }
 
-                    // If under pressure and page is now clean, evict immediately.
-                    if (underpressure && !page->testflag(PAGE_DIRTY) && this->totalpages > this->maxpages) {
-                        // evictpagefromwriteback handles unlock and unref.
-                        evictpagefromwriteback(page);
-                    } else {
+                // Process the locked pages from this batch.
+                if (lockedcount > 0) {
+                    written += this->writebackbatch(batch, lockedcount);
+                    for (size_t i = 0; i < lockedcount; i++) {
+                        CachePage *page = batch[i];
                         page->pageunlock();
                         page->unref();
                         if (page->pagemeta) {
@@ -1496,9 +1593,7 @@ namespace NMem {
             // Also shrink if dirty ratio is high and we're near page limit (make room for new dirty pages).
             size_t dirtytarget = (this->maxpages * DIRTYTARGETPERCENT) / 100;
             bool overdirtytarget = this->dirtypages > dirtytarget;
-            bool needshrink = wasovertotallimit ||
-                              (this->maxpages > 0 && this->totalpages > this->maxpages) ||
-                              (overdirtytarget && this->totalpages > (this->maxpages * 90) / 100);
+            bool needshrink = wasovertotallimit || (this->maxpages > 0 && this->totalpages > this->maxpages) || (overdirtytarget && this->totalpages > (this->maxpages * 90) / 100);
             if (needshrink) {
                 size_t target = this->targetfreepages > 0 ? this->targetfreepages : 16;
                 size_t current = this->totalpages;
@@ -1592,8 +1687,7 @@ namespace NMem {
         }
 
         // Use collect-then-process pattern to avoid holding cachelock during I/O.
-        // We lock each page during collection to prevent double-collection and
-        // to ensure pages remain valid until we process them.
+        // We lock each page during collection to prevent double-collection and to ensure pages remain valid until we process them.
         static constexpr size_t BATCHSIZE = 16;
         static constexpr size_t MAX_LOCKED_RETRIES = 3;
         CachePage *batch[BATCHSIZE];
@@ -1612,8 +1706,7 @@ namespace NMem {
 
             // Collect victim pages. Only collect CLEAN pages to avoid writeback during shrink.
             // Dirty pages will be handled by the writeback thread.
-            // We lock each page during collection to prevent the same page being
-            // collected twice and to ensure it remains valid.
+            // We lock each page during collection to prevent the same page being collected twice and to ensure it remains valid.
             {
                 NLib::ScopeIRQSpinlock guard(&this->cachelock);
                 while (collected < BATCHSIZE && freed + collected < count) {
@@ -1622,7 +1715,7 @@ namespace NMem {
                         break;
                     }
                     // Try to lock the page while holding cachelock.
-                    // This prevents double-collection: locked pages are skipped by selectvictimclean.
+                    // This prevents double-collection. Locked pages are skipped by selectvictimclean (it also prevents waiting on locked pages!).
                     if (!victim->trypagelock()) {
                         // Page is already locked, skip it.
                         continue;
@@ -1814,8 +1907,8 @@ namespace NMem {
         if (page->pagemeta) {
             page->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
             page->pagemeta->cacheentry = NULL;
-            page->pagemeta->unref();  // Release initial cache ref.
-            page->pagemeta->unref();  // Release ref from lookupandlock.
+            page->pagemeta->unref(); // Release initial cache ref.
+            page->pagemeta->unref(); // Release ref from lookupandlock.
         }
 
         // Release reference to inode (BlockDevice pages don't hold refs).
@@ -1897,7 +1990,7 @@ namespace NMem {
             if (foundpage->pagemeta) {
                 foundpage->pagemeta->flags &= ~NArch::PMM::PageMeta::PAGEMETA_PAGECACHE;
                 foundpage->pagemeta->cacheentry = NULL;
-                foundpage->pagemeta->unref();  // Release initial cache ref.
+                foundpage->pagemeta->unref(); // Release initial cache ref.
             }
 
             // Release reference to inode (BlockDevice pages don't hold refs).
@@ -1907,8 +2000,8 @@ namespace NMem {
 
             // Unlock and release refs.
             foundpage->pageunlock();
-            foundpage->unref();  // Release our lookup ref.
-            foundpage->unref();  // Release initial cache ref. May delete page.
+            foundpage->unref(); // Release our lookup ref.
+            foundpage->unref(); // Release initial cache ref. May delete page.
         }
 
         return errors;
@@ -2099,8 +2192,7 @@ namespace NMem {
             }
 
             pagecache->init(maxpages, targetfree);
-            NUtil::printf("[mm/pagecache]: Page cache sized to %lu pages (%lu MiB), target free %lu.\n",
-                         maxpages, (maxpages * NArch::PAGESIZE) / (1024 * 1024), targetfree);
+            NUtil::printf("[mm/pagecache]: Page cache sized to %lu pages (%lu MiB), target free %lu.\n", maxpages, (maxpages * NArch::PAGESIZE) / (1024 * 1024), targetfree);
         }
     }
 

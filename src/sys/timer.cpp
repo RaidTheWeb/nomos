@@ -22,9 +22,17 @@ namespace NSys {
             lock.release();
         }
 
+        static void triggerwork(struct NSched::work *w) {
+            OneshotEvent *udata = (OneshotEvent *)w->udata;
+            if (udata) {
+                udata->trigger();
+            }
+        }
+
+
         timerhandle_t create(void (*callback)(void *), void *arg, uint64_t duration) {
             // This function EXPECTS the caller to have locked the timer subsystem.
-            uint64_t curticks = __atomic_load_n(&ticks, __ATOMIC_ACQUIRE);
+            uint64_t curticks = __atomic_load_n(&ticks, memory_order_acquire);
             timerhandle_t handle = nexthandle++;
             OneshotEvent event(callback, arg, curticks + duration, handle);
             events.push(event);
@@ -71,6 +79,8 @@ namespace NSys {
             }
 
             lock.release();
+
+            // XXX: Even outside the timer lock, interrupts are still disabled, so long callbacks could impact latency (potentially even causing shootdowns).
 
             // Trigger callbacks without holding the lock.
             for (size_t i = 0; i < expired.getsize(); i++) {

@@ -1141,7 +1141,7 @@ namespace NFS {
 
         // Ditto for ext2.
         static struct VFS::fsreginfo ext2fsinfo = {
-            .name = "ext2"
+            .name = "ext2" // XXX: Mounted ext2 filesystems can be *really* slow. Is there something wrong with my indirect block handling?
         };
 
         REGFS(ext4, Ext4FileSystem::instance, &ext4fsinfo);

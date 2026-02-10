@@ -462,7 +462,7 @@ namespace NDev {
                 struct nvmequeue *cq = &ctrl->iocq[q];
                 struct nvmequeue *sq = &ctrl->iosq[q];
 
-                if (!cq->entries || cq->cqvec != vec) {
+                if (!cq->entries || !sq->entries || cq->cqvec != vec) {
                     continue;
                 }
 
@@ -471,6 +471,7 @@ namespace NDev {
                 // Process all available completions.
                 while (true) {
                     uint32_t cqhead = cq->head;
+                    assert(cqhead < cq->size, "NVMe completion queue head out of bounds.");
                     uint8_t cqphase = cq->phase;
                     volatile struct nvmecqe *cqe = &((struct nvmecqe *)cq->entries)[cqhead];
 
@@ -1064,7 +1065,7 @@ retry:
 
         // Allocate MSI/MSI-X vectors.
         NArch::CPU::get()->currthread->disablemigrate();
-        PCI::enablevectors(&info, ctrl->nscount + 1, ctrl->qvecs);
+        PCI::enablevectors(&info, ctrl->nscount + 1, ctrl->qvecs); // We allocate enough for every namespace, *and* for the admin queue, because we can't exactly change our minds later (at least, with the current system).
         NArch::CPU::get()->currthread->enablemigrate();
 
         // Mark controller as initialised before creating namespaces so interrupts work.

@@ -233,18 +233,17 @@ namespace NMem {
             NSched::Thread *wbthread = NULL;
 
             // Writeback configuration.
-            static constexpr uint64_t WRITEBACKINTERVALMS = 500; // 500ms default (reduced from 1s).
-            static constexpr size_t MAXWRITEBACKPERCYCLE = 128; // Max pages per writeback cycle (increased from 64).
-            
+            static constexpr uint64_t WRITEBACKINTERVALMS = 5000; // 200ms default.
+            static constexpr size_t MAXWRITEBACKPERCYCLE = 512; // Max pages per writeback cycle.
+
             // Two-tier dirty thresholds for soft/hard throttling.
             static constexpr size_t DIRTYSOFTTHRESHOLDPERCENT = 25; // Wake writeback at 25% dirty.
             static constexpr size_t DIRTYHARDTHRESHOLDPERCENT = 50; // Block writers at 50% dirty.
-            static constexpr size_t DIRTYTHRESHOLDPERCENT = 40; // Legacy threshold (kept for compatibility).
             static constexpr size_t DIRTYTARGETPERCENT = 15; // Target dirty ratio after cleanup.
-            
+
             // Batch sizes for writeback.
-            static constexpr size_t BATCHSIZENORMAL = 32; // Normal batch size.
-            static constexpr size_t BATCHSIZEPRESSURE = 128; // Batch size under pressure.
+            static constexpr size_t BATCHSIZENORMAL = 64; // Normal batch size.
+            static constexpr size_t BATCHSIZEPRESSURE = 256; // Batch size under pressure.
 
             void addtoactive(CachePage *page);
             void addtoinactive(CachePage *page);
@@ -267,6 +266,7 @@ namespace NMem {
             int evictpage(CachePage *page); // Evict a single page.
             void evictpagefromwriteback(CachePage *page); // Evict page from writeback context (page already locked+clean).
 
+            size_t writebackbatch(CachePage **batch, size_t maxcount); // Write back a batch of pages.
             int writebackpage(CachePage *page); // Write single page to backing store.
         public:
             PageCache(void);
@@ -312,13 +312,13 @@ namespace NMem {
 
             // Check if dirty page throttling should occur (hard threshold).
             bool shouldthrottle(void) const;
-            
+
             // Check if we should wake writeback proactively (soft threshold).
             bool shouldwakewriteback(void) const;
 
             // Block the caller until cache pressure is relieved.
             void throttle(void);
-            
+
             // Perform direct reclaim from calling thread. Returns pages written/freed.
             size_t directreclaim(size_t target);
 

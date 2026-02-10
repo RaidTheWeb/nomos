@@ -2,6 +2,7 @@
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/smp.hpp>
+#include <arch/x86_64/tsc.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <lib/align.hpp>
 #include <lib/assert.hpp>
@@ -29,6 +30,10 @@ namespace NArch {
         struct shootdownreq shootdownreq = {};
 
         void doshootdown(enum shootdowntype type, uintptr_t start, uintptr_t end) {
+            if (NSched::initialised) {
+                NArch::CPU::get()->currthread->disablemigrate(); // Prevent migration during shootdown.
+            }
+
             if (type == SHOOTDOWN_RANGE) {
                 size_t pages = (end - start) / PAGESIZE;
                 if (pages > SHOOTDOWN_RANGETHRESHOLD) {
@@ -58,6 +63,9 @@ namespace NArch {
             // Read CPU count atomically once and use consistently.
             size_t cpucount = __atomic_load_n(&SMP::awakecpus, memory_order_acquire);
             if (cpucount < 2) {
+                if (NSched::initialised) {
+                    NArch::CPU::get()->currthread->enablemigrate();
+                }
                 return;
             }
 
@@ -66,7 +74,9 @@ namespace NArch {
                 CPU::get()->irqstackdepth);
 
             // Acquire global shootdown lock (serialises all shootdowns).
-            shootdownlock.acquire();
+            while (!shootdownlock.trylock()) { // My gleeby deeby ahh thought that a global shootdown lock acquire across any CPU *wouldn't* cause a deadlock scenario if two CPUs tried to do it at once.
+                asm volatile("pause" ::: "memory"); // Just trylock here and spin, so we can still accept IPIs for the other shootdown that'll inevitably be in progress if we fail to acquire the lock.
+            }
 
             // Set up the global request.
             size_t newgen = shootdownreq.generation + 1;
@@ -91,21 +101,36 @@ namespace NArch {
             asm volatile("" ::: "memory");  // Ensure preemptdisabled is visible before enabling interrupts.
             CPU::get()->setint(true);  // Allow IPIs to be received.
 
-            uint64_t timeout = 100000000ULL;
+            uint64_t now = TSC::query();
+            // Set 5 second timeout for shootdown completion to detect deadlocks.
+            uint64_t timeout = now + (TSC::hz * 5);
+
 
             while (__atomic_load_n(&shootdownreq.acks, memory_order_acquire) < target) {
                 asm volatile("pause" ::: "memory");
-                if (--timeout == 0) {
+                if (TSC::query() > timeout) {
                     size_t acks = __atomic_load_n(&shootdownreq.acks, memory_order_relaxed);
                     NUtil::printf("TLB shootdown timeout: %lu/%lu acks (missing %lu responses).\n", acks, target, target - acks);
-                    NUtil::printf("Shootdown type=%d, generation=%lu, start=0x%lx, end=0x%lx\n", (int)shootdownreq.type, newgen, shootdownreq.start, shootdownreq.end);
+                    NUtil::printf("Shootdown type=%d, generation=%lu, start=0x%lx, end=0x%lx.\n", (int)shootdownreq.type, newgen, shootdownreq.start, shootdownreq.end);
                     // Dump per-CPU tlbgeneration to identify which CPUs are behind.
                     NUtil::printf("Per-CPU TLB generations (current gen=%lu):\n", newgen);
                     for (size_t i = 0; i < cpucount; i++) {
                         CPU::cpulocal *cpu = SMP::cpulist[i];
                         if (cpu) {
                             size_t cpugen = __atomic_load_n(&cpu->tlbgeneration, memory_order_relaxed);
-                            NUtil::printf("  CPU %lu: tlbgen=%lu %s\n", i, cpugen, (cpugen >= newgen) ? "(acked)" : "(MISSING)");
+                            if (cpu->id != CPU::get()->id) {
+                                NUtil::printf("  CPU %lu: tlbgen=%lu %s.\n", i, cpugen, (cpugen >= newgen) ? "(acked)" : "(MISSING)");
+
+                                if (cpugen < newgen) {
+                                    NUtil::printf("    CPU %lu interrupt status: %s (%s)", i, cpu->intstatus ? "idle" : "interrupts disabled", cpu->ininterrupt ? "in interrupt" : "not in interrupt");
+                                    if (cpu->ininterrupt) {
+                                        NUtil::printf(" (handling vector %u)", cpu->handlingvec);
+                                    }
+                                    NUtil::printf(".\n");
+                                }
+                            } else {
+                                NUtil::printf("  CPU %lu: tlbgen=%lu (sender).\n", i, cpugen);
+                            }
                         }
                     }
 #ifdef TSTATE_DEBUG
@@ -120,6 +145,9 @@ namespace NArch {
             CPU::get()->preemptdisabled = oldpreempt;
 
             shootdownlock.release();
+            if (NSched::initialised) {
+                NArch::CPU::get()->currthread->enablemigrate();
+            }
         }
 
         void tlbshootdown(struct Interrupts::isr *isr, struct CPU::context *ctx) {

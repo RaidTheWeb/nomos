@@ -39,8 +39,9 @@ namespace NArch {
             (void)isr;
             (void)ctx;
 
+            // Handle updating the timer subsystem regardless of whether we schedule or not (preemption could be disabled, preventing the scheduler from updating the timer itself).
             uint64_t current = (TSC::query() * 1000) / TSC::hz;
-            NSys::Timer::update(current); // Update timer subsystem with current time in milliseconds
+            NSys::Timer::update(current); // Update timer subsystem with current time in milliseconds.
 
             sched(isr, ctx);
         }

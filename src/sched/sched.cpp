@@ -35,6 +35,8 @@
 // - Session::lock
 // Level 4:
 // - VMM::addrspace::lock
+// Level 4.5:
+// - Timer::lock (never hold while calling wake() or schedulethread())
 // Level 5:
 // - waitinglock (WaitQueue)
 // Level 6:
@@ -530,6 +532,9 @@ namespace NSched {
         // Update current thread pointer.
         cpu->currthread = thread;
 
+        cpu->ininterrupt = false;
+        cpu->preemptdisabled = false; // Well yeah, it would be, wouldn't it?
+
         // Perform the actual context switch.
         CPU::ctx_swap(&thread->ctx);
     }
@@ -545,6 +550,11 @@ namespace NSched {
 
         uint64_t now = TSC::query();
         Thread *prev = cpu->currthread;
+
+        if (cpu == CPU::getbsp()) {
+            uint64_t currentms = (now * 1000) / TSC::hz;
+            NSys::Timer::update(currentms);
+        }
 
         // Protect prev from being stolen while we're using it.
         if (prev && prev != cpu->idlethread) {
@@ -775,7 +785,11 @@ namespace NSched {
             cpu->quantumdeadline = now + (TSC::hz / 1000) * QUANTUMMS;
             Timer::rearm();
 
+
             __atomic_store_n(&cpu->inschedule, false, memory_order_release);
+
+            cpu->preemptdisabled = false;
+            cpu->ininterrupt = false;
         }
     }
 

@@ -88,6 +88,8 @@ namespace NArch {
         extern "C" void isr_handle(uint64_t vec, struct CPU::context *ctx) {
             struct isr *isr = &CPU::get()->isrtable[vec];
             CPU::get()->intstatus = false;
+            CPU::get()->ininterrupt = true;
+            CPU::get()->handlingvec = vec;
 
             if (NArch::CPU::get()->intcntr == __SIZE_MAX__) {
                 NArch::CPU::get()->intcntr = 0; // Handle wraparound. We do not care about intcntr for statistics purposes, only for ratelimiting.
@@ -111,7 +113,9 @@ namespace NArch {
                 NSched::signal_checkpending(ctx, NSched::POSTINT); // Check for pending signals before returning to userspace.
             }
 
-            CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false;
+            CPU::get()->ininterrupt = false;
+            CPU::get()->handlingvec = 0;
+            CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false; // If we initially had interrupts enabled, re-enable them on return.
         }
 
         void exception_handler(struct isr *isr, struct CPU::context *ctx) {
@@ -122,6 +126,8 @@ namespace NArch {
             bool isuserspace = (ctx->cs & 0x3) == 0x3;
 
             if ((isr->id & 0xffffffff) == 14) { // #PF
+                uintptr_t fixup = 0;
+
                 uintptr_t addr = 0;
                 asm volatile(
                     "mov %%cr2, %0"
@@ -154,12 +160,23 @@ namespace NArch {
                         NFS::VFS::INode *backingfile = vma->backingfile;
                         backingfile->ref();
                         space->lock.release();
+                        NArch::CPU::get()->preemptdisabled = true; // Prevent timer preemption before we block.
+                        NSched::Thread *currthread = NArch::CPU::get()->currthread;
+                        bool oldmigrate = __atomic_load_n(&currthread->migratedisabled, memory_order_acquire);
+                        currthread->disablemigrate(); // Prevent migration, so we aren't handling the page fault on one CPU and then get migrated to another CPU before we finish.
+                        NArch::CPU::get()->ininterrupt = false;
+                        asm volatile("" ::: "memory"); // Ensure flags are visible.
+                        bool oldint = NArch::CPU::get()->setint(true); // Let other stuff happen while we block.
 
                         // Calculate file offset for this page.
                         uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
                         size_t pageoffsetinvma = pagestart - vmastart;
 
                         if (pageoffsetinvma >= vmafilemapsize) { // Send SIGBUS for accesses beyond file-backed region.
+                            NArch::CPU::get()->setint(oldint);
+                            if (!oldmigrate) {
+                                currthread->enablemigrate();
+                            }
                             backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGBUS);
@@ -172,6 +189,10 @@ namespace NArch {
 
                         NMem::CachePage *cachepage = backingfile->getorcachepage(fileoff);
                         if (!cachepage) {
+                            NArch::CPU::get()->setint(oldint);
+                            if (!oldmigrate) {
+                                currthread->enablemigrate();
+                            }
                             backingfile->unref();
                             if (isuserspace) {
                                 NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
@@ -182,8 +203,12 @@ namespace NArch {
 
                         // Page is returned locked. Check if it needs to be read from disk.
                         if (!cachepage->testflag(NMem::PAGE_UPTODATE)) {
-                            int err = backingfile->readpage(cachepage);
+                            int err = backingfile->readpage(cachepage); // May block on disk I/O.
                             if (err < 0) {
+                                NArch::CPU::get()->setint(oldint);
+                                if (!oldmigrate) {
+                                    currthread->enablemigrate();
+                                }
                                 cachepage->pageunlock();
                                 cachepage->unref();
                                 backingfile->unref();
@@ -203,6 +228,29 @@ namespace NArch {
                             }
                         }
 
+                        if (isuserspace) { // Handle signal (otherwise, we'd never get it handled until disk I/O has stopped).
+                            NLib::sigset_t pending = __atomic_load_n(
+                                &NArch::CPU::get()->currthread->process->signalstate.pending,
+                                memory_order_acquire);
+                            NLib::sigset_t blocked = __atomic_load_n(
+                                &NArch::CPU::get()->currthread->blocked,
+                                memory_order_acquire);
+                            if (pending & ~blocked) {
+                                NArch::CPU::get()->setint(oldint);
+                                if (!oldmigrate) {
+                                    currthread->enablemigrate();
+                                }
+                                cachepage->pageunlock();
+                                cachepage->unref();
+                                backingfile->unref();
+                                return; // Abort. We'll be thrown back in here when we fault again, but we'd like signals to be done.
+                            }
+                        }
+
+                        if (!oldmigrate) {
+                            currthread->enablemigrate();
+                        }
+
                         // Re-acquire space lock and verify VMA is still valid.
                         space->lock.acquire();
                         vma = space->vmaspace->findcontaining(addr);
@@ -210,6 +258,7 @@ namespace NArch {
                             vma->start != vmastart || vma->end != vmaend) {
                             // VMA was changed while we were sleeping, discard mapping.
                             space->lock.release();
+                            NArch::CPU::get()->setint(oldint); // Restore interrupt state now.
                             cachepage->pageunlock();
                             cachepage->unref();
                             backingfile->unref();
@@ -246,6 +295,9 @@ namespace NArch {
                         backingfile->readahead(fileoff + PAGESIZE);
 
                         VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, pagestart, pagestart + PAGESIZE);
+
+                        // Now restore original interrupt state before returning.
+                        NArch::CPU::get()->setint(oldint);
                         return;
                     }
 
@@ -257,7 +309,8 @@ namespace NArch {
                         return;
                     }
 
-                    uintptr_t fixup = NSys::checkfault((uintptr_t)ctx->rip);
+                    // Handle usercopy and other *known* fault points. Only handles non-present faults.
+                    fixup = NSys::checkfault((uintptr_t)ctx->rip);
                     if (fixup) { // Is this fault fixable?
                         ctx->rip = fixup;
                         return; // Return to fixed-up instruction.
@@ -295,9 +348,30 @@ namespace NArch {
                     assertarg(meta, "Failed to get page metadata for physical address %p during COW handling.\n", oldpage);
                     meta->unref(); // Unref old page, free if needed.
 
-                    // XXX: Free pages with no more references from any thread.
+                    NArch::CPU::get()->ininterrupt = false;
+                    asm volatile("" ::: "memory");
+                    bool oldint = NArch::CPU::get()->setint(true);
+
                     VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
+
+                    NArch::CPU::get()->setint(oldint);
                     return;
+                } else {
+                    space->lock.release();
+                    // Send SIGSEGV for write to non-writeable page in userspace.
+                    if (isuserspace) {
+                        NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: write to non-writeable page.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, addr);
+                        NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
+                        return;
+                    }
+
+                    // Handle usercopy and other *known* fault points. Handles any other protection fault.
+                    fixup = NSys::checkfault((uintptr_t)ctx->rip);
+                    if (fixup) { // Is this fault fixable?
+                        NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: access violation on page. Fixing up to %p.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, ctx->rip, fixup);
+                        ctx->rip = fixup;
+                        return; // Return to fixed-up instruction.
+                    }
                 }
 
                 space->lock.release();

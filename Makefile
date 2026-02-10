@@ -75,7 +75,7 @@ SHAREDFLAGS ?= \
 	-fno-omit-frame-pointer
 
 ifeq ($(DEBUG),1)
-	CPPFLAGS += -DTSTATE_DEBUG
+#	CPPFLAGS += -DTSTATE_DEBUG -DSYSCALL_DEBUG -DSYSCALL_DEBUGRET
 	SHAREDFLAGS += -fsanitize=undefined
 endif
 

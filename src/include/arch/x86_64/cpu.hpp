@@ -114,6 +114,8 @@ namespace NArch {
             uint32_t lapicid;
             uint64_t lapicfreq = 0;
             bool intstatus = false; // Interrupts enabled?
+            bool ininterrupt = false; // Currently handling an interrupt?
+            uint8_t handlingvec = 0; // Vector of currently handling interrupt, for debugging.
 
             // IRQSpinlock state stack for nested lock acquisition.
             static constexpr size_t IRQSTACKMAX = 16;

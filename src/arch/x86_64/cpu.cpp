@@ -70,7 +70,7 @@ namespace NArch {
                 return -EFAULT;
             }
 
-            // Validate and get string length from userspace
+            // Validate and get string length from userspace.
             ssize_t textlen = NMem::UserCopy::strnlen(text, 4096); // Max 4KB debug string
             if (textlen < 0) {
                 return -EFAULT;
@@ -80,7 +80,6 @@ namespace NArch {
                 return 0;
             }
 
-            // Copy string from userspace to prevent TOCTOU attacks
             char *kbuf = new char[textlen + 1];
             if (!kbuf) {
                 return -ENOMEM;

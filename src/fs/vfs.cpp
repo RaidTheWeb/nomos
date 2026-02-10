@@ -813,6 +813,9 @@ dowrite:
 
             // Resolve the mountpoint node (except for root mount).
             if (mntpath.depth() > 0) {
+                // XXX: Mounting the wrong partition as ext4, and then immediately trying to mount the right partition causes getroot() in resolve() to access NULL pointer.
+                // XXX: May be just a problem with EINVAL through mount().
+
                 ssize_t ret = this->resolve(path, &mntnode, NULL, true, NULL);
                 if (ret < 0) {
                     delete[] path;
