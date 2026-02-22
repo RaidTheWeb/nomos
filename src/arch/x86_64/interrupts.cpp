@@ -61,28 +61,96 @@ namespace NArch {
         };
 
         struct isr *regisr(uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi) {
-            bool old = CPU::get()->setint(false); // Clear.
+            CPU::get()->veclock.acquire();
 
             struct isr *isr = &CPU::get()->isrtable[vec];
             isr->eoi = eoi;
             isr->func = func;
             isr->id = ((uint64_t)CPU::get()->lapicid << 32) | vec;
 
-            CPU::get()->setint(old); // Restore.
+            // Mark vector as allocated in the bitmap.
+            size_t idx = vec / 64;
+            uint64_t bit = 1ULL << (vec % 64);
+            CPU::get()->vecbitmap[idx] |= bit;
+
+            CPU::get()->veclock.release();
             return isr;
         }
 
         uint8_t allocvec(void) {
-            bool old = CPU::get()->setint(false); // Clear.
+            CPU::get()->veclock.acquire();
 
-            for (size_t i = 0; i < 256; i++) {
-                if (!CPU::get()->isrtable[i].func) {
-                    CPU::get()->setint(old);
-                    return i;
+            // Start from vector 32 to skip exception vectors 0-31.
+            for (size_t i = 32; i < 255; i++) {
+                size_t idx = i / 64;
+                uint64_t bit = 1ULL << (i % 64);
+                if (!(CPU::get()->vecbitmap[idx] & bit)) {
+                    CPU::get()->vecbitmap[idx] |= bit; // Mark as allocated.
+                    CPU::get()->veclock.release();
+                    return (uint8_t)i;
                 }
             }
-            assert(false, "Could not find a vector to allocate.\n");
+            assert(false, "No free interrupt vectors on this CPU.\n");
+            CPU::get()->veclock.release();
             return 0;
+        }
+
+        void freevec(uint8_t vec) {
+            CPU::get()->veclock.acquire();
+
+            size_t idx = vec / 64;
+            uint64_t bit = 1ULL << (vec % 64);
+            CPU::get()->vecbitmap[idx] &= ~bit;
+            CPU::get()->isrtable[vec].func = NULL;
+
+            CPU::get()->veclock.release();
+        }
+
+        uint8_t allocvecon(struct CPU::cpulocal *cpu) {
+            cpu->veclock.acquire();
+
+            for (size_t i = 32; i < 255; i++) {
+                size_t idx = i / 64;
+                uint64_t bit = 1ULL << (i % 64);
+                if (!(cpu->vecbitmap[idx] & bit)) {
+                    cpu->vecbitmap[idx] |= bit;
+                    cpu->veclock.release();
+                    return (uint8_t)i;
+                }
+            }
+            assert(false, "No free interrupt vectors on target CPU.\n");
+            cpu->veclock.release();
+            return 0;
+        }
+
+        struct isr *regisron(struct CPU::cpulocal *cpu, uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi) {
+            cpu->veclock.acquire();
+
+            struct isr *isr = &cpu->isrtable[vec];
+            isr->eoi = eoi;
+            isr->id = ((uint64_t)cpu->lapicid << 32) | vec;
+
+            // Write func last so the target CPU sees consistent eoi/id before the handler.
+            asm volatile("" ::: "memory");
+            isr->func = func;
+
+            size_t idx = vec / 64;
+            uint64_t bit = 1ULL << (vec % 64);
+            cpu->vecbitmap[idx] |= bit;
+
+            cpu->veclock.release();
+            return isr;
+        }
+
+        void freevecon(struct CPU::cpulocal *cpu, uint8_t vec) {
+            cpu->veclock.acquire();
+
+            size_t idx = vec / 64;
+            uint64_t bit = 1ULL << (vec % 64);
+            cpu->vecbitmap[idx] &= ~bit;
+            cpu->isrtable[vec].func = NULL;
+
+            cpu->veclock.release();
         }
 
         extern "C" void isr_handle(uint64_t vec, struct CPU::context *ctx) {
@@ -107,6 +175,8 @@ namespace NArch {
                     APIC::eoi();
                 }
                 isr->func(isr, ctx); // Call ISR function.
+            } else if(vec >= 32 && vec != 0xff) {
+                APIC::eoi();
             }
 
             if ((ctx->cs & 0x3) == 0x3) {
@@ -360,7 +430,7 @@ namespace NArch {
                     space->lock.release();
                     // Send SIGSEGV for write to non-writeable page in userspace.
                     if (isuserspace) {
-                        NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: write to non-writeable page.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, addr);
+                        NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: access violation on page.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, addr);
                         NSched::signalproc(NArch::CPU::get()->currthread->process, SIGSEGV);
                         return;
                     }
@@ -368,7 +438,6 @@ namespace NArch {
                     // Handle usercopy and other *known* fault points. Handles any other protection fault.
                     fixup = NSys::checkfault((uintptr_t)ctx->rip);
                     if (fixup) { // Is this fault fixable?
-                        NUtil::printf("[arch/x86_64/interrupts] (%u:%u) Page fault at %p: access violation on page. Fixing up to %p.\n", NArch::CPU::get()->currthread->process->id, NArch::CPU::get()->currthread->id, ctx->rip, fixup);
                         ctx->rip = fixup;
                         return; // Return to fixed-up instruction.
                     }

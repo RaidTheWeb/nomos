@@ -813,9 +813,6 @@ dowrite:
 
             // Resolve the mountpoint node (except for root mount).
             if (mntpath.depth() > 0) {
-                // XXX: Mounting the wrong partition as ext4, and then immediately trying to mount the right partition causes getroot() in resolve() to access NULL pointer.
-                // XXX: May be just a problem with EINVAL through mount().
-
                 ssize_t ret = this->resolve(path, &mntnode, NULL, true, NULL);
                 if (ret < 0) {
                     delete[] path;
@@ -861,22 +858,47 @@ dowrite:
 
             {
                 NLib::ScopeSpinlock guard(&this->mountlock);
-
                 this->mounts.push((struct VFS::mntpoint) { NLib::strdup(path), fs, mntnode });
 
-                if (!mntpath.depth() && !this->root) { // Attempt to assign root if we haven't already.
+                if (!mntpath.depth() && !this->root) {
                     this->root = fs->getroot();
                 }
             }
 
             if (fs->mount(src, path, mntnode, flags, data) != 0) {
-                this->umount(path, 0); // Rollback mount on failure.
+                // Rollback: remove the mount entry directly.
+                {
+                    NLib::ScopeSpinlock guard(&this->mountlock);
+                    this->mounts.remove([](struct mntpoint mnt, void *udata) {
+                        const char *matchpath = (const char *)udata;
+                        if (!NLib::strcmp(mnt.path, matchpath)) {
+                            delete[] mnt.path;
+                            return true;
+                        }
+                        return false;
+                    }, (void *)path);
+
+                    // Clear VFS root if we set it above.
+                    if (!mntpath.depth() && this->root) {
+                        this->root->unref();
+                        this->root = NULL;
+                    }
+                }
+                delete fs;
                 if (mntnode) {
                     mntnode->unref();
                 }
                 delete[] path;
                 return -EINVAL;
             }
+
+            {
+                NLib::ScopeSpinlock guard(&this->mountlock);
+                if (!mntpath.depth() && !this->root) {
+                    this->root = fs->getroot();
+                }
+            }
+
             delete[] path;
             return 0;
         }

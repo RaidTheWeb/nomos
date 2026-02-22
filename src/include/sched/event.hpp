@@ -160,7 +160,7 @@ namespace NSched {
     while (!(condition) && !__atomic_load_n(&__tstate->expired, memory_order_acquire)) { \
         (wq)->preparewait(); \
         /* Re-check expired after preparewait to catch timer that fired while we set up. */ \
-        if (__atomic_load_n(&__tstate->expired, __ATOMIC_ACQUIRE)) { \
+        if (__atomic_load_n(&__tstate->expired, memory_order_acquire)) { \
             (wq)->finishwait(true); \
             break; \
         } \

@@ -65,6 +65,9 @@ namespace NArch {
         }
 
         extern "C" ssize_t sys_debug(char *text) {
+#ifdef SYS_DEBUG
+
+
             // XXX: Disable in "production".
             if (!text) {
                 return -EFAULT;
@@ -96,6 +99,9 @@ namespace NArch {
             delete[] kbuf;
 
             return 0;
+#else
+            return -ENOSYS;
+#endif
         }
 
         // Entrypoint for system calls.

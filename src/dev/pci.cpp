@@ -3,6 +3,7 @@
 #include <arch/x86_64/acpi.hpp>
 #include <arch/x86_64/apic.hpp>
 #include <arch/x86_64/cpu.hpp>
+#include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/vmm.hpp>
 #include <arch/x86_64/io.hpp>
 #endif
@@ -66,15 +67,14 @@ namespace NDev {
                     if (cap == 0x05) { // MSI.
                         dev.info.pci.msisupport = true;
                         dev.info.pci.msioff = ptr;
-                        break;
-                    } else if (cap == 0x10) { // PCIe.
+                    }
+                    if (cap == 0x10) { // PCIe.
                         dev.info.pci.pciesupport = true;
                         dev.info.pci.pcieoff = ptr;
-                        break;
-                    } else if (cap == 0x11) { // MSI-X.
+                    }
+                    if (cap == 0x11) { // MSI-X.
                         dev.info.pci.msixsupport = true;
                         dev.info.pci.msixoff = ptr;
-                        break;
                     }
 
                     ptr = read(&dev, ptr + 1, 1);
@@ -221,9 +221,10 @@ namespace NDev {
                     return;
                 }
 
-                uint32_t bits = read(dev, dev->info.pci.msioff + MSIMASKREG, 4);
+                uint8_t maskoff = (ctrl & MSICTRL64) ? MSIMASKREG64 : MSIMASKREG32;
+                uint32_t bits = read(dev, dev->info.pci.msioff + maskoff, 4);
                 bits |= (1 << idx); // Flip bit to mask.
-                write(dev, dev->info.pci.msioff + MSIMASKREG, bits, 4);
+                write(dev, dev->info.pci.msioff + maskoff, bits, 4);
             }
 
             // XXX: Legacy IRQ support.
@@ -251,15 +252,33 @@ namespace NDev {
                     return;
                 }
 
-                uint32_t bits = read(dev, dev->info.pci.msioff + MSIMASKREG, 4);
+                uint8_t maskoff = (ctrl & MSICTRL64) ? MSIMASKREG64 : MSIMASKREG32;
+                uint32_t bits = read(dev, dev->info.pci.msioff + maskoff, 4);
                 bits &= ~(1 << idx); // Flip bit to unmask.
-                write(dev, dev->info.pci.msioff + MSIMASKREG, bits, 4);
+                write(dev, dev->info.pci.msioff + maskoff, bits, 4);
             }
 
             // XXX: Legacy IRQ support.
         }
 
-        int enablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors) {
+        // Internal round-robin CPU selector for automatic IRQ distribution.
+        static int nextirqcpu(void) {
+            static volatile size_t rr = 0;
+            return (int)(__atomic_fetch_add(&rr, 1, __ATOMIC_RELAXED) % NArch::SMP::awakecpus);
+        }
+
+        int enablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors, void (*handler)(struct NArch::Interrupts::isr *, struct NArch::CPU::context *), bool eoi) {
+            // Disable migration for the duration to keep CPU::get() stable across the function.
+            NArch::CPU::get()->currthread->disablemigrate();
+
+            if (count > 32) {
+                NUtil::printf("[dev/pci]: Requested vector count %u exceeds limit of 32.\n", count);
+                NArch::CPU::get()->currthread->enablemigrate();
+                return -1;
+            }
+
+            int result = -1;
+
             if (dev->info.pci.msixsupport) { // Prioritise MSI-X.
                 uint16_t msixctrl = read(dev, dev->info.pci.msixoff + MSIXCTRLREG, 2);
 
@@ -272,6 +291,7 @@ namespace NDev {
 
                 if (count == 0 || count > size) {
                     NUtil::printf("[dev/pci]: Device does not support the requested number of MSI-X vectors.\n");
+                    NArch::CPU::get()->currthread->enablemigrate();
                     return -1;
                 }
 
@@ -285,13 +305,22 @@ namespace NDev {
                 struct msixentry *table = (struct msixentry *)(bar.base + off);
 
                 for (size_t i = 0; i < count; i++) {
-                    vectors[i] = NArch::Interrupts::allocvec();
+                    int cpuidx = nextirqcpu();
+                    struct NArch::CPU::cpulocal *target = NArch::SMP::cpulist[cpuidx];
 
-                    table[i].addrlo = NArch::APIC::lapicphy | (NArch::CPU::get()->lapicid << 12);
+                    vectors[i] = NArch::Interrupts::allocvecon(target);
+                    dev->info.pci.irqcpus[i] = (uint8_t)cpuidx;
+
+                    // Register ISR handler atomically with vector allocation if provided.
+                    if (handler) {
+                        NArch::Interrupts::regisron(target, vectors[i], handler, eoi);
+                    }
+
+                    table[i].addrlo = NArch::APIC::lapicphy | (target->lapicid << 12);
                     table[i].addrhi = (NArch::APIC::lapicphy >> 32) & 0xffffffff;
                     table[i].data = vectors[i]; // Specify the vector.
                     table[i].vc = 0; // Begin unmasked.
-                    NUtil::printf("[dev/pci]: Sending MSI-X IRQ %u to %u at %p.\n", i, vectors[i], table[i].addrlo);
+                    NUtil::printf("[dev/pci]: MSI-X IRQ %u -> vec %u on CPU %u.\n", i, vectors[i], target->lapicid);
                 }
 
 
@@ -303,9 +332,13 @@ namespace NDev {
 
                 unmapbar(bar);
 
-                NUtil::printf("[dev/pci]: MSI-X enabled with vectors %u to %u.\n", vectors[0], vectors[0] + count - 1);
-                return 0;
+                NUtil::printf("[dev/pci]: MSI-X enabled with %u vector(s).\n", count);
+                result = 0;
             } else if (dev->info.pci.msisupport) {
+                // MSI: all vectors share one address register, so they must target a single CPU.
+                int msicpuidx = nextirqcpu();
+                struct NArch::CPU::cpulocal *msitarget = NArch::SMP::cpulist[msicpuidx];
+
                 uint16_t msictrl = read(dev, dev->info.pci.msioff + MSICTRLREG, 2);
 
                 uint8_t mmc = (msictrl & MSIMMMASK) >> MSIMMSHIFT;
@@ -313,11 +346,18 @@ namespace NDev {
 
                 if (count > maxvec) {
                     NUtil::printf("[dev/pci]: Device does not support the requested number of MSI vectors.\n");
+                    NArch::CPU::get()->currthread->enablemigrate();
                     return -1;
                 }
 
                 for (size_t i = 0; i < count; i++) {
-                    vectors[i] = NArch::Interrupts::allocvec();
+                    vectors[i] = NArch::Interrupts::allocvecon(msitarget);
+                    dev->info.pci.irqcpus[i] = (uint8_t)msicpuidx;
+
+                    // Register ISR handler atomically with vector allocation if provided.
+                    if (handler) {
+                        NArch::Interrupts::regisron(msitarget, vectors[i], handler, eoi);
+                    }
                 }
 
                 uint8_t mmeval = 0;
@@ -341,6 +381,7 @@ namespace NDev {
                         mmeval = 5;
                         break;
                     default:
+                        NArch::CPU::get()->currthread->enablemigrate();
                         return -1;
                 }
 
@@ -358,8 +399,9 @@ namespace NDev {
                     };
                     uint32_t raw;
                 } msiaddr;
-                msiaddr.addr = NArch::APIC::lapicphy;
-                msiaddr.dest = 0; // Target CPU0.
+                msiaddr.raw = 0;
+                msiaddr.addr = NArch::APIC::lapicphy >> 20; // 0xFEE00000 -> 0xFEE.
+                msiaddr.dest = msitarget->lapicid;
                 msiaddr.hint = 0;
                 msiaddr.mode = 0;
 
@@ -368,18 +410,57 @@ namespace NDev {
                     write(dev, dev->info.pci.msioff + MSIADDRHIREG, (NArch::APIC::lapicphy >> 32) & 0xffffffff, 4);
                 }
 
+                uint8_t dataoff = (msictrl & MSICTRL64) ? MSIDATAREG64 : MSIDATAREG32;
                 uint16_t data = vectors[0];
-                write(dev, dev->info.pci.msioff + MSIDATAREG, data, 2); // Write base vector.
+                write(dev, dev->info.pci.msioff + dataoff, data, 2); // Write base vector.
 
                 msictrl &= ~MSIMMMASK;
                 msictrl |= (mmeval << MSIMMSHIFT); // Overwrite with new MME value.
                 msictrl |= MSICTRLEN; // Reenable controller.
                 write(dev, dev->info.pci.msioff + MSICTRLREG, msictrl, 2);
-                NUtil::printf("[dev/pci]: MSI enabled with vectors %u to %u.\n", vectors[0], vectors[0] + count - 1);
-                return 0;
+                NUtil::printf("[dev/pci]: MSI enabled with %u vector(s) on CPU %u.\n", count, msitarget->lapicid);
+                result = 0;
             }
 
-            return -1; // XXX: Legacy IRQ support.
+            NArch::CPU::get()->currthread->enablemigrate();
+
+            if (result == 0) {
+                dev->info.pci.irqcount = count;
+            }
+
+            if (result != 0) {
+                NUtil::printf("[dev/pci]: No MSI/MSI-X support on device. Legacy IRQ not yet implemented.\n");
+            }
+
+            return result;
+        }
+
+        void disablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors) {
+            if (dev->info.pci.msixsupport) {
+                // Mask all vectors first.
+                uint16_t msixctrl = read(dev, dev->info.pci.msixoff + MSIXCTRLREG, 2);
+                msixctrl |= MSIXCTRLFUNCMASK; // Function-level mask.
+                write(dev, dev->info.pci.msixoff + MSIXCTRLREG, msixctrl, 2);
+            } else if (dev->info.pci.msisupport) {
+                // Disable MSI controller.
+                uint16_t msictrl = read(dev, dev->info.pci.msioff + MSICTRLREG, 2);
+                msictrl &= ~MSICTRLEN;
+                write(dev, dev->info.pci.msioff + MSICTRLREG, msictrl, 2);
+            }
+
+            // Ensure in-flight interrupts have drained before freeing vectors.
+            asm volatile("mfence" : : : "memory");
+
+            // Free all allocated vectors using the stored CPU assignments.
+            NArch::CPU::get()->currthread->disablemigrate();
+            for (size_t i = 0; i < count; i++) {
+                if (vectors[i] != 0) {
+                    struct NArch::CPU::cpulocal *target = NArch::SMP::cpulist[dev->info.pci.irqcpus[i]];
+                    NArch::Interrupts::freevecon(target, vectors[i]);
+                }
+            }
+            dev->info.pci.irqcount = 0;
+            NArch::CPU::get()->currthread->enablemigrate();
         }
 
         struct bar getbar(struct devinfo *dev, uint8_t idx) {
@@ -436,11 +517,11 @@ namespace NDev {
                 if (is_mmio) {
                     bar.mmio = true;
                     bar.base = baselo & 0xfffffff0;
-                    bar_size = (~(size_lo & ~0xFULL)) + 1;
+                    bar_size = (~(size_lo & ~0xFu)) + 1;
                 } else {
                     // IO BAR
-                    bar.base = baselo & ~0x3;
-                    bar_size = (~(size_lo & ~0x3)) + 1;
+                    bar.base = baselo & ~0x3u;
+                    bar_size = (~(size_lo & ~0x3u)) + 1;
                 }
             }
 
@@ -451,7 +532,7 @@ namespace NDev {
                 {
                     NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
                     virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(len, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
-                    assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, bar.base, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, len, false), "Failed to map PCI MMIO space.\n");
+                    assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, bar.base, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::DISABLECACHE, len, false), "Failed to map PCI MMIO space.\n");
                 }
                 // Deferred shootdown after releasing lock.
                 NArch::VMM::doshootdown(NArch::VMM::SHOOTDOWN_RANGE, virt, virt + len);
@@ -481,7 +562,7 @@ namespace NDev {
                     {
                         NLib::ScopeIRQSpinlock guard(&NArch::VMM::kspace.lock);
                         virt = (uintptr_t)NArch::VMM::kspace.vmaspace->alloc(maplen, NMem::Virt::VIRT_RW | NMem::Virt::VIRT_NX);
-                        assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, alloc->address, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE, maplen, false), "Failed to map PCI MMIO space.\n");
+                        assert(NArch::VMM::_maprange(&NArch::VMM::kspace, virt, alloc->address, NArch::VMM::PRESENT | NArch::VMM::NOEXEC | NArch::VMM::WRITEABLE | NArch::VMM::DISABLECACHE, maplen, false), "Failed to map PCI MMIO space.\n");
                     }
                     NUtil::printf("[dev/pci]: Discovered ECAM space at %p for bus range %d-%d.\n", alloc->address, alloc->start_bus, alloc->end_bus);
                     // Deferred shootdown after releasing lock.

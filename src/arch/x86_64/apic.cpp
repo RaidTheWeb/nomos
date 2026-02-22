@@ -207,7 +207,7 @@ namespace NArch {
 
             // Memory map whatever address we're going to be using, or else it won't let us!
             uintptr_t virt = (uintptr_t)VMM::kspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW);
-            assert(VMM::mappage(&VMM::kspace, virt, lapicaddr, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC), "Failed to memory map LAPIC base address.\n");
+            assert(VMM::mappage(&VMM::kspace, virt, lapicaddr, VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC | VMM::DISABLECACHE), "Failed to memory map LAPIC base address.\n");
             lapicaddr = virt;
 
             ioapics = new IoApic[numioapic];
@@ -220,7 +220,7 @@ namespace NArch {
                 uintptr_t virt = (uintptr_t)VMM::kspace.vmaspace->alloc(PAGESIZE, NMem::Virt::VIRT_NX | NMem::Virt::VIRT_RW);
                 assert(VMM::mappage(&VMM::kspace,
                     virt, (uintptr_t)ioapics[i].addr,
-                    VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC
+                    VMM::PRESENT | VMM::WRITEABLE | VMM::NOEXEC | VMM::DISABLECACHE
                 ), "Failed to memory map IOAPIC base address.\n");
                 ioapics[i].addr = (void *)virt;
 

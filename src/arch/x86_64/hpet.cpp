@@ -2,7 +2,9 @@
 #include <arch/x86_64/arch.hpp>
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/hpet.hpp>
+#include <arch/x86_64/pmm.hpp>
 #include <arch/x86_64/tsc.hpp>
+#include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <util/kprint.hpp>
 

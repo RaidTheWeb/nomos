@@ -247,6 +247,16 @@ namespace NDev {
                 writecmd(0xad); // Disable PS/2 port 1.
                 writecmd(0xa7); // Disable PS/2 port 2.
 
+                NArch::CPU::get()->currthread->disablemigrate(); // Guard to prevent the thread from being migrated to a different CPU halfway through registering an interrupt handler on it.
+
+                uint8_t vec = Interrupts::allocvec(); // Allocate vector for keyboard handler.
+
+                // Register ISR for the keyboard handler.
+                Interrupts::regisr(vec, kbdhandler, true);
+
+                APIC::setirq(1, vec, false, NArch::CPU::get()->lapicid); // Unmask IRQ1 for keyboard handler.
+                NArch::CPU::get()->currthread->enablemigrate();
+
                 // Pull out any pending data.
                 while (NArch::inb(CMDPORT) & (1 << 0)) {
                     NArch::inb(DATAPORT);
@@ -259,16 +269,6 @@ namespace NDev {
                 writedata(conf); // Write out config.
 
                 writecmd(0xae); // Enable PS/2 port 1.
-
-                NArch::CPU::get()->currthread->disablemigrate(); // Guard to prevent the thread from being migrated to a different CPU halfway through registering an interrupt handler on it.
-
-                uint8_t vec = Interrupts::allocvec(); // Allocate vector for keyboard handler.
-
-                // Register ISR for the keyboard handler.
-                Interrupts::regisr(vec, kbdhandler, true);
-
-                APIC::setirq(1, vec, false, NArch::CPU::get()->lapicid); // Unmask IRQ1 for keyboard handler.
-                NArch::CPU::get()->currthread->enablemigrate();
 
                 idev = new Input::Device();
                 idev->evsupported |= Input::event::KEY;

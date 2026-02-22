@@ -4,6 +4,10 @@
 #include <dev/dev.hpp>
 #include <stdint.h>
 
+#ifdef __x86_64__
+#include <arch/x86_64/interrupts.hpp>
+#endif
+
 namespace NDev {
     namespace PCI {
         struct bar {
@@ -15,9 +19,12 @@ namespace NDev {
         static constexpr uint8_t MSICTRLREG = 0x02;
         static constexpr uint8_t MSIADDRLOREG = 0x04;
         static constexpr uint8_t MSIADDRHIREG = 0x08;
-        static constexpr uint8_t MSIDATAREG = 0x08;
-        static constexpr uint8_t MSIMASKREG = 0x0c;
-        static constexpr uint8_t MSIPENDINGREG = 0x10;
+        static constexpr uint8_t MSIDATAREG32 = 0x08;
+        static constexpr uint8_t MSIDATAREG64 = 0x0c;
+        static constexpr uint8_t MSIMASKREG32 = 0x0c;
+        static constexpr uint8_t MSIMASKREG64 = 0x10;
+        static constexpr uint8_t MSIPENDINGREG32 = 0x10;
+        static constexpr uint8_t MSIPENDINGREG64 = 0x14;
 
         static constexpr uint16_t MSICTRL64 = (1 << 7);
         static constexpr uint16_t MSICTRLMASK = (1 << 8);
@@ -43,7 +50,8 @@ namespace NDev {
         void maskvector(struct devinfo *dev, uint8_t idx);
         void unmaskvector(struct devinfo *dev, uint8_t idx)
 ;
-        int enablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors);
+        int enablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors, void (*handler)(struct NArch::Interrupts::isr *, struct NArch::CPU::context *) = NULL, bool eoi = true);
+        void disablevectors(struct devinfo *dev, uint8_t count, uint8_t *vectors);
 
         uint32_t read(struct devinfo *dev, uint32_t off, int size);
         void write(struct devinfo *dev, uint32_t off, uint32_t val, int size);

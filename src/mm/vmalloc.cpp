@@ -19,8 +19,8 @@ namespace NMem {
                 return alloc ? (void *)NArch::hhdmoff((void *)alloc) : NULL;
             }
 
-            // First, try to allocate a contiguous block of physical memory.
-            // XXX: Consider KVMALLOC here later.
+            // First, try to allocate a contiguous block of physical memory for the entire size.
+            // XXX: Is it even worth it?
             //void *alloc = NArch::PMM::alloc(size);
             //if (alloc) {
                 // Successful, return HHDM offset pointer, as PMM returns physical address.

@@ -154,8 +154,7 @@ namespace NMem {
         // Atomically check and clear magic to prevent double-free race.
         // Two threads could otherwise both pass the magic check before either clears it.
         uint32_t expected = ALLOCMAGIC;
-        bool success = __atomic_compare_exchange_n(&meta->magic, &expected, 0,
-                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        bool success = __atomic_compare_exchange_n(&meta->magic, &expected, 0, false, memory_order_acq_rel, memory_order_relaxed);
         assert(success, "Double free or invalid free on potentially non-allocated block.\n");
 
         assert(meta->startcanary == CANARY && meta->endcanary == CANARY, "Slab memory corruption detected.\n");

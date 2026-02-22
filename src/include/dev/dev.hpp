@@ -43,6 +43,9 @@ namespace NDev {
                 uint16_t msixoff;
                 bool pciesupport;
                 uint16_t pcieoff;
+
+                uint8_t irqcount; // Number of active interrupt vectors (managed by PCI subsystem).
+                uint8_t irqcpus[32]; // CPU index for each allocated vector (managed by PCI subsystem).
             } pci;
             struct {
                 // USB generic info, for generic devices (eg. storage devices, mice, and keyboards).
@@ -61,6 +64,11 @@ namespace NDev {
     class Driver {
         public:
             virtual void probe(struct devinfo info) {
+                (void)info;
+            }
+
+            // Potential for plug and play support.
+            virtual void shutdown(struct devinfo info) {
                 (void)info;
             }
     };

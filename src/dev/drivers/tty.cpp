@@ -269,20 +269,65 @@ namespace NDev {
     void TTY::process(char c, void (*writefn)(const char *, size_t)) {
         bool canwrite = writefn != NULL;
 
+        // VLNEXT (Ctrl+V): if the previous character was VLNEXT, insert this character literally, bypassing all signal and editing processing.
+        if (this->vlnextpending) {
+            this->vlnextpending = false;
+
+            if (this->termios.lflag & ICANON) {
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
+                this->linebuffer.push(c);
+
+                if (this->termios.lflag & ECHO) {
+                    // ECHOCTL: echo control characters as ^X.
+                    if ((this->termios.lflag & ECHOCTL) && c < 32 && c != '\t' && c != '\n') {
+                        char ctrl[2] = { '^', (char)(c + 0x40) };
+                        if (canwrite) {
+                            writefn(ctrl, 2);
+                        }
+                        NLib::ScopeIRQSpinlock guard2(&this->outlock);
+                        this->outbuffer.push(ctrl[0]);
+                        this->outbuffer.push(ctrl[1]);
+                    } else {
+                        if (canwrite) {
+                            writefn(&c, 1);
+                        }
+                        NLib::ScopeIRQSpinlock guard2(&this->outlock);
+                        this->outbuffer.push(c);
+                    }
+                }
+            } else {
+                if (canwrite && (this->termios.lflag & ECHO)) {
+                    writefn(&c, 1);
+                }
+                NLib::ScopeIRQSpinlock guard(&this->inlock);
+                this->inbuffer.push(c);
+                if (NSched::initialised) {
+                    this->readwait.wakeone();
+                }
+            }
+            return;
+        }
+
         if (termios.lflag & ISIG) {
             int signal = -1;
+            char sigch = 0;
             if (c == this->termios.cc.vintr) {
                 signal = SIGINT;
-                NUtil::printf("Interrupt.\n");
+                sigch = c;
             } else if (c == this->termios.cc.vquit) {
                 signal = SIGQUIT;
-                NUtil::printf("Quit.\n");
+                sigch = c;
             } else if (c == this->termios.cc.vsusp) {
                 signal = SIGTSTP;
-                NUtil::printf("Suspend.\n");
+                sigch = c;
             }
 
             if (signal >= 0) {
+                if ((this->termios.lflag & ECHO) && (this->termios.lflag & ECHOCTL) && canwrite) {
+                    char ctrl[3] = { '^', (char)(sigch + 0x40), '\n' };
+                    writefn(ctrl, 3);
+                }
+
                 // POSIX: Unless NOFLSH is set, flush input and output queues.
                 if (!(this->termios.lflag & NOFLSH)) {
                     NLib::ScopeIRQSpinlock guard1(&this->linelock);
@@ -364,16 +409,79 @@ namespace NDev {
                 this->linebuffer.clear();
                 return;
             } else if (c == this->termios.cc.veof) {
-                // Forced to flush output to buffer, there's nothing left.
-                // POLLIN. We might have some data.
+                // Ctrl+D: flush the line buffer.
                 NLib::ScopeIRQSpinlock guard(&this->linelock);
-                if (this->linebuffer.empty()) { // EOF is only valid at the start of a line.
-                    this->pending_eof = true;
-                    if (NSched::initialised) {
-                        this->readwait.wakeone();
-                    }
-                    return;
+                if (this->linebuffer.empty()) {
+                    this->pendingeof = true;
+                } else {
+                    this->pendingflush = true;
                 }
+                if (NSched::initialised) {
+                    this->readwait.wakeone();
+                }
+                return;
+            } else if ((this->termios.lflag & IEXTEN) && c == this->termios.cc.vwerase) {
+                // VWERASE (Ctrl+W): erase the last word.
+                // A word is defined as a sequence of non-whitespace characters.
+                NLib::ScopeIRQSpinlock guard(&this->linelock);
+
+                // First, skip trailing whitespace.
+                while (!this->linebuffer.empty()) {
+                    char last = this->linebuffer.peek(this->linebuffer.size() - 1);
+                    if (last != ' ' && last != '\t') {
+                        break;
+                    }
+                    this->linebuffer.popback();
+                    if ((this->termios.lflag & ECHO) && (this->termios.lflag & ECHOE) && canwrite) {
+                        writefn("\b \b", 3);
+                    }
+                }
+
+                // Then, erase the word itself (non-whitespace chars).
+                while (!this->linebuffer.empty()) {
+                    char last = this->linebuffer.peek(this->linebuffer.size() - 1);
+                    if (last == ' ' || last == '\t') {
+                        break;
+                    }
+                    this->linebuffer.popback();
+                    if ((this->termios.lflag & ECHO) && (this->termios.lflag & ECHOE) && canwrite) {
+                        // If the erased char was a control char echoed as ^X,
+                        // we need to erase two columns.
+                        if ((this->termios.lflag & ECHOCTL) && last < 32 && last != '\t' && last != '\n') {
+                            writefn("\b \b\b \b", 6);
+                        } else {
+                            writefn("\b \b", 3);
+                        }
+                    }
+                }
+                return;
+            } else if ((this->termios.lflag & IEXTEN) && c == this->termios.cc.vreprint) {
+                // VREPRINT (Ctrl+R): reprint the current input line.
+                if ((this->termios.lflag & ECHO) && canwrite) {
+                    // Echo ^R and newline first.
+                    if (this->termios.lflag & ECHOCTL) {
+                        writefn("^R\n", 3);
+                    }
+
+                    NLib::ScopeIRQSpinlock guard(&this->linelock);
+                    for (size_t i = 0; i < this->linebuffer.size(); i++) {
+                        char ch = this->linebuffer.peek(i);
+                        if ((this->termios.lflag & ECHOCTL) && ch < 32 && ch != '\t' && ch != '\n') {
+                            char ctrl[2] = { '^', (char)(ch + 0x40) };
+                            writefn(ctrl, 2);
+                        } else {
+                            writefn(&ch, 1);
+                        }
+                    }
+                }
+                return;
+            } else if ((this->termios.lflag & IEXTEN) && c == this->termios.cc.vlnext) {
+                // VLNEXT (Ctrl+V): the next character is taken literally.
+                this->vlnextpending = true;
+                if ((this->termios.lflag & ECHO) && (this->termios.lflag & ECHOCTL) && canwrite) {
+                    writefn("^V", 2);
+                }
+                return;
             }
 
             if ((this->termios.iflag & IGNCR) && c == '\r') {
@@ -442,7 +550,10 @@ namespace NDev {
         }
     }
 
-    static bool hasline(NLib::CircularBuffer<char> *buf, char eol, char eof) {
+    static bool hasline(NLib::CircularBuffer<char> *buf, char eol, char eof, bool pendingflush) {
+        if (pendingflush) {
+            return true; // VEOF mid-line: data is ready without a delimiter.
+        }
         for (size_t i = 0; i < buf->size(); i++) {
             char c = buf->peek(i);
             if (c == '\n' || c == eol || c == eof) {
@@ -523,8 +634,8 @@ namespace NDev {
             // Create an IRQSpinlock guard to manage line lock (because input interrupt sources also acquire this lock).
             this->linelock.acquire();
             // If an EOF was received at the start of the line, return EOF (0).
-            if (this->pending_eof && this->linebuffer.empty()) {
-                this->pending_eof = false;
+            if (this->pendingeof && this->linebuffer.empty()) {
+                this->pendingeof = false;
                 this->linelock.release();
                 return 0;
             }
@@ -538,7 +649,7 @@ namespace NDev {
             int ret;
             waiteventinterruptiblelocked(
                 &this->readwait,
-                hasline(&this->linebuffer, this->termios.cc.veol, this->termios.cc.veof),
+                hasline(&this->linebuffer, this->termios.cc.veol, this->termios.cc.veof, this->pendingflush) || this->pendingeof,
                 &this->linelock,
                 ret
             );
@@ -547,6 +658,16 @@ namespace NDev {
                 this->linelock.release();
                 return ret; // Interrupted by signal.
             }
+
+            // Check for EOF again (may have been set while waiting).
+            if (this->pendingeof && this->linebuffer.empty()) {
+                this->pendingeof = false;
+                this->linelock.release();
+                return 0;
+            }
+
+            bool wasflushed = this->pendingflush;
+            this->pendingflush = false;
 
             size_t tocopy = this->linebuffer.size();
             if (tocopy > count) { // If there is more data in the line than the user wants, we should only copy out as much the caller wants.
@@ -756,7 +877,7 @@ dowrite:
         if ((events & VFS::POLLIN) || (events & VFS::POLLRDNORM)) {
             if (this->termios.lflag & ICANON) {
                 NLib::ScopeIRQSpinlock guard(&this->linelock);
-                if (hasline(&this->linebuffer, this->termios.cc.veol, this->termios.cc.veof)) {
+                if (hasline(&this->linebuffer, this->termios.cc.veol, this->termios.cc.veof, this->pendingflush) || this->pendingeof) {
                     *revents |= (events & (VFS::POLLIN | VFS::POLLRDNORM));
                 }
             } else {
@@ -884,70 +1005,107 @@ dowrite:
                 if (value == 1) { // Pressed.
 
                     char ascii = '\0';
-                    if (ctrl) { // Handle control sequences.
 
-                        if (alted) {
-                            if (code >= Input::key::KF1 && code <= Input::key::KF9) {
-                                // XXX: VT Switching.
-                                // currentvt = 1 + (code - Input::key::KF1);
-                                return;
-                            }
+                    if (ctrl && alted) {
+                        if (code >= Input::key::KF1 && code <= Input::key::KF9) {
+                            // XXX: VT Switching.
+                            // currentvt = 1 + (code - Input::key::KF1);
+                            return;
+                        }
+                    }
+
+                    // Helper lambda to write an escape sequence string to the active TTY.
+                    auto writeesc = [](const char *s, size_t n) {
+                        for (size_t i = 0; i < n; i++) {
+                            ttys[currentvt - 1]->tty->process(s[i], NLimine::console_write);
+                        }
+                    };
+
+                    { // Emit arrow key codes.
+                        const char *esccode = NULL;
+                        switch (code) {
+                            case Input::key::KUP:    esccode = "\x1b[A"; break;
+                            case Input::key::KDOWN:  esccode = "\x1b[B"; break;
+                            case Input::key::KRIGHT: esccode = "\x1b[C"; break;
+                            case Input::key::KLEFT:  esccode = "\x1b[D"; break;
+                            default: break;
                         }
 
-                        if ((asciitable[code] >= 'a' && asciitable[code] <= 'z') || (asciitable[code] >= 'A' && asciitable[code] <= '\\')) {
+                        if (esccode) {
+                            writeesc(esccode, NLib::strlen(esccode));
+                            return;
+                        }
+                    }
 
+                    {
+                        const char *esccode = NULL;
+                        switch (code) {
+                            case Input::key::KHOME:     esccode = "\x1b[1~"; break;
+                            case Input::key::KINSERT:   esccode = "\x1b[2~"; break;
+                            case Input::key::KDELETE:   esccode = "\x1b[3~"; break;
+                            case Input::key::KEND:      esccode = "\x1b[4~"; break;
+                            case Input::key::KPAGEUP:   esccode = "\x1b[5~"; break;
+                            case Input::key::KPAGEDOWN: esccode = "\x1b[6~"; break;
+                            default: break;
+                        }
+
+                        if (esccode) {
+                            writeesc(esccode, NLib::strlen(esccode));
+                            return;
+                        }
+                    }
+
+                    {
+                        const char *esccode = NULL;
+                        switch (code) {
+                            case Input::key::KF1:  esccode = "\x1b[[A";  break;
+                            case Input::key::KF2:  esccode = "\x1b[[B";  break;
+                            case Input::key::KF3:  esccode = "\x1b[[C";  break;
+                            case Input::key::KF4:  esccode = "\x1b[[D";  break;
+                            case Input::key::KF5:  esccode = "\x1b[[E";  break;
+                            case Input::key::KF6:  esccode = "\x1b[17~"; break;
+                            case Input::key::KF7:  esccode = "\x1b[18~"; break;
+                            case Input::key::KF8:  esccode = "\x1b[19~"; break;
+                            case Input::key::KF9:  esccode = "\x1b[20~"; break;
+                            case Input::key::KF10: esccode = "\x1b[21~"; break;
+                            case Input::key::KF11: esccode = "\x1b[23~"; break;
+                            case Input::key::KF12: esccode = "\x1b[24~"; break;
+                            default: break;
+                        }
+
+                        if (esccode) {
+                            writeesc(esccode, NLib::strlen(esccode));
+                            return;
+                        }
+                    }
+
+                    // Ctrl+letter produces a control character (e.g. Ctrl+C = 0x03).
+                    if (ctrl) {
+                        if ((asciitable[code] >= 'a' && asciitable[code] <= 'z') || (asciitable[code] >= 'A' && asciitable[code] <= '\\')) {
                             ascii = asciitable[code] >= 'a' ? asciitable[code] - 0x60 : asciitable[code] - 0x40;
-                            // Send to TTY.
                             ttys[currentvt - 1]->tty->process(ascii, NLimine::console_write);
                         }
                         return;
                     }
 
-                    const char *esccode = NULL;
-                    switch (code) {
-                        case Input::key::KHOME:
-                            esccode = "\x1b[1~";
-                            break;
-                        case Input::key::KEND:
-                            esccode = "\x1b[4~";
-                            break;
-                        case Input::key::KDELETE:
-                            esccode = "\x1b[3~";
-                            break;
-                        case Input::key::KINSERT:
-                            esccode = "\x1b[2~";
-                            break;
-                        case Input::key::KPAGEUP:
-                            esccode = "\x1b[5~";
-                            break;
-                        case Input::key::KPAGEDOWN:
-                            esccode = "\x1b[6~";
-                            break;
-                        case Input::key::KLEFT:
-                            esccode = "\x1b[D";
-                            break;
-                        case Input::key::KRIGHT:
-                            esccode = "\x1b[C";
-                            break;
-                        case Input::key::KUP:
-                            esccode = "\x1b[A";
-                            break;
-                        case Input::key::KDOWN:
-                            esccode = "\x1b[B";
-                            break;
-                        default:
-                            goto notspecial; // Clearly not a special key that emits an escape code.
+                    // Alt+key sends ESC prefix followed by the character.
+                    if (alted) {
+                        if (code < Input::key::KMAX) {
+                            bool upshift = shifted;
+                            if (asciitable[code] >= 'a' && asciitable[code] <= 'z') {
+                                upshift ^= capslock;
+                            }
+                            ascii = upshift ? asciitableshift[code] : asciitable[code];
+                        }
+                        if (ascii != '\0') {
+                            ttys[currentvt - 1]->tty->process('\x1b', NLimine::console_write);
+                            ttys[currentvt - 1]->tty->process(ascii, NLimine::console_write);
+                        }
+                        return;
                     }
 
-                    // Write escape code to TTY.
-                    for (size_t i = 0; i < NLib::strlen(esccode); i++) {
-                        ttys[currentvt - 1]->tty->process(esccode[i], NLimine::console_write);
-                    }
-                    return;
-
-notspecial:
+                    // Regular key (no modifiers, or shift only).
                     if (code < Input::key::KMAX) {
-
                         bool upshift = shifted;
 
                         if (asciitable[code] >= 'a' && asciitable[code] <= 'z') {
@@ -1006,7 +1164,7 @@ notspecial:
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) override {
                 if (dev == CURDEVICEID) {
                     uint64_t cttydev = this->getcttydev();
-                    if (cttydev == 0) {
+                    if (cttydev == 0 || (DEVFS::major(cttydev) != MAJOR || DEVFS::minor(cttydev) > MAXMINOR)) {
                         return -ENXIO; // No controlling terminal.
                     }
                     return write(cttydev, buf, count, offset, fdflags); // Forward to actual TTY.

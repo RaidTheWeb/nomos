@@ -1,6 +1,7 @@
 #ifdef __x86_64__
 #include <arch/x86_64/cpu.hpp>
 #endif
+#include <fs/devfs.hpp>
 #include <fs/pipefs.hpp>
 #include <fs/vfs.hpp>
 #include <lib/errno.hpp>
@@ -167,6 +168,17 @@ namespace NFS {
                 proc->fdtable->close(fd); // Clean up FD table entry and call INode::close().
                 node->unref();
                 SYSCALL_RET(res); // Open failed.
+            }
+
+            if (S_ISCHR(st.st_mode) && !(flags & O_NOCTTY)) { // Check if we should try setting a controlling terminal. POSIX says only if O_NOCTTY is not set, and the file is a character device. We also require that the process is a session leader without a controlling terminal.
+                proc->lock.acquire();
+                bool isleader = proc->session && proc->session->id == proc->id;
+                uint64_t currentctty = __atomic_load_n(&proc->tty, memory_order_relaxed);
+                proc->lock.release();
+
+                if (isleader && currentctty == 0) {
+                    node->ioctl(0x540e, 0); // TIOCSCTTY. Ignore errors (not all char devices are TTYs).
+                }
             }
 
             node->unref(); // Unreference. FD table will handle the reference.

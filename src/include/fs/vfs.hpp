@@ -639,6 +639,9 @@ namespace NFS {
                 }
 
                 virtual INode *getroot(void) {
+                    if (!this->root) {
+                        return NULL;
+                    }
                     this->root->ref();
                     return this->root;
                 }
@@ -727,6 +730,9 @@ namespace NFS {
                 int umount(const char *path, int flags);
 
                 virtual INode *getroot(void) {
+                    if (!this->root) {
+                        return NULL;
+                    }
                     this->root->ref();
                     return this->root;
                 }

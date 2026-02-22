@@ -125,6 +125,7 @@ namespace NSched {
             }
 
             mypgrp->lock.acquire();
+            // Remove ourselves from process group.
             mypgrp->procs.remove([](Process *p, void *arg) {
                 return p == ((Process *)arg);
             }, (void *)this);
@@ -132,8 +133,8 @@ namespace NSched {
             bool pgrpempty = mypgrp->procs.empty();
             bool pgrpnorefs = (mypgrp->getrefcount() == 0);
 
-            if (pgrpempty && pgrpnorefs) {
-                if (mysession) {
+            if (pgrpempty && pgrpnorefs) { // If that group is then empty, we can delete it.
+                if (mysession) { // If the group had a session, remove the group from the session and delete the session if it's empty.
                     mysession->lock.acquire();
                     mysession->pgrps.remove([](ProcessGroup *pg, void *arg) {
                         return pg == ((ProcessGroup *)arg);
@@ -154,7 +155,7 @@ namespace NSched {
             }
         }
 
-        if (this->parent) {
+        if (this->parent) { // If we have a parent (near-universal except for init), remove ourselves from its children list.
             this->parent->lock.acquire();
             this->parent->children.remove([](Process *p, void *arg) {
                 return p == ((Process *)arg);
@@ -168,7 +169,7 @@ namespace NSched {
         assert(pinitproc, "Failed to find init process during process destruction.\n");
         Process *initproc = *pinitproc;
 
-        if (children.size() && this != initproc) {
+        if (children.size() && this != initproc) { // If we have children and we aren't init (which reaps itself), we need to reparent them to init.
             NLib::DoubleList<Process *>::Iterator it = this->children.begin();
             for (; it.valid(); it.next()) {
                 Process *child = *(it.get());
@@ -180,7 +181,7 @@ namespace NSched {
                 initproc->lock.release();
 
                 // Notify init of reparenting, so it can reap if needed.
-                signalproc(initproc, SIGCHLD);
+                signalproc(initproc, SIGCHLD); // XXX: Is this a potential deadlock location?
 
                 child->lock.release();
             }
@@ -327,6 +328,9 @@ namespace NSched {
         child->uid = current->uid;
         child->gid = current->gid;
         child->umask = current->umask;
+
+        // Inherit controlling terminal.
+        child->tty = __atomic_load_n(&current->tty, memory_order_relaxed);
 
         // Establish child<->parent relationship between processes.
         child->parent = current;

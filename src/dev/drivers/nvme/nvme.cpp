@@ -63,7 +63,7 @@ namespace NDev {
     }
 
     NVMEDriver::NVMEDriver(void) {
-        instance = this;
+        __atomic_store_n(&instance, this, memory_order_release);
 
 
         // Create dedicated worker pool for NVMe I/O completions, we CANNOT afford I/O completion to be blocked (because it may be relied on by other workers, deadlocking everything).
@@ -85,13 +85,73 @@ namespace NDev {
     }
 
     NVMEDriver::~NVMEDriver(void) {
+        // Prevent ISR from entering driver code.
+        __atomic_store_n(&instance, (NVMEDriver *)NULL, memory_order_seq_cst);
+
         for (size_t i = 0; i < this->ctrlcount; i++) {
             struct nvmectrl *ctrl = &this->controllers[i];
 
             if (ctrl->initialised) {
+                // Signal ISR to stop processing this controller.
+                __atomic_store_n(&ctrl->dead, true, memory_order_release);
+                __atomic_thread_fence(memory_order_seq_cst);
+
+                // Disable interrupt vectors and unregister ISR handlers.
+                PCI::disablevectors(&ctrl->info, ctrl->nscount + 1, ctrl->qvecs);
+
                 // Disable controller.
                 ctrl->cc.en = 0;
                 write32(&ctrl->pcibar, REGCC, *((uint32_t *)&ctrl->cc));
+
+                // Complete all pending I/Os with error.
+                if (ctrl->pending) {
+                    for (size_t p = 0; p < ctrl->pendingcount; p++) {
+                        struct nvmepending *pending = &ctrl->pending[p];
+                        if (__atomic_load_n(&pending->inuse, memory_order_acquire)) {
+                            __atomic_store_n(&pending->status, -EIO, memory_order_release);
+                            __atomic_store_n(&pending->done, true, memory_order_release);
+                            pending->wq.wakeone();
+                        }
+                    }
+                }
+
+                // Tear down namespace devices.
+                for (size_t n = 0; n < ctrl->nscount; n++) {
+                    struct nvmens *ns = &ctrl->namespaces[n];
+                    if (!ns->active) {
+                        continue;
+                    }
+
+                    // Tear down partition devices.
+                    for (size_t p = 0; p < ns->numparts; p++) {
+                        if (ns->partnames[p][0]) {
+                            DEVFS::unregisterdevfile(ns->partnames[p]);
+                        }
+                        if (ns->partdevs[p]) {
+                            registry->remove(ns->partdevs[p]);
+                            delete ns->partdevs[p];
+                            ns->partdevs[p] = NULL;
+                        }
+                    }
+
+                    // Tear down main block device.
+                    if (ns->devname[0]) {
+                        DEVFS::unregisterdevfile(ns->devname);
+                    }
+                    if (ns->blkdev) {
+                        registry->remove(ns->blkdev);
+                        delete ns->blkdev;
+                        ns->blkdev = NULL;
+                    }
+
+                    // Free namespace identification.
+                    if (ns->id) {
+                        dmafree(ns->id, sizeof(struct nvmensid));
+                        ns->id = NULL;
+                    }
+
+                    ns->active = false;
+                }
 
                 // Free admin queues.
                 dmafree(ctrl->asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
@@ -109,8 +169,19 @@ namespace NDev {
 
                 // Free identification structure.
                 dmafree(ctrl->id, PAGESIZE);
+
+                // Free pending operations array.
+                delete[] ctrl->pending;
+                ctrl->pending = NULL;
+
+                __atomic_store_n(&ctrl->initialised, false, memory_order_release);
             }
             PCI::unmapbar(ctrl->pcibar);
+        }
+
+        // Drain workqueue after all controllers are disabled.
+        if (nvmeworkqueue) {
+            nvmeworkqueue->drain();
         }
     }
 
@@ -165,7 +236,9 @@ namespace NDev {
                 return -1; // Timeout.
             }
 
+#ifdef __x86_64__
             asm volatile("pause");
+#endif
         }
     }
 
@@ -353,7 +426,7 @@ namespace NDev {
             struct nvmepending *pending = &ctrl->pending[baseidx + slot];
 
             bool expected = false;
-            if (__atomic_compare_exchange_n(&pending->inuse, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (__atomic_compare_exchange_n(&pending->inuse, &expected, true, false, memory_order_acq_rel, memory_order_acquire)) {
                 __atomic_store_n(&pending->done, false, memory_order_release);
                 __atomic_store_n(&pending->status, 0, memory_order_release);
                 pending->submittsc = 0; // Will be set at submission time.
@@ -415,9 +488,14 @@ namespace NDev {
         struct nvmepending *pending = (struct nvmepending *)work->udata;
         assert(pending != NULL, "No pending pointer in NVMe completion work item.");
 
-        if (pending->bio && pending->bio->callback) {
-            // Call the block I/O callback.
-            pending->bio->callback(pending->bio);
+        if (pending->bio) {
+            pending->bio->status = __atomic_load_n(&pending->status, memory_order_acquire);
+            __atomic_store_n(&pending->bio->completed, true, memory_order_release);
+
+            if (pending->bio->callback) {
+                // Call the block I/O callback.
+                pending->bio->callback(pending->bio);
+            }
         }
 
         if (pending->callback) {
@@ -443,17 +521,23 @@ namespace NDev {
     static void iocqhandler(struct NArch::Interrupts::isr *isr, struct NArch::CPU::context *ctx) {
         (void)ctx;
 
-        if (!instance) {
+        NVMEDriver *drv = __atomic_load_n(&instance, memory_order_acquire);
+        if (!drv) {
             return;
         }
 
         uint8_t vec = (uint8_t)(isr->id & 0xff);
 
         // Search for the controller and queue that owns this vector.
-        for (size_t c = 0; c < instance->ctrlcount; c++) {
-            struct nvmectrl *ctrl = &instance->controllers[c];
+        for (size_t c = 0; c < drv->ctrlcount; c++) {
+            struct nvmectrl *ctrl = &drv->controllers[c];
 
-            if (!ctrl->initialised) {
+            if (!__atomic_load_n(&ctrl->initialised, memory_order_acquire)) {
+                continue;
+            }
+
+            // Check if controller is being torn down.
+            if (__atomic_load_n(&ctrl->dead, memory_order_acquire)) {
                 continue;
             }
 
@@ -584,7 +668,7 @@ retry:
 
         if (setupprps(cmd, buffer, size) != 0) {
             sq->qlock.release();
-            __atomic_store_n(&pending->inuse, false, __ATOMIC_RELEASE);
+            __atomic_store_n(&pending->inuse, false, memory_order_release);
             return -1;
         }
 
@@ -671,7 +755,7 @@ retry:
 
         if (setupprps(cmd, buffer, size) != 0) {
             sq->qlock.release();
-            __atomic_store_n(&localpending->inuse, false, __ATOMIC_RELEASE);
+            __atomic_store_n(&localpending->inuse, false, memory_order_release);
             return -1;
         }
 
@@ -805,10 +889,6 @@ retry:
         uint16_t qid = ns->nsnum + 1;
         uint8_t cpuvec = ctrl->qvecs[qid];  // CPU interrupt vector for this queue.
 
-        // Register interrupt handler with CPU vector.
-        NArch::CPU::get()->currthread->disablemigrate();
-        NArch::Interrupts::regisr(cpuvec, iocqhandler, true);
-        NArch::CPU::get()->currthread->enablemigrate();
 
         // Create completion queue: qid is the MSI-X table index, cpuvec is for interrupt matching.
         if (createiocqueue(ctrl, qid, QUEUESIZE, qid, cpuvec) != 0) {
@@ -852,6 +932,9 @@ retry:
         NUtil::snprintf(namebuf, sizeof(namebuf), "nvme%un%u", ctrl->num, ns->nsnum + 1);
         DEVFS::registerdevfile(namebuf, st);
 
+        ns->blkdev = nsblkdev;
+        NLib::memcpy(ns->devname, namebuf, sizeof(ns->devname));
+
         struct parttableinfo *ptinfo = getpartinfo(nsblkdev);
         if (ptinfo) {
             for (size_t i = 0; i < ptinfo->numparts; i++) {
@@ -869,6 +952,12 @@ retry:
                 registry->add(partblkdev);
 
                 DEVFS::registerdevfile(namebuf, st);
+
+                if (ns->numparts < nvmens::MAXPARTS) {
+                    ns->partdevs[ns->numparts] = partblkdev;
+                    NLib::memcpy(ns->partnames[ns->numparts], namebuf, sizeof(ns->partnames[0]));
+                    ns->numparts++;
+                }
             }
         }
     }
@@ -1063,13 +1152,34 @@ retry:
 
         NUtil::printf("[dev/nvme]: Controller has %u namespace(s).\n", ctrl->nscount);
 
-        // Allocate MSI/MSI-X vectors.
-        NArch::CPU::get()->currthread->disablemigrate();
-        PCI::enablevectors(&info, ctrl->nscount + 1, ctrl->qvecs); // We allocate enough for every namespace, *and* for the admin queue, because we can't exactly change our minds later (at least, with the current system).
-        NArch::CPU::get()->currthread->enablemigrate();
+        // Allocate pending operations array dynamically, sized to actual queue count.
+        ctrl->pendingcount = (ctrl->nscount + 1) * QUEUESIZE;
+        ctrl->pending = new struct nvmepending[ctrl->pendingcount]();
+        if (!ctrl->pending) {
+            NUtil::printf("[dev/nvme]: Failed to allocate pending operations array.\n");
+            dmafree(nsids, PAGESIZE);
+            dmafree(ctrl->id, sizeof(struct nvmeid));
+            dmafree(ctrl->asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
+            dmafree(ctrl->acq.entries, QUEUESIZE * sizeof(struct nvmecqe));
+            PCI::unmapbar(bar);
+            return;
+        }
+
+        // Allocate MSI/MSI-X vectors and register interrupt handler.
+        int vecresult = PCI::enablevectors(&info, ctrl->nscount + 1, ctrl->qvecs, iocqhandler, true);
+        if (vecresult != 0) {
+            NUtil::printf("[dev/nvme]: Failed to enable interrupt vectors.\n");
+            delete[] ctrl->pending;
+            dmafree(nsids, PAGESIZE);
+            dmafree(ctrl->id, sizeof(struct nvmeid));
+            dmafree(ctrl->asq.entries, QUEUESIZE * sizeof(struct nvmesqe));
+            dmafree(ctrl->acq.entries, QUEUESIZE * sizeof(struct nvmecqe));
+            PCI::unmapbar(bar);
+            return;
+        }
 
         // Mark controller as initialised before creating namespaces so interrupts work.
-        ctrl->initialised = true;
+        __atomic_store_n(&ctrl->initialised, true, memory_order_release);
         this->ctrlcount++;
 
         // Initialise each namespace.

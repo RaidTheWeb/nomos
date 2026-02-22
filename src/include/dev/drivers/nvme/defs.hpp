@@ -257,6 +257,8 @@ namespace NDev {
         volatile uint16_t nextcid; // Next command ID for this queue. Only use for submission queues. Accessed atomically.
     };
 
+    class BlockDevice; // Forward declaration for device tracking.
+
     struct nvmens {
         uint32_t nsid; // Namespace ID (Given by the controller).
         uint32_t nsnum; // Namespace number (0-based index).
@@ -266,6 +268,14 @@ namespace NDev {
         bool active;
         bool formatted;
         char guid[37];
+
+        // Device tracking for teardown.
+        static constexpr size_t MAXPARTS = 16;
+        BlockDevice *blkdev;
+        char devname[64];
+        BlockDevice *partdevs[MAXPARTS];
+        char partnames[MAXPARTS][64];
+        size_t numparts;
     };
 
     static constexpr size_t MAXQUEUES = 64;
@@ -315,9 +325,11 @@ namespace NDev {
         struct devinfo info;
 
         bool initialised;
+        volatile bool dead; // Set to true during teardown; ISR checks this to bail out.
         uint32_t num; // Controller number.
 
-        struct nvmepending pending[MAXQUEUES * QUEUESIZE];
+        struct nvmepending *pending; // Dynamically allocated: (nscount + 1) * QUEUESIZE entries.
+        size_t pendingcount; // Number of entries in pending array.
 
         // XXX: Per-controller locks.
     };

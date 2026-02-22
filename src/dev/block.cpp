@@ -608,11 +608,13 @@ namespace NDev {
         }
 
         req->status = (res < 0) ? (int)res : 0;
+        int status = req->status;
 
         __atomic_store_n(&req->completed, true, memory_order_release);
 
         if (req->callback) {
             req->callback(req);
+            return status;
         }
 
         req->wq.wake();

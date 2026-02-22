@@ -110,6 +110,8 @@ namespace NArch {
             struct ist ist;
             uint64_t gdt[7];
             struct Interrupts::isr isrtable[256];
+            uint64_t vecbitmap[4] = {}; // 256 bits, one per vector. Bit set = allocated.
+            IRQSpinlock veclock; // Serialises vector allocation and ISR registration across CPUs.
             uint32_t id;
             uint32_t lapicid;
             uint64_t lapicfreq = 0;

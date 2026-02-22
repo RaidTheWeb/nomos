@@ -5,8 +5,6 @@ global __ucopyto
 global __ustrlen
 global __umemset
 
-; XXX: Use rep instructions for better performance.
-
 ; Fault tolerant copy from user space to kernel space.
 __ucopyfrom:
     test rdx, rdx ; Check for zero size.

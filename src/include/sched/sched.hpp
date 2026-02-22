@@ -137,7 +137,7 @@ namespace NSched {
             size_t threadcount = 0;
             NLib::DoubleList<Thread *> threads;
 
-            uint64_t tty; // Device ID of process' controlling TTY.
+            uint64_t tty = 0; // Device ID of process' controlling TTY.
 
             struct signal signalstate; // Signal state (pending, blocked, handlers).
 

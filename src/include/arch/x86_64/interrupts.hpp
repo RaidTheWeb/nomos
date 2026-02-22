@@ -5,6 +5,10 @@
 #include <stdint.h>
 
 namespace NArch {
+    namespace CPU {
+        struct cpulocal; // Forward declaration for cross-CPU vector operations.
+    }
+
     namespace Interrupts {
         struct idtentry {
             uint16_t offlow; // Lower 16-bit offset.
@@ -37,6 +41,14 @@ namespace NArch {
 
         // Allocate a free vector for interrupt handler usage.
         uint8_t allocvec(void);
+
+        // Free a previously allocated vector.
+        void freevec(uint8_t vec);
+
+        // Cross-CPU vector operations: allocate, register, and free vectors on a specified CPU.
+        uint8_t allocvecon(struct CPU::cpulocal *cpu);
+        struct isr *regisron(struct CPU::cpulocal *cpu, uint8_t vec, void (*func)(struct isr *self, struct CPU::context *ctx), bool eoi);
+        void freevecon(struct CPU::cpulocal *cpu, uint8_t vec);
 
         void setup(void);
         void reload(void);

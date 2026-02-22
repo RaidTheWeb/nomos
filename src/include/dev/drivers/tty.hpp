@@ -165,7 +165,9 @@ namespace NDev {
             // 2. outlock
             // 3. inlock
 
-            bool pending_eof = false;
+            bool pendingeof = false;
+            bool pendingflush = false; // Set by VEOF mid-line to flush without delimiter.
+            bool vlnextpending = false;
 
             // Job control structures:
             NSched::ProcessGroup *fpgrp = NULL; // Foreground process group.
