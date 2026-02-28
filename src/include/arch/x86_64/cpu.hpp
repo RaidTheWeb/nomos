@@ -103,6 +103,7 @@ namespace NArch {
 
             uint8_t *ist1stack = NULL;  // IST1: NMI stack.
             uint8_t *ist2stack = NULL;  // IST2: Double Fault stack.
+            uint8_t *ist3stack = NULL;  // IST3: #GP stack.
 
             NSched::Thread *idlethread = NULL; // Fallback idle thread, for when trere's no work.
             uint64_t lastschedts; // For runtime delta calculations.
@@ -149,6 +150,8 @@ namespace NArch {
 
             volatile bool preemptdisabled = true; // Is preemption disabled on this CPU?
             volatile bool inschedule = false; // Is this CPU currently in the scheduler? Prevents nested scheduler invocations.
+
+            NSched::Thread *pendingmigrate = NULL; // Thread awaiting migration re-enable after ctx_swap abandons its stack.
 
             bool setint(bool status) {
                 asm volatile("cli");

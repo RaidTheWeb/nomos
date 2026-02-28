@@ -800,37 +800,7 @@ namespace NArch {
             }
 
             if (flags & MAP_ANONYMOUS) {
-                for (size_t i = 0; i < size; i += PAGESIZE) {
-                    void *page = PMM::alloc(PAGESIZE);
-                    if (!page) {
-                        // Free already-allocated pages before unmapping
-                        for (size_t j = 0; j < i; j += PAGESIZE) {
-                            uint64_t *pte = _resolvepte(space, (uintptr_t)addr + j);
-                            if (pte && (*pte & PRESENT)) {
-                                void *phys = (void *)(*pte & ADDRMASK);
-                                PMM::free(phys, PAGESIZE);
-                            }
-                        }
-                        _unmaprange(space, (uintptr_t)addr, i);
-                        space->vmaspace->free(addr, size);
-                        SYSCALL_RET(-ENOMEM);
-                    }
-                    NLib::memset(hhdmoff(page), 0, PAGESIZE);
-                    if (!_mappage(space, (uintptr_t)addr + i, (uintptr_t)page, prottovmm(prot), false)) {
-                        // Free the page we just allocated plus all previously allocated pages
-                        PMM::free(page, PAGESIZE);
-                        for (size_t j = 0; j < i; j += PAGESIZE) {
-                            uint64_t *pte = _resolvepte(space, (uintptr_t)addr + j);
-                            if (pte && (*pte & PRESENT)) {
-                                void *phys = (void *)(*pte & ADDRMASK);
-                                PMM::free(phys, PAGESIZE);
-                            }
-                        }
-                        _unmaprange(space, (uintptr_t)addr, i, false);
-                        space->vmaspace->free(addr, size);
-                        SYSCALL_RET(-ENOMEM);
-                    }
-                }
+                // Anonymous mappings are demand paged in.
             } else { // File-backed mapping.
                 // Demand paging:
                 bool demandback = NFS::VFS::S_ISBLK(nodeattr.st_mode) || NFS::VFS::S_ISREG(nodeattr.st_mode);

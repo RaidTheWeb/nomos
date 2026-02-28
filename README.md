@@ -9,7 +9,8 @@ The name "Nomos" comes from the name of the [Ancient Greek daemon](https://en.wi
 - [CFS](https://en.wikipedia.org/wiki/Completely_Fair_Scheduler)-inspired SMP-capable scheduler.
 - [Demand Paging](https://en.wikipedia.org/wiki/Demand_paging) for files.
 - NVMe driver.
-- ext4 filesystem support.
+- AHCI driver (SATA support).
+- ext4/ext3/ext2 filesystem support (albeit, no journaling for ext4/ext3).
 - Asynchronous I/O.
 - POSIX interface.
 

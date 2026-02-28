@@ -137,15 +137,6 @@ isr_common:
 
     push rax
 
-    ; Now we can use RAX again.
-    ; Prepare for page table swap back, post-syscall.
-    mov rax, [gs:0x0] ; Load current thread pointer.
-    mov rax, [rax + 8] ; Load current process pointer.
-    mov rax, [rax] ; Load address space pointer.
-    mov rax, [rax + 8] ; Load physical PML4 of current thread into temp.
-
-    ; lfence
-    ; mov cr3, rax
     swapgs
     lfence
 

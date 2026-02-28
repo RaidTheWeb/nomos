@@ -181,6 +181,7 @@ namespace NDev {
 
         // Release this slot.
         __atomic_store_n(&pending->inuse, false, memory_order_release);
+        pending->port->slotavailwq.wakeone();
     }
 
     static void queuecompletion(struct ahcipending *pending) {

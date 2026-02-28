@@ -62,9 +62,10 @@ namespace NSched {
     };
 
 
-    static void deliversignal(Thread *thread, uint8_t sig, struct NArch::CPU::context *ctx, enum callertype caller) {
+    // Returns true if proc->lock was released internally (caller must NOT release again).
+    static bool deliversignal(Thread *thread, uint8_t sig, struct NArch::CPU::context *ctx, enum callertype caller) {
         if (sig <= 0 || sig >= NSIG) {
-            return; // Invalid signal number.
+            return false; // Invalid signal number.
         }
 
         // Used when indexing into actions array.
@@ -78,7 +79,7 @@ namespace NSched {
             enum dflactions dflact = dflactions[signo];
             switch (dflact) {
                 case DFL_IGNORE:
-                    return; // Do nothing.
+                    return false; // Do nothing.
                 case DFL_TERMINATE:
                     proc->lock.release(); // Explicit lock release, as exit() will try to acquire it again.
                     // Terminate process, the calling thread is part of the process.
@@ -113,7 +114,7 @@ namespace NSched {
                     NSched::yield();
 
                     // When we return here, SIGCONT was received.
-                    return;
+                    return true; // Lock was released.
                 }
                 case DFL_CONTINUE: {
                     // Continue the process if it was stopped.
@@ -133,11 +134,12 @@ namespace NSched {
                             }
                         }
                     }
-                    return;
+                    return false;
                 }
             }
+            return false; // Unreachable, but satisfies UBSan.
         } else if (action->handler == SIG_IGN) {
-            return; // Explicitly ignored.
+            return false; // Explicitly ignored.
         } else {
 #ifdef __x86_64__
             // Save old signal mask to restore later (per-thread).
@@ -153,7 +155,7 @@ namespace NSched {
             // Check if we have a restorer (required for proper signal return).
             if (!action->restorer) {
                 NUtil::printf("[sched/signal] On %u: No restorer set, cannot deliver to user handler.\n", sig);
-                return;
+                return false;
             }
 
             uint64_t usp = ctx->rsp;
@@ -191,7 +193,7 @@ namespace NSched {
                 // Cannot deliver signal safely, terminate process.
                 proc->lock.release();
                 NSched::exit(1, SIGSEGV); // Terminate due to invalid memory access.
-                return; // Unreachable.
+                return true; // Unreachable, but lock was released.
             }
 
             // Build signal frame on user stack.
@@ -212,7 +214,7 @@ namespace NSched {
                 }
                 proc->lock.release();
                 NSched::exit(1, SIGSEGV); // Terminate due to invalid memory access.
-                return; // Unreachable.
+                return true; // Unreachable, but lock was released.
             }
 
             // Now we need to get the gleeby deeby context set up to jump to the signal handler.
@@ -225,7 +227,7 @@ namespace NSched {
                 action->handler = SIG_DFL; // Reset to default if SA_RESETHAND is set.
             }
 #endif
-            return;
+            return false;
         }
     }
 
@@ -244,11 +246,12 @@ namespace NSched {
 
         Process *proc = currthread->process;
 
-        NLib::ScopeIRQSpinlock guard(&proc->lock);
+        proc->lock.acquire();
 
         // Find highest priority pending unblocked signal (check thread mask).
         uint64_t deliverable = proc->signalstate.pending & ~__atomic_load_n(&currthread->blocked, memory_order_acquire);
         if (deliverable == 0) {
+            proc->lock.release();
             if (caller == NSched::POSTSYSCALL) {
                 NArch::CPU::get()->intstatus = true;
             }
@@ -261,7 +264,11 @@ namespace NSched {
         // Clear pending bit.
         clearpending(&proc->signalstate, sig);
 
-        deliversignal(currthread, sig, ctx, caller);
+        // deliversignal returns true if it released proc->lock internally.
+        bool released = deliversignal(currthread, sig, ctx, caller);
+        if (!released) {
+            proc->lock.release();
+        }
         if (caller == NSched::POSTSYSCALL) {
             NArch::CPU::get()->intstatus = true;
         }

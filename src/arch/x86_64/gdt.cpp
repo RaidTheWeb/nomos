@@ -30,14 +30,14 @@ namespace NArch {
             // Granularity 0xaf
             gdtt[2] = 0x00af93000000ffff;
 
-            // User Code 64
+            // User Data 64
             // Limit 0xffff
             // Base 0x00000000
             // Access 0xf3
             // Granularity 0xaf
             gdtt[3] = 0x00aff3000000ffff;
 
-            // User Data 64
+            // User Code 64
             // Limit 0xffff
             // Base 0x00000000
             // Access 0xfb

@@ -34,10 +34,12 @@ namespace NDev {
                 if (alreadydone) { // Bail out early if possible.
                     int status = __atomic_load_n(&pending->status, memory_order_acquire);
                     __atomic_store_n(&pending->inuse, false, memory_order_release);
+                    port->slotavailwq.wakeone();
                     return status;
                 }
 
                 __atomic_store_n(&pending->inuse, false, memory_order_release);
+                port->slotavailwq.wakeone();
                 return -ETIMEDOUT;
             }
 
@@ -51,11 +53,11 @@ namespace NDev {
         pending->wq.waitinglock.release();
         int status = __atomic_load_n(&pending->status, memory_order_acquire);
         __atomic_store_n(&pending->inuse, false, memory_order_release);
+        pending->port->slotavailwq.wakeone();
         return status;
     }
 
-    int allocslot(struct ahcictrl *ctrl, struct ahciport *port, int *outslot, struct ahcipending **outpending) {
-        int retries = 0;
+    int allocslot(struct ahcictrl *ctrl, struct ahciport *port, int *outslot, struct ahcipending **outpending, bool blocking) {
         while (true) {
             for (size_t i = 0; i <= ctrl->nslots; i++) {
                 bool expected = false;
@@ -74,12 +76,28 @@ namespace NDev {
                 }
             }
 
-            if (retries++ > 100) {
-                NUtil::printf("[dev/ata]: No pending slots available after %d retries.\n", retries);
-                return -EBUSY;
+            // All slots busy.
+            if (!blocking) {
+                return -EBUSY; // Non-blocking callers (async I/O) must not deadlock.
             }
 
-            NSched::yield();
+            // Blocking callers sleep until a slot is released.
+            port->slotavailwq.waitinglock.acquire();
+            bool anyfree = false;
+            for (size_t i = 0; i <= ctrl->nslots; i++) {
+                if (!__atomic_load_n(&port->pendings[i].inuse, memory_order_acquire)) {
+                    anyfree = true;
+                    break;
+                }
+            }
+            if (!anyfree) {
+                port->slotavailwq.preparewait();
+                port->slotavailwq.waitinglock.release();
+                NSched::yield();
+                port->slotavailwq.waitinglock.acquire();
+                port->slotavailwq.finishwait(true);
+            }
+            port->slotavailwq.waitinglock.release();
         }
     }
 
@@ -142,6 +160,7 @@ namespace NDev {
             if (remaining > 0) {
                 NUtil::printf("[dev/ata]: Buffer too fragmented for PRDT (need more than %lu entries).\n", (unsigned long)PRDTMAX);
                 __atomic_store_n(&pending->inuse, false, memory_order_release);
+                port->slotavailwq.wakeone();
                 return -EINVAL;
             }
 
@@ -149,9 +168,6 @@ namespace NDev {
             cmdtable->prdt[prdtidx - 1].i = 1;
             hdr->prdtl = prdtidx;
         }
-
-        (void)ctrl;
-        (void)port;
         return 0;
     }
 
@@ -170,7 +186,7 @@ namespace NDev {
         int slot = -1;
         struct ahcipending *pending = NULL;
 
-        int res = allocslot(ctrl, port, &slot, &pending);
+        int res = allocslot(ctrl, port, &slot, &pending, true); // Sync: block until a slot is available.
         if (res < 0) {
             return res;
         }
@@ -197,7 +213,7 @@ namespace NDev {
         int slot = -1;
         struct ahcipending *pending = NULL;
 
-        int res = allocslot(ctrl, port, &slot, &pending);
+        int res = allocslot(ctrl, port, &slot, &pending, false); // Async: never block; caller retries.
         if (res < 0) {
             return res;
         }
@@ -258,6 +274,7 @@ namespace NDev {
                         }
 
                         __atomic_store_n(&pendings[i]->inuse, false, memory_order_release);
+                        pendings[i]->port->slotavailwq.wakeone();
                     }
                 }
                 return firsterror;
@@ -275,6 +292,7 @@ namespace NDev {
 
                     int status = __atomic_load_n(&pendings[i]->status, memory_order_acquire);
                     __atomic_store_n(&pendings[i]->inuse, false, memory_order_release);
+                    pendings[i]->port->slotavailwq.wakeone();
                     if (status != 0 && firsterror == 0) {
                         firsterror = status;
                     }

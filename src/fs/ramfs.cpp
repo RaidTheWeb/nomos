@@ -119,6 +119,13 @@ namespace NFS {
                 }
             }
             this->datalock.release();
+
+            // Invalidate cached pages so mmap mappings see the new data.
+            // XXX: I reckon this could be smarter by invalidating the *relevant* pages, but this works for now. Not exactly performant though...
+            if (NMem::pagecache) {
+                NMem::pagecache->invalidateinode(this);
+            }
+
             return count;
         }
 
@@ -142,6 +149,12 @@ namespace NFS {
                     this->attr.st_blocks = 0;
                     this->datalock.release();
                 }
+
+                // Invalidate cached pages so mmap mappings see the truncated state.
+                if (NMem::pagecache) {
+                    NMem::pagecache->invalidateinode(this);
+                }
+
                 return 0;
             }
 
@@ -170,6 +183,12 @@ namespace NFS {
             this->attr.st_blocks = (this->attr.st_size + this->attr.st_blksize - 1) / this->attr.st_blksize;
 
             this->datalock.release();
+
+            // Invalidate cached pages so mmap mappings see the truncated state.
+            if (NMem::pagecache) {
+                NMem::pagecache->invalidateinode(this);
+            }
+
             return 0;
         }
 

@@ -253,6 +253,7 @@ namespace NDev {
         uintptr_t dmaaddr;
 
         NArch::IRQSpinlock qlock;
+        NSched::WaitQueue slotavailwq; // Signalled when a pending slot or queue entry becomes free.
 
         volatile uint16_t nextcid; // Next command ID for this queue. Only use for submission queues. Accessed atomically.
     };
@@ -288,6 +289,8 @@ namespace NDev {
         uint64_t entries[PAGESIZE / sizeof(uint64_t)];
     };
 
+    struct nvmequeue;
+
     // Struct for pending operations.
     struct nvmepending {
         NSched::WaitQueue wq; // Wait queue for this pending operation.
@@ -295,6 +298,8 @@ namespace NDev {
         volatile int status; // Status code. Written by ISR, read after done=true.
         volatile bool inuse; // Are we using this slot? Accessed atomically.
         volatile uint64_t submittsc; // TSC timestamp when submitted, for timeout detection.
+
+        struct nvmequeue *queue = NULL; // Backpointer to owning submission queue (set by allocpending).
 
         void (*callback)(struct nvmepending *) = NULL; // Optional callback function for async completions.
         void *udata = NULL; // User data pointer for the callback.

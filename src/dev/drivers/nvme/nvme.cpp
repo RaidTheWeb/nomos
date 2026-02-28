@@ -430,6 +430,7 @@ namespace NDev {
                 __atomic_store_n(&pending->done, false, memory_order_release);
                 __atomic_store_n(&pending->status, 0, memory_order_release);
                 pending->submittsc = 0; // Will be set at submission time.
+                pending->queue = sq; // Backpointer to owning submission queue.
 
                 // Clear callback/bio pointers to prevent stale values from previous I/O.
                 pending->callback = NULL;
@@ -466,6 +467,9 @@ namespace NDev {
                 NUtil::printf("[dev/nvme]: I/O request timed out after %lu us.\n", IOTIMEOUTUS);
                 // Mark as no longer in use so completion handler ignores late arrival.
                 __atomic_store_n(&pending->inuse, false, memory_order_release);
+                if (pending->queue) {
+                    pending->queue->slotavailwq.wakeone();
+                }
                 return -1;
             }
 
@@ -480,6 +484,9 @@ namespace NDev {
 
         int status = __atomic_load_n(&pending->status, memory_order_acquire);
         __atomic_store_n(&pending->inuse, false, memory_order_release);
+        if (pending->queue) {
+            pending->queue->slotavailwq.wakeone();
+        }
         return status ? -1 : 0;
     }
 
@@ -507,6 +514,9 @@ namespace NDev {
 
         // Release this slot.
         __atomic_store_n(&pending->inuse, false, memory_order_release);
+        if (pending->queue) {
+            pending->queue->slotavailwq.wakeone();
+        }
     }
 
     static void queuecompletion(struct nvmepending *pending) {
@@ -617,20 +627,24 @@ advancecq:
     int NVMEDriver::iorequest(struct nvmectrl *ctrl, uint16_t qid, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size) {
         struct nvmequeue *sq = &ctrl->iosq[qid];
 
-        // Allocate a pending slot first.
+        // Allocate a pending slot first (blocking: sleep until available).
         uint16_t cid;
         struct nvmepending *pending;
 
-        int retries = 0;
         while (allocpending(ctrl, qid, &cid, &pending) != 0) {
-            if (retries++ > 100) {
-                NUtil::printf("[dev/nvme]: No pending slots available.\n");
-                return -1;
+            sq->slotavailwq.waitinglock.acquire();
+            if (allocpending(ctrl, qid, &cid, &pending) == 0) {
+                sq->slotavailwq.waitinglock.release();
+                break;
             }
+            sq->slotavailwq.preparewait();
+            sq->slotavailwq.waitinglock.release();
             NSched::yield();
+            sq->slotavailwq.waitinglock.acquire();
+            sq->slotavailwq.finishwait(true);
+            sq->slotavailwq.waitinglock.release();
         }
 
-        int queueretries = 0;
 retry:
         // Lock the submission queue for the submission phase.
         sq->qlock.acquire();
@@ -643,13 +657,17 @@ retry:
         if (nexttail == sqhead) {
             sq->qlock.release();
 
-            // Keep the same pending slot, just retry submission.
-            if (queueretries++ > 1000) {
-                NUtil::printf("[dev/nvme]: Queue full after 1000 retries.\n");
-                __atomic_store_n(&pending->inuse, false, memory_order_release);
-                return -1;
+            // Queue full: sleep until a completion frees space.
+            sq->slotavailwq.waitinglock.acquire();
+            sqhead = __atomic_load_n(&sq->head, memory_order_acquire);
+            if (nexttail == sqhead) {
+                sq->slotavailwq.preparewait();
+                sq->slotavailwq.waitinglock.release();
+                NSched::yield();
+                sq->slotavailwq.waitinglock.acquire();
+                sq->slotavailwq.finishwait(true);
             }
-            NSched::yield();
+            sq->slotavailwq.waitinglock.release();
             goto retry;
         }
 
@@ -669,6 +687,7 @@ retry:
         if (setupprps(cmd, buffer, size) != 0) {
             sq->qlock.release();
             __atomic_store_n(&pending->inuse, false, memory_order_release);
+            sq->slotavailwq.wakeone();
             return -1;
         }
 
@@ -705,20 +724,14 @@ retry:
     int NVMEDriver::iorequest_async(struct nvmectrl *ctrl, uint16_t qid, uint8_t opcode, uint32_t nsid, uint64_t lba, uint16_t sectors, void *buffer, size_t size, struct nvmepending **pending, struct NDev::bioreq *bio) {
         struct nvmequeue *sq = &ctrl->iosq[qid];
 
-        // Allocate a pending slot first.
+        // Allocate a pending slot (non-blocking: return immediately if none available).
         uint16_t cid;
         struct nvmepending *localpending;
 
-        int retries = 0;
-        while (allocpending(ctrl, qid, &cid, &localpending) != 0) {
-            if (retries++ > 100) {
-                NUtil::printf("[dev/nvme]: No pending slots available.\n");
-                return -1;
-            }
-            NSched::yield();
+        if (allocpending(ctrl, qid, &cid, &localpending) != 0) {
+            return -EBUSY; // Non-blocking: caller retries.
         }
 
-        int queueretries = 0;
 retry:
         // Lock the submission queue for the submission phase.
         sq->qlock.acquire();
@@ -730,14 +743,10 @@ retry:
         if (nexttail == sqhead) {
             sq->qlock.release();
 
-            // Keep the same pending slot, just retry submission.
-            if (queueretries++ > 1000) {
-                NUtil::printf("[dev/nvme]: Queue full after 1000 retries.\n");
-                __atomic_store_n(&localpending->inuse, false, memory_order_release);
-                return -1;
-            }
-            NSched::yield();
-            goto retry;
+            // Queue full: return -EBUSY for async callers to avoid deadlock.
+            __atomic_store_n(&localpending->inuse, false, memory_order_release);
+            sq->slotavailwq.wakeone();
+            return -EBUSY;
         }
 
         struct nvmesqe *cmd = &((struct nvmesqe *)sq->entries)[tail];
@@ -756,6 +765,7 @@ retry:
         if (setupprps(cmd, buffer, size) != 0) {
             sq->qlock.release();
             __atomic_store_n(&localpending->inuse, false, memory_order_release);
+            sq->slotavailwq.wakeone();
             return -1;
         }
 
@@ -807,6 +817,9 @@ retry:
                 for (size_t i = 0; i < count; i++) {
                     if (!done[i]) {
                         __atomic_store_n(&pendings[i]->inuse, false, memory_order_release);
+                        if (pendings[i]->queue) {
+                            pendings[i]->queue->slotavailwq.wakeone();
+                        }
                     }
                 }
                 delete[] done;
@@ -825,6 +838,9 @@ retry:
 
                     int status = __atomic_load_n(&pendings[i]->status, memory_order_acquire);
                     __atomic_store_n(&pendings[i]->inuse, false, memory_order_release);
+                    if (pendings[i]->queue) {
+                        pendings[i]->queue->slotavailwq.wakeone();
+                    }
                     if (status != 0 && firsterror == 0) {
                         firsterror = -EIO;
                     }

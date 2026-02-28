@@ -12,7 +12,7 @@
 namespace NDev {
 
     int waitio(struct ahcipending *pending);
-    int allocslot(struct ahcictrl *ctrl, struct ahciport *port, int *outslot, struct ahcipending **outpending);
+    int allocslot(struct ahcictrl *ctrl, struct ahciport *port, int *outslot, struct ahcipending **outpending, bool blocking);
     void issuecommand(struct ahcictrl *ctrl, struct ahciport *port, int slot, struct ahcipending *pending);
 
     static int setupatapicommand(struct ahcictrl *ctrl, struct ahciport *port, int slot, struct ahcipending *pending, const uint8_t *cdb, size_t cdblen, void *buf, size_t size, bool iswrite) {
@@ -82,6 +82,7 @@ namespace NDev {
             if (remaining > 0) {
                 NUtil::printf("[dev/ata]: ATAPI buffer too fragmented for PRDT (need more than %lu entries).\n", (unsigned long)PRDTMAX);
                 __atomic_store_n(&pending->inuse, false, memory_order_release);
+                port->slotavailwq.wakeone();
                 return -EINVAL;
             }
 
@@ -98,7 +99,7 @@ namespace NDev {
         int slot = -1;
         struct ahcipending *pending = NULL;
 
-        int res = allocslot(ctrl, port, &slot, &pending);
+        int res = allocslot(ctrl, port, &slot, &pending, true); // Sync: block until a slot is available.
         if (res < 0) {
             return res;
         }
@@ -125,7 +126,7 @@ namespace NDev {
         int slot = -1;
         struct ahcipending *pending = NULL;
 
-        int res = allocslot(ctrl, port, &slot, &pending);
+        int res = allocslot(ctrl, port, &slot, &pending, false); // Async: never block; caller retries.
         if (res < 0) {
             return res;
         }

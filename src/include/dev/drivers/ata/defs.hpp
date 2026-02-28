@@ -239,6 +239,7 @@ namespace NDev {
         uint32_t sectorsize;
 
         NArch::IRQSpinlock portlock;
+        NSched::WaitQueue slotavailwq; // Signalled when a command slot becomes free.
 
         struct ahcipending pendings[MAXSLOTS]; // One pending slot per command slot.
 

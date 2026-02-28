@@ -155,9 +155,16 @@ namespace NArch {
 
         extern "C" void isr_handle(uint64_t vec, struct CPU::context *ctx) {
             struct isr *isr = &CPU::get()->isrtable[vec];
+            bool oldininterrupt = CPU::get()->ininterrupt; // Save for nesting.
             CPU::get()->intstatus = false;
             CPU::get()->ininterrupt = true;
             CPU::get()->handlingvec = vec;
+
+            NSched::Thread *pendmig = CPU::get()->pendingmigrate;
+            if (pendmig) {
+                CPU::get()->pendingmigrate = NULL;
+                pendmig->enablemigrate();
+            }
 
             if (NArch::CPU::get()->intcntr == __SIZE_MAX__) {
                 NArch::CPU::get()->intcntr = 0; // Handle wraparound. We do not care about intcntr for statistics purposes, only for ratelimiting.
@@ -170,7 +177,6 @@ namespace NArch {
             }
 
             if (isr->func != NULL) { // If this ISR has been allocated.
-
                 if (isr->eoi) { // Should this ISR trigger an EOI?
                     APIC::eoi();
                 }
@@ -183,7 +189,7 @@ namespace NArch {
                 NSched::signal_checkpending(ctx, NSched::POSTINT); // Check for pending signals before returning to userspace.
             }
 
-            CPU::get()->ininterrupt = false;
+            CPU::get()->ininterrupt = oldininterrupt; // Restore previous nesting state.
             CPU::get()->handlingvec = 0;
             CPU::get()->intstatus = ctx->rflags & 0x200 ? true : false; // If we initially had interrupts enabled, re-enable them on return.
         }
@@ -219,9 +225,39 @@ namespace NArch {
                 uint64_t *pte = VMM::_resolvepte(space, addr);
 
                 if (!pte || !(*pte & VMM::PRESENT)) {
-                    // Check if this is a file-backed VMA that needs demand paging.
+                    // Check if this address belongs to a valid VMA that needs demand paging.
                     NMem::Virt::vmanode *vma = space->vmaspace->findcontaining(addr);
-                    if (vma && vma->used && vma->backingfile && !(vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
+                    if (vma && vma->used && !(vma->flags & NMem::Virt::VIRT_CHRSPECIAL)) {
+                        if (!vma->backingfile) { // No backing file. Probably anonymous.
+                            uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
+                            uint8_t vmaflags = vma->flags;
+
+                            void *newpage = PMM::alloc(PAGESIZE);
+                            if (!newpage) {
+                                space->lock.release();
+                                if (isuserspace) {
+                                    NSched::signalproc(NArch::CPU::get()->currthread->process, SIGKILL);
+                                    return;
+                                }
+                                panic("Out of memory during anonymous demand paging.\n");
+                            }
+
+                            NLib::memset(hhdmoff(newpage), 0, PAGESIZE);
+
+                            uint64_t mapflags = VMM::PRESENT | VMM::USER;
+                            if (vmaflags & NMem::Virt::VIRT_RW) {
+                                mapflags |= VMM::WRITEABLE;
+                            }
+                            if (vmaflags & NMem::Virt::VIRT_NX) {
+                                mapflags |= VMM::NOEXEC;
+                            }
+
+                            VMM::_mappage(space, pagestart, (uintptr_t)newpage, mapflags, false);
+                            space->lock.release();
+                            return;
+                        }
+
+                        // File-backed demand paging.
                         uintptr_t vmastart = vma->start;
                         uintptr_t vmaend = vma->end;
                         off_t vmafileoffset = vma->fileoffset;
@@ -317,10 +353,6 @@ namespace NArch {
                             }
                         }
 
-                        if (!oldmigrate) {
-                            currthread->enablemigrate();
-                        }
-
                         // Re-acquire space lock and verify VMA is still valid.
                         space->lock.acquire();
                         vma = space->vmaspace->findcontaining(addr);
@@ -329,6 +361,9 @@ namespace NArch {
                             // VMA was changed while we were sleeping, discard mapping.
                             space->lock.release();
                             NArch::CPU::get()->setint(oldint); // Restore interrupt state now.
+                            if (!oldmigrate) {
+                                currthread->enablemigrate();
+                            }
                             cachepage->pageunlock();
                             cachepage->unref();
                             backingfile->unref();
@@ -340,9 +375,12 @@ namespace NArch {
                         }
 
                         // Map the cached page into the process address space.
+                        bool privatecow = (vmaflags & NMem::Virt::VIRT_RW) && !(vmaflags & NMem::Virt::VIRT_SHARED);
                         uint64_t mapflags = VMM::PRESENT | VMM::USER;
-                        if (vmaflags & NMem::Virt::VIRT_RW) {
-                            mapflags |= VMM::WRITEABLE;
+                        if (privatecow) { // Mark private mappings as CoW (if writeable) so we get a copy.
+                            mapflags |= VMM::COW; // Read-only + CoW.
+                        } else if (vmaflags & NMem::Virt::VIRT_RW) {
+                            mapflags |= VMM::WRITEABLE; // Direct access.
                         }
                         if (vmaflags & NMem::Virt::VIRT_NX) {
                             mapflags |= VMM::NOEXEC;
@@ -359,15 +397,19 @@ namespace NArch {
 
                         cachepage->pageunlock();
                         cachepage->unref();
-                        backingfile->unref();
 
                         // Trigger readahead for sequential access patterns.
                         backingfile->readahead(fileoff + PAGESIZE);
+
+                        backingfile->unref();
 
                         VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, pagestart, pagestart + PAGESIZE);
 
                         // Now restore original interrupt state before returning.
                         NArch::CPU::get()->setint(oldint);
+                        if (!oldmigrate) {
+                            currthread->enablemigrate();
+                        }
                         return;
                     }
 
@@ -416,8 +458,21 @@ namespace NArch {
 
                     PMM::PageMeta *meta = PMM::phystometa((uintptr_t)oldpage);
                     assertarg(meta, "Failed to get page metadata for physical address %p during COW handling.\n", oldpage);
+
+                    if (meta->flags & PMM::PageMeta::PAGEMETA_PAGECACHE) { // Remove old mappings.
+                        NMem::CachePage *cachepage = (NMem::CachePage *)meta->cacheentry;
+                        if (cachepage) {
+                            uintptr_t pagestart = NLib::aligndown(addr, PAGESIZE);
+                            cachepage->removemapping(space, pagestart);
+                        }
+                    }
+
                     meta->unref(); // Unref old page, free if needed.
 
+                    // Disable migration before enabling interrupts for the TLB
+                    NSched::Thread *currthread = NArch::CPU::get()->currthread;
+                    bool oldmigrate = __atomic_load_n(&currthread->migratedisabled, memory_order_acquire);
+                    currthread->disablemigrate();
                     NArch::CPU::get()->ininterrupt = false;
                     asm volatile("" ::: "memory");
                     bool oldint = NArch::CPU::get()->setint(true);
@@ -425,6 +480,9 @@ namespace NArch {
                     VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
 
                     NArch::CPU::get()->setint(oldint);
+                    if (!oldmigrate) {
+                        currthread->enablemigrate();
+                    }
                     return;
                 } else {
                     space->lock.release();
@@ -441,9 +499,9 @@ namespace NArch {
                         ctx->rip = fixup;
                         return; // Return to fixed-up instruction.
                     }
-                }
 
-                space->lock.release();
+                    goto pffault;
+                }
 pffault:
                 NUtil::snprintf(errbuffer, sizeof(errbuffer), "CPU Exception: %s.\nPage fault at %p occurred due to %s %s in %p during %s as %s(%lu).\n", exceptions[isr->id & 0xffffffff], ctx->rip, ctx->err & (1 << 1) ? "Write" : "Read", ctx->err & (1 << 0) ? "Page protection violation" : "Non-present page violation", addr, ctx->err & (1 << 4) ? "Instruction Fetch" : "Normal Operation", ctx->err & (1 << 2) ? "User" : "Supervisor", NArch::CPU::get()->currthread ? NArch::CPU::get()->currthread->process->id : 0);
                 sig = SIGSEGV;
@@ -518,6 +576,7 @@ pffault:
 
             idt[2].ist = 1;  // NMI uses IST1.
             idt[8].ist = 2;  // Double Fault uses IST2.
+            idt[13].ist = 3; // #GP uses IST3.
         }
 
         void reload(void) {

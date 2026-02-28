@@ -338,7 +338,8 @@ namespace NSched {
             // Check if this thread can be migrated.
             if (!__atomic_load_n(&thread->migratedisabled, memory_order_acquire) &&
                 __atomic_load_n(&thread->locksheld, memory_order_acquire) == 0 &&
-                thread->gettargetmode() != Thread::target::STRICT) {
+                thread->gettargetmode() != Thread::target::STRICT &&
+                (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire) == Thread::state::SUSPENDED) {
 
                 cpu->runqueue._erase(candidate);
                 __atomic_store_n(&thread->inrunqueue, false, memory_order_release);
@@ -410,7 +411,8 @@ namespace NSched {
             // Safety checks for migration eligibility.
             if (!__atomic_load_n(&thread->migratedisabled, memory_order_acquire) &&
                 __atomic_load_n(&thread->locksheld, memory_order_acquire) == 0 &&
-                thread->gettargetmode() != Thread::target::STRICT) {
+                thread->gettargetmode() != Thread::target::STRICT &&
+                (enum Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire) == Thread::state::SUSPENDED) {
 
                 victim->runqueue._erase(candidate);
 
@@ -502,7 +504,7 @@ namespace NSched {
         return steal();
     }
 
-    static void switchthread(Thread *thread, bool needswap) {
+    static void switchthread(Thread *thread, bool needswap, Thread *prevformigration = NULL) {
         struct CPU::cpulocal *cpu = CPU::get();
 
         // Swap address space if switching to a different process.
@@ -533,7 +535,13 @@ namespace NSched {
         cpu->currthread = thread;
 
         cpu->ininterrupt = false;
-        cpu->preemptdisabled = false; // Well yeah, it would be, wouldn't it?
+        cpu->preemptdisabled = false;
+
+        asm volatile("cli");
+
+        cpu->pendingmigrate = prevformigration; // Mark as pending, defer to safe context.
+
+        __atomic_store_n(&cpu->inschedule, false, memory_order_release);
 
         // Perform the actual context switch.
         CPU::ctx_swap(&thread->ctx);
@@ -578,13 +586,7 @@ namespace NSched {
         // 2. Update load weight periodically.
         updateload(cpu);
 
-        // 3. Load balance every N quantums (e.g., every 4 = 40ms).
-        if ((cpu->schedintr % 4) == 0) {
-            loadbalance(cpu);
-        }
-        cpu->schedintr++;
-
-        // 4. Check process itimer.
+        // 3. Check process itimer.
         if (prev && prev->process && !prev->process->kernel) {
             checkitimer(prev->process, now);
         }
@@ -630,6 +632,12 @@ namespace NSched {
             cpu->runqueue.lock.release();
         }
 
+        // 7. Load balance every N quantums (e.g., every 4 = 40ms).
+        if ((cpu->schedintr % 4) == 0) {
+            loadbalance(cpu);
+        }
+        cpu->schedintr++;
+
         bool shouldqueuezombie = false;
         Thread *zombiethread = NULL;
 
@@ -668,10 +676,6 @@ namespace NSched {
         }
 #endif
 
-        if (prevformigration && prevformigration != next) {
-            prevformigration->enablemigrate(); // Safe to re-enable now.
-        }
-
         // 8. Handle migration re-enable.
         if (next->rescheduling) {
             __atomic_store_n(&next->rescheduling, false, memory_order_release);
@@ -695,8 +699,8 @@ namespace NSched {
             cpu->quantumdeadline = now + (TSC::hz / 1000) * QUANTUMMS;
             Timer::rearm();
 
-            __atomic_store_n(&cpu->inschedule, false, memory_order_release);
-            switchthread(next, needswap);
+            Thread *migprev = (prevformigration && prevformigration != next) ? prevformigration : NULL;
+            switchthread(next, needswap, migprev);
 
             // XXX: There are STILL niche cases where we can end up back here for no good reason. Typically while in the middle of a system call that blocks on a waitqueue.
 
@@ -808,11 +812,10 @@ namespace NSched {
 
         CPU::get()->schedstack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
-
-        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
+        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
 
-        // Allocate IST stacks for NMI and Double Fault handlers.
+        // Allocate IST stacks for NMI, Double Fault, and #GP handlers.
         CPU::get()->ist1stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
         assertarg(CPU::get()->ist1stack, "Failed to allocate IST1 (NMI) stack for CPU%lu.\n", CPU::get()->id);
         CPU::get()->ist1stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist1stack));
@@ -822,6 +825,11 @@ namespace NSched {
         assertarg(CPU::get()->ist2stack, "Failed to allocate IST2 (Double Fault) stack for CPU%lu.\n", CPU::get()->id);
         CPU::get()->ist2stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist2stack));
         CPU::get()->ist.ist2 = (uint64_t)CPU::get()->ist2stack + DEFAULTSTACKSIZE;
+
+        CPU::get()->ist3stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
+        assertarg(CPU::get()->ist3stack, "Failed to allocate IST3 (GP) stack for CPU%lu.\n", CPU::get()->id);
+        CPU::get()->ist3stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist3stack));
+        CPU::get()->ist.ist3 = (uint64_t)CPU::get()->ist3stack + DEFAULTSTACKSIZE;
 
         CPU::get()->currthread = idlethread;
 
@@ -844,10 +852,10 @@ namespace NSched {
 
         CPU::get()->schedstack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
         assertarg(CPU::get()->schedstack, "Failed to allocate scheduler stack for CPU%lu.\n", CPU::get()->id);
-        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
         CPU::get()->schedstack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->schedstack));
+        CPU::get()->schedstacktop = (uintptr_t)CPU::get()->schedstack + DEFAULTSTACKSIZE;
 
-        // Allocate IST stacks for NMI and Double Fault handlers.
+        // Allocate IST stacks for NMI, Double Fault, and #GP handlers.
         CPU::get()->ist1stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
         assertarg(CPU::get()->ist1stack, "Failed to allocate IST1 (NMI) stack for CPU%lu.\n", CPU::get()->id);
         CPU::get()->ist1stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist1stack));
@@ -857,6 +865,11 @@ namespace NSched {
         assertarg(CPU::get()->ist2stack, "Failed to allocate IST2 (Double Fault) stack for CPU%lu.\n", CPU::get()->id);
         CPU::get()->ist2stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist2stack));
         CPU::get()->ist.ist2 = (uint64_t)CPU::get()->ist2stack + DEFAULTSTACKSIZE;
+
+        CPU::get()->ist3stack = (uint8_t *)PMM::alloc(DEFAULTSTACKSIZE, PMM::FLAGS_NOTRACK);
+        assertarg(CPU::get()->ist3stack, "Failed to allocate IST3 (GP) stack for CPU%lu.\n", CPU::get()->id);
+        CPU::get()->ist3stack = (uint8_t *)hhdmoff((void *)((uintptr_t)CPU::get()->ist3stack));
+        CPU::get()->ist.ist3 = (uint64_t)CPU::get()->ist3stack + DEFAULTSTACKSIZE;
 
         CPU::get()->idlethread = idlethread;
         CPU::get()->currthread = idlethread;
@@ -902,7 +915,9 @@ namespace NSched {
             } else {
                 target = getidlest();
             }
-            if (!target) target = CPU::get();
+            if (!target) {
+                target = CPU::get();
+            }
         }
 
         // Normalise vruntime to target's minvruntime (lock-free read).
@@ -1065,7 +1080,9 @@ namespace NSched {
             Thread *thread = *it.get();
             it.next();
 
-            if (thread == current) continue;
+            if (thread == current) {
+                continue;
+            }
             toexit.push(thread);
         }
 
