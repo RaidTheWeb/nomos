@@ -555,7 +555,7 @@ namespace NSched {
         }
 
         ProcessGroup *newpgrp = NULL;
-        if (pgid != target->id) { // We join an existing process group if pgid != target's pid.
+        if ((size_t)pgid != target->id) { // We join an existing process group if pgid != target's pid.
             Process **pgleader = pidtable->find(pgid);
             if (!pgleader) { // No leader found.
                 SYSCALL_RET(-EPERM); // Process group doesn't exist.

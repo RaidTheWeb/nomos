@@ -5,12 +5,14 @@
 extern void (*__init_array[])();
 extern void (*__init_array_end[])();
 
-extern "C" void *__dso_handle = NULL;
-extern "C" int __cxa_atexit(void (*destructor)(void *), void *arg, void *dso) {
-    (void)destructor;
-    (void)arg;
-    (void)dso;
-    return 0;
+extern "C" {
+    __attribute__((visibility("hidden"))) void *__dso_handle = 0;
+    int __cxa_atexit(void (*destructor)(void *), void *arg, void *dso) {
+        (void)destructor;
+        (void)arg;
+        (void)dso;
+        return 0;
+    }
 }
 
 namespace NCxx {

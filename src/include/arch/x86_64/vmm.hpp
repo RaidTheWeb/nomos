@@ -112,24 +112,13 @@ namespace NArch {
             SHOOTDOWN_FULL      // Full TLB flush.
         };
 
-        // Global shootdown request structure.
-        struct shootdownreq {
-            volatile enum shootdowntype type;
-            volatile uintptr_t start;
-            volatile uintptr_t end;
-            volatile size_t generation;     // Incremented on each new request.
-            volatile size_t acks;           // Number of CPUs that have processed.
-            size_t targetcpus;              // Number of CPUs that must acknowledge.
-        };
-
-        extern NArch::IRQSpinlock shootdownlock;
-        extern struct shootdownreq shootdownreq;
-
         static const size_t SHOOTDOWN_RANGETHRESHOLD = 32; // Threshold for when we should use a full TLB flush instead of a range shootdown (in pages).
 
         // Perform a TLB shootdown across all CPUs.
-        // Must not be called with any IRQSpinlocks held! (Will assert against that case, but fair warning nonetheless).
         void doshootdown(enum shootdowntype type, uintptr_t start, uintptr_t end);
+
+        // Service any pending TLB shootdown request for the current CPU.
+        void servicelocalpending(void);
 
         struct pagetable {
             uint64_t entries[PAGESIZE / sizeof(uint64_t)]; // Define access to every entry within a page table (512 entries for 4096 byte pages).
@@ -156,20 +145,19 @@ namespace NArch {
         // (Unlocked) Resolve page table entry of a virtual address.
         uint64_t *_resolvepte(struct addrspace *space, uintptr_t virt);
 
-        // (Unlocked) Map a virtual address with an entry. If shootdown is false, the caller is responsible for doing TLB shootdown.
-        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool shootdown = true);
+        bool _mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, bool shootdown = false);
 
         bool _remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags);
 
-        // (Unlocked) Unmap a virtual address. If shootdown is false, the caller is responsible for doing TLB shootdown.
-        void _unmappage(struct addrspace *space, uintptr_t virt, bool shootdown = true);
+        // (Unlocked) Unmap a virtual address. The caller is responsible for doing TLB shootdown.
+        void _unmappage(struct addrspace *space, uintptr_t virt, bool shootdown = false);
 
-        bool _maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size, bool shootdown = true);
+        bool _maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size, bool shootdown = false);
 
         bool _remaprange(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags, size_t size);
 
-        // (Unlocked) Unmap a range of virtual addresses. If shootdown is false, the caller is responsible for doing TLB shootdown.
-        void _unmaprange(struct addrspace *space, uintptr_t virt, size_t size, bool shootdown = true);
+        // (Unlocked) Unmap a range of virtual addresses. The caller is responsible for doing TLB shootdown.
+        void _unmaprange(struct addrspace *space, uintptr_t virt, size_t size, bool shootdown = false);
 
 
         // Kernel space page table. This is essentially just a page table for the entire useful address space, including an identity map for the lower 4GB of the address space.
@@ -177,27 +165,24 @@ namespace NArch {
         extern struct addrspace kspace;
 
         // Resolve physical address of virtual address.
-        static uintptr_t virt2phys(struct addrspace *space, uintptr_t virt) {
+        static inline uintptr_t virt2phys(struct addrspace *space, uintptr_t virt) {
             NLib::ScopeIRQSpinlock guard(&space->lock);
             return _virt2phys(space, virt);
         }
 
         // Resolve page table entry of a virtual address.
-        static uint64_t *resolvepte(struct addrspace *space, uintptr_t virt) {
+        static inline uint64_t *resolvepte(struct addrspace *space, uintptr_t virt) {
             NLib::ScopeIRQSpinlock guard(&space->lock);
             return _resolvepte(space, virt);
         }
 
         // Map a virtual address with an entry.
-        static bool mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
-            bool wasPresent;
-            {
-                NLib::ScopeIRQSpinlock guard(&space->lock);
-                uint64_t *pte = _resolvepte(space, virt);
-                wasPresent = pte && (*pte & PRESENT);
-                if (!_mappage(space, virt, phys, flags, false)) {
-                    return false;
-                }
+        static inline bool mappage(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags) {
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+            uint64_t *pte = _resolvepte(space, virt);
+            bool wasPresent = pte && (*pte & PRESENT);
+            if (!_mappage(space, virt, phys, flags, false)) {
+                return false;
             }
             if (wasPresent) {
                 doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
@@ -205,57 +190,47 @@ namespace NArch {
             return true;
         }
 
-        static bool remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags) {
-            {
-                NLib::ScopeIRQSpinlock guard(&space->lock);
-                if (!_remappage(space, virt, newphys, flags)) {
-                    return false;
-                }
+        static inline bool remappage(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags) {
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+            if (!_remappage(space, virt, newphys, flags)) {
+                return false;
             }
             doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
             return true;
         }
 
         // Unmap a virtual address.
-        static void unmappage(struct addrspace *space, uintptr_t virt) {
-            {
-                NLib::ScopeIRQSpinlock guard(&space->lock);
-                _unmappage(space, virt, false);
-            }
+        static inline void unmappage(struct addrspace *space, uintptr_t virt) {
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+            _unmappage(space, virt, false);
             doshootdown(SHOOTDOWN_SINGLE, virt, virt + PAGESIZE);
         }
 
-        static bool maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
+        static inline bool maprange(struct addrspace *space, uintptr_t virt, uintptr_t phys, uint64_t flags, size_t size) {
             size_t alignedsize = ((size + PAGESIZE - 1) / PAGESIZE) * PAGESIZE;
-            {
-                NLib::ScopeIRQSpinlock guard(&space->lock);
-                if (!_maprange(space, virt, phys, flags, size, false)) {
-                    return false;
-                }
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+            if (!_maprange(space, virt, phys, flags, size, false)) {
+                return false;
             }
             // Always do shootdown for maprange since we may have remapped existing pages.
             doshootdown(SHOOTDOWN_RANGE, virt, virt + alignedsize);
             return true;
         }
 
-        static bool remaprange(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags, size_t size) {
+        static inline bool remaprange(struct addrspace *space, uintptr_t virt, uintptr_t newphys, uint64_t flags, size_t size) {
             size_t alignedsize = ((size + PAGESIZE - 1) / PAGESIZE) * PAGESIZE;
-            {
-                NLib::ScopeIRQSpinlock guard(&space->lock);
-                if (!_remaprange(space, virt, newphys, flags, size)) {
-                    return false;
-                }
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+            if (!_remaprange(space, virt, newphys, flags, size)) {
+                return false;
             }
             doshootdown(SHOOTDOWN_RANGE, virt, virt + alignedsize);
             return true;
         }
 
-        static void unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
+        static inline void unmaprange(struct addrspace *space, uintptr_t virt, size_t size) {
             size_t alignedsize = ((size + PAGESIZE - 1) / PAGESIZE) * PAGESIZE;
-            {
-                NLib::ScopeIRQSpinlock guard(&space->lock);
-                _unmaprange(space, virt, size, false);
-            }
+            NLib::ScopeIRQSpinlock guard(&space->lock);
+            _unmaprange(space, virt, size, false);
             doshootdown(SHOOTDOWN_RANGE, virt, virt + alignedsize);
         }
 

@@ -22,12 +22,12 @@ namespace NSys {
             lock.release();
         }
 
-        static void triggerwork(struct NSched::work *w) {
+        /*static void triggerwork(struct NSched::work *w) {
             OneshotEvent *udata = (OneshotEvent *)w->udata;
             if (udata) {
                 udata->trigger();
             }
-        }
+        }*/
 
 
         timerhandle_t create(void (*callback)(void *), void *arg, uint64_t duration) {

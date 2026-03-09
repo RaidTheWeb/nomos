@@ -127,7 +127,7 @@ namespace NDev {
             uint64_t lastlba = 0;
 
             BlockDevice(uint64_t id, DevDriver *driver) : Device(id, driver) { }
-            ~BlockDevice();
+            virtual ~BlockDevice();
 
             // Block-wise read/write methods.
 

@@ -154,6 +154,7 @@ namespace NDev {
             virtual int mmap(uint64_t dev, void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
                 (void)dev;
                 (void)addr;
+                (void)count;
                 (void)offset;
                 (void)flags;
                 (void)fdflags;
@@ -263,7 +264,7 @@ namespace NDev {
 
     // Call this function at the bottom of driver files to register them.
 #define REGDRIVER(driver, driverinfo) \
-    extern "C" __attribute__((section(".drivers"), used)) struct NDev::regentry driver##_entry = { \
+    __attribute__((section(".drivers"), used)) struct NDev::regentry driver##_entry = { \
         .magic = MAGIC, \
         .create = []() -> NDev::Driver *{ return new driver(); }, \
         .info = driverinfo \

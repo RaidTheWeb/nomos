@@ -516,7 +516,6 @@ namespace NFS {
             uint8_t *dest = (uint8_t *)buf;
 
             while (count > 0) {
-                off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
                 size_t offwithinpage = offset % NArch::PAGESIZE;
                 size_t toread = NArch::PAGESIZE - offwithinpage;
                 if (toread > count) {
@@ -626,7 +625,6 @@ copydata:
             size_t pagessincethrottlecheck = 0;
 
             while (count > 0) {
-                off_t pageoffset = (offset / NArch::PAGESIZE) * NArch::PAGESIZE;
                 size_t offwithinpage = offset % NArch::PAGESIZE;
                 size_t towrite = NArch::PAGESIZE - offwithinpage;
                 if (towrite > count) {
@@ -932,7 +930,7 @@ dowrite:
             {
                 NLib::ScopeSpinlock guard(&this->mountlock);
 
-                bool worked = this->mounts.remove([](struct mntpoint mnt, void *udata) {
+                this->mounts.remove([](struct mntpoint mnt, void *udata) {
                     struct umount_ud *u = (struct umount_ud *)udata;
                     if (!NLib::strcmp(mnt.path, u->match)) {
                         u->fs = mnt.fs;
@@ -1899,6 +1897,7 @@ dowrite:
 
 
         int VFS::identifyfs(const char *src) {
+            (void)src;
             // XXX: Implement filesystem auto-detection.
             return -ENODEV;
         }

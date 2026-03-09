@@ -196,7 +196,7 @@ namespace NSched {
                     if (NMem::UserCopy::copyfrom(&ktimeout, timeout, sizeof(struct NSys::Clock::timespec)) < 0) {
                         SYSCALL_RET(-EFAULT);
                     }
-                    if (ktimeout.tv_sec < 0 || ktimeout.tv_nsec < 0 || ktimeout.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
+                    if (ktimeout.tv_sec < 0 || ktimeout.tv_nsec < 0 || (uint64_t)ktimeout.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
                         SYSCALL_RET(-EINVAL);
                     }
                     // Convert to milliseconds, rounding up.

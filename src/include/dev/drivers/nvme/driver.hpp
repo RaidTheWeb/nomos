@@ -45,7 +45,7 @@ namespace NDev {
                 this->blksize = ns->blksize;
             }
 
-            ~NVMEBlockDevice();
+            ~NVMEBlockDevice() = default;
 
             ssize_t readblock(uint64_t lba, void *buffer) override {
                 size_t blksize = ns->blksize;

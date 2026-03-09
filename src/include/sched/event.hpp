@@ -153,6 +153,10 @@ namespace NSched {
         break; \
     } \
     NSched::timeoutstate *__tstate = new NSched::timeoutstate(wq); \
+    if (__tstate == NULL) { \
+        (result) = -ENOMEM; \
+        break; \
+    } \
     NSys::Timer::timerlock(); \
     __tstate->timerhandle = NSys::Timer::create(NSched::timeoutstate::callback, __tstate, (timeout_ms)); \
     NSys::Timer::timerunlock(); \
@@ -196,6 +200,10 @@ namespace NSched {
         break; \
     } \
     NSched::timeoutstate *__tstate = new NSched::timeoutstate(wq); \
+    if (__tstate == NULL) { \
+        (result) = -ENOMEM; \
+        break; \
+    } \
     NSys::Timer::timerlock(); \
     __tstate->timerhandle = NSys::Timer::create(NSched::timeoutstate::callback, __tstate, (timeout_ms)); \
     NSys::Timer::timerunlock(); \

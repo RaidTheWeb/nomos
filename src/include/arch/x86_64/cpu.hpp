@@ -12,6 +12,11 @@
 
 
 namespace NArch {
+
+    namespace VMM {
+        enum shootdowntype : uint8_t;
+    }
+
     namespace CPU {
 
         // Interrupt Stack Table, 64-bit "TSS".
@@ -126,6 +131,16 @@ namespace NArch {
             size_t irqstackdepth = 0;
 
             volatile size_t tlbgeneration = 0; // Last processed TLB generation for this CPU.
+
+            struct {
+                volatile enum VMM::shootdowntype type;
+                volatile uintptr_t start;
+                volatile uintptr_t end;
+                volatile size_t generation; // Set with release semantics by initiator.
+                volatile size_t *acks; // Points to initiator's ack counter.
+            } shootdownslot = { }; // Shootdown slot for a request.
+
+            volatile bool tlbshootdownpending = false; // Do we have any work that we haven't done yet (we're occupied or whatever).
 
             volatile uint64_t loadweight = 0; // (oldweight * 3 + rqsize * 1024) / 4
             NSched::RBTree runqueue; // Per-CPU queue of threads within a Red-Black tree.

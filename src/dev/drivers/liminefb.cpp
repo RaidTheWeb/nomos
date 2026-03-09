@@ -86,12 +86,11 @@ namespace NDev {
                     struct VFS::stat st = (struct VFS::stat) {
                         .st_mode = 0666 | VFS::S_IFCHR,
                         .st_rdev = DEVFS::makedev(MAJOR, i),
-                        .st_size = fb->pitch * fb->height
+                        .st_size = (off_t)(fb->pitch * fb->height)
                     };
                     st.st_blksize = 4096;
                     st.st_blocks = (st.st_size + 511) / 512;
 
-                    VFS::INode *devnode;
                     char path[512];
                     NUtil::snprintf(path, sizeof(path), "fb%lu", i);
                     DEVFS::registerdevfile(path, st);
@@ -126,13 +125,14 @@ namespace NDev {
             }
 
             ssize_t read(uint64_t dev, void *buf, size_t count, off_t offset, int fdflags) {
+                (void)fdflags;
                 uint32_t minor = DEVFS::minor(dev);
                 struct limine_framebuffer *fb = getfb(minor);
                 if (!fb) {
                     return -ENODEV;
                 }
 
-                if (offset >= (fb->pitch * fb->height)) {
+                if (offset < 0 || (uint64_t)offset >= (fb->pitch * fb->height)) {
                     return 0;
                 }
 
@@ -146,13 +146,14 @@ namespace NDev {
             }
 
             ssize_t write(uint64_t dev, const void *buf, size_t count, off_t offset, int fdflags) {
+                (void)fdflags;
                 uint32_t minor = DEVFS::minor(dev);
                 struct limine_framebuffer *fb = getfb(minor);
                 if (!fb) {
                     return -ENODEV;
                 }
 
-                if (offset >= (fb->pitch * fb->height)) {
+                if (offset < 0 || (uint64_t)offset >= (fb->pitch * fb->height)) {
                     return 0;
                 }
 
@@ -166,6 +167,7 @@ namespace NDev {
             }
 
             int mmap(uint64_t dev, void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
+                (void)fdflags;
                 uint32_t minor = DEVFS::minor(dev);
                 struct limine_framebuffer *fb = getfb(minor);
                 if (!fb) {
@@ -192,7 +194,7 @@ namespace NDev {
 
 
                 NSched::Process *proc = NArch::CPU::get()->currthread->process;
-                if (!NArch::VMM::_maprange(proc->addrspace, (uintptr_t)addr, phys, vmmflags, tomap)) {
+                if (!NArch::VMM::_maprange(proc->addrspace, (uintptr_t)addr, phys, vmmflags, tomap, false)) {
                     return -EFAULT;
                 }
 #endif

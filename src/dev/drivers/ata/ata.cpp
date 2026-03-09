@@ -102,6 +102,7 @@ namespace NDev {
     }
 
     static int setupcommand(struct ahcictrl *ctrl, struct ahciport *port, int slot, struct ahcipending *pending, uint8_t cmd, uint64_t lba, uint16_t count, void *buf, size_t size, bool iswrite) {
+        (void)ctrl;
         struct ahcicmdhdr *hdr = &port->cmdlist[slot];
         NLib::memset(hdr, 0, sizeof(struct ahcicmdhdr));
 

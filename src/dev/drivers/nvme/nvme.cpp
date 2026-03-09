@@ -101,7 +101,9 @@ namespace NDev {
 
                 // Disable controller.
                 ctrl->cc.en = 0;
-                write32(&ctrl->pcibar, REGCC, *((uint32_t *)&ctrl->cc));
+                uint32_t ccval;
+                NLib::memcpy(&ccval, &ctrl->cc, sizeof(ccval));
+                write32(&ctrl->pcibar, REGCC, ccval);
 
                 // Complete all pending I/Os with error.
                 if (ctrl->pending) {
@@ -732,7 +734,6 @@ retry:
             return -EBUSY; // Non-blocking: caller retries.
         }
 
-retry:
         // Lock the submission queue for the submission phase.
         sq->qlock.acquire();
         uint32_t tail = sq->tail;
@@ -768,8 +769,6 @@ retry:
             sq->slotavailwq.wakeone();
             return -1;
         }
-
-        uintptr_t prplistaddr = (size > 2 * PAGESIZE) ? cmd->prp2 : 0;
 
         localpending->bio = bio;
 
@@ -1050,7 +1049,9 @@ retry:
         // Configure admin queue attributes.
         ctrl->aqa.asqs = QUEUESIZE - 1;
         ctrl->aqa.acqs = QUEUESIZE - 1;
-        write32(&ctrl->pcibar, REGAQA, *((uint32_t *)&ctrl->aqa));
+        uint32_t aqaval;
+        NLib::memcpy(&aqaval, &ctrl->aqa, sizeof(aqaval));
+        write32(&ctrl->pcibar, REGAQA, aqaval);
 
         // Set admin queue base addresses.
         write64(&ctrl->pcibar, REGASQ, ctrl->asq.dmaaddr);
@@ -1064,10 +1065,14 @@ retry:
         ctrl->cc.shn = 0;
         ctrl->cc.iosqes = 6; // 64 bytes per SQE.
         ctrl->cc.iocqes = 4; // 16 bytes per CQE.
-        write32(&ctrl->pcibar, REGCC, *((uint32_t *)&ctrl->cc));
+        uint32_t ccval1;
+        NLib::memcpy(&ccval1, &ctrl->cc, sizeof(ccval1));
+        write32(&ctrl->pcibar, REGCC, ccval1);
 
         ctrl->cc.en = 1;
-        write32(&ctrl->pcibar, REGCC, *((uint32_t *)&ctrl->cc));
+        uint32_t ccval2;
+        NLib::memcpy(&ccval2, &ctrl->cc, sizeof(ccval2));
+        write32(&ctrl->pcibar, REGCC, ccval2);
 
         // Wait for controller ready.
         uint64_t timeout = ctrl->caps.to * 500000;

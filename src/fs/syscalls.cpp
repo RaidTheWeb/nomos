@@ -188,6 +188,7 @@ namespace NFS {
 
         extern "C" uint64_t sys_dup(int fd, int flags) {
             SYSCALL_LOG("sys_dup(%d, %d).\n", fd, flags);
+            (void)flags;
 
             NSched::Process *proc = NArch::CPU::get()->currthread->process;
 
@@ -1427,7 +1428,6 @@ namespace NFS {
 
                     // Apply signal mask for the duration of the poll (per-thread).
                     NSched::Thread *thread = NArch::CPU::get()->currthread;
-                    NSched::Process *proc = thread->process;
                     NLib::sigset_t oldmask = __atomic_load_n(&thread->blocked, memory_order_acquire);
                     __atomic_store_n(&thread->blocked, ksigmask, memory_order_release);
 
@@ -1481,7 +1481,6 @@ namespace NFS {
 
             // Apply signal mask for the duration of the poll (per-thread).
             NSched::Thread *thread = NArch::CPU::get()->currthread;
-            NSched::Process *proc = thread->process;
             NLib::sigset_t oldmask = __atomic_load_n(&thread->blocked, memory_order_acquire);
             __atomic_store_n(&thread->blocked, ksigmask, memory_order_release);
 
@@ -1651,10 +1650,10 @@ namespace NFS {
 
             // Setup basic attributes, specific filesystems fill in the rest.
             struct stat attr {
-                .st_mode = mode,
-                .st_uid = proc->euid,
-                .st_gid = proc->egid,
-                .st_rdev = dev
+                .st_mode = (uint32_t)mode,
+                .st_uid = (uint32_t)proc->euid,
+                .st_gid = (uint32_t)proc->egid,
+                .st_rdev = (uint64_t)(dev)
             };
 
             INode *procroot = proc->root;
@@ -1766,7 +1765,7 @@ namespace NFS {
             struct stat st = targetnode->getattr();
             if (uid == 0) {
                 ok = true; // Root can always change mode.
-            } else if (uid == st.st_uid) {
+            } else if ((uint32_t)uid == st.st_uid) {
                 ok = true; // Owner can change mode.
             }
 
@@ -1777,6 +1776,11 @@ namespace NFS {
 
             struct stat newattr = st;
             newattr.st_mode = (st.st_mode & S_IFMT) | (mode & ~S_IFMT);
+
+            if (uid != 0 && (uint32_t)gid != st.st_gid) {
+                newattr.st_mode &= ~S_ISGID;
+            }
+
             targetnode->setattr(newattr);
             targetnode->unref();
             SYSCALL_RET(0);
@@ -1867,15 +1871,21 @@ namespace NFS {
             struct stat st = targetnode->getattr();
             if (euid == 0) {
                 ok = true; // Root can always change owner.
-            } else if (euid == st.st_uid) {
-                // Non-root can change group to one of their groups.
-                if (gid == -1 || gid == st.st_gid) {
+            } else if ((uint32_t)euid == st.st_uid) {
+                // POSIX: non-root cannot change uid to a different value.
+                if (uid != -1 && (uint32_t)uid != st.st_uid) {
+                    targetnode->unref();
+                    SYSCALL_RET(-EPERM);
+                }
+
+                // POSIX: non-root owner can change group to current group or their EGID.
+                if (gid == -1 || (uint32_t)gid == st.st_gid || (uint32_t)gid == (uint32_t)egid) {
                     ok = true;
                 }
             }
             if (!ok) {
                 targetnode->unref();
-                SYSCALL_RET(-EACCES);
+                SYSCALL_RET(-EPERM);
             }
 
             struct stat newattr = st;
@@ -1885,6 +1895,12 @@ namespace NFS {
             if (gid != -1) {
                 newattr.st_gid = gid;
             }
+
+            // Clear setuid/setgid bits if we're changing ownership and we're not root.
+            if (euid != 0 && S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+                newattr.st_mode &= ~(S_ISUID | S_ISGID);
+            }
+
             targetnode->setattr(newattr);
             targetnode->unref();
             SYSCALL_RET(0);
@@ -2297,9 +2313,9 @@ namespace NFS {
 
             // Setup symlink attributes.
             struct stat attr {
-                .st_mode = static_cast<uint32_t>(S_IFLNK | 0777), // Symlinks typically have 0777 permissions (actual permission determined by target).
-                .st_uid = peuid,
-                .st_gid = pegid
+                .st_mode = (uint32_t)(S_IFLNK | 0777), // Symlinks typically have 0777 permissions (actual permission determined by target).
+                .st_uid = (uint32_t)peuid,
+                .st_gid = (uint32_t)pegid
             };
 
             // Create the symlink node.

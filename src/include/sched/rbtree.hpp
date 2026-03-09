@@ -44,9 +44,12 @@ namespace NSched {
 
             template <typename T>
             static T *getentry(struct node *node) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
                 return reinterpret_cast<T *>(
                     reinterpret_cast<uint8_t *>(node) - offsetof(T, node)
                 );
+#pragma GCC diagnostic pop
             }
 
             NArch::IRQSpinlock lock;

@@ -27,10 +27,12 @@ namespace NArch {
             void acquire(void);
             bool trylock(void);
             void release(void);
+            bool islocked(void) const {
+                return this->locked != 0;
+            }
     };
 
     // Special wrapper class for spinlocks that blocks and disables interrupts while holding the lock. NOTE: Do NOT use in thread-thread synchronisation cases, only for thread-interrupt synchronisation cases.
-    // This should ONLY be used for *very* short critical sections, otherwise, we risk deadlocking on TLB shootdowns and other interrupt-context operations.
     class IRQSpinlock {
 
         private:

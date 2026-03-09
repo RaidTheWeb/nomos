@@ -238,12 +238,6 @@ namespace NFS {
                 // Write a group descriptor back to disk.
                 int writegroupdesc(uint32_t group);
 
-                // Count free blocks in a bitmap.
-                uint32_t countfreeblocks(uint32_t group, const void *bitmap);
-
-                // Count free inodes in a bitmap.
-                uint32_t countfreeinodes(uint32_t group, const void *bitmap);
-
                 // Set padding bits in inode bitmap (bits beyond inodespergroup).
                 void setinodebitmappadding(void *bitmap);
 
@@ -287,10 +281,10 @@ namespace NFS {
                 uint32_t dirblockchecksum(uint32_t ino, uint32_t gen, void *block, size_t len);
 
                 // Compute block bitmap checksum.
-                uint32_t blockbitmapchecksum(uint32_t group, const void *bitmap);
+                uint32_t blockbitmapchecksum(const void *bitmap);
 
                 // Compute inode bitmap checksum.
-                uint32_t inodebitmapchecksum(uint32_t group, const void *bitmap);
+                uint32_t inodebitmapchecksum(const void *bitmap);
 
                 // Compute extent block checksum.
                 uint32_t extentblockchecksum(uint32_t ino, uint32_t gen, const void *block, size_t len);

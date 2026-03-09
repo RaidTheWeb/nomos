@@ -544,8 +544,6 @@ namespace NFS {
         }
 
         int RAMFileSystem::unlink(VFS::INode *node, VFS::INode *parent) {
-            uint64_t ino = node->getattr().st_ino;
-
             // Remove from parent.
             bool worked = parent->remove(node->getname());
             parent->unref();

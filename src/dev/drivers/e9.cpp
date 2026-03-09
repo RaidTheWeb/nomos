@@ -58,7 +58,8 @@ namespace NDev {
     static struct reginfo info = {
         .name = "e9",
         .type = reginfo::GENERIC,
-        .stage = reginfo::STAGE1
+        .stage = reginfo::STAGE1,
+        .match = { }
     };
     REGDRIVER(E9Driver, &info);
 }

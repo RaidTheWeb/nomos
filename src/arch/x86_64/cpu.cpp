@@ -100,6 +100,7 @@ namespace NArch {
 
             return 0;
 #else
+            (void)text;
             return -ENOSYS;
 #endif
         }

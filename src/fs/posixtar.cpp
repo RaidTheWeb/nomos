@@ -165,7 +165,7 @@ namespace NFS {
                         size_t len;
                         if (haslonglink) {
                             linktarget = longlink;
-                            len = NLib::strlen(longlink);
+                            len = NLib::strnlen(longlink, sizeof(longlink) - 1);
                             haslonglink = false;
                         } else {
                             linktarget = lname;

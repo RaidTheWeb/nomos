@@ -666,7 +666,7 @@ namespace NDev {
                 return 0;
             }
 
-            bool wasflushed = this->pendingflush;
+            //bool wasflushed = this->pendingflush;
             this->pendingflush = false;
 
             size_t tocopy = this->linebuffer.size();
@@ -686,7 +686,7 @@ namespace NDev {
                 }
 
                 if (kbufidx > 0) {
-                    size_t ret = NMem::UserCopy::copyto(buf + i, (const char *)kbuf, kbufidx);
+                    ssize_t ret = NMem::UserCopy::copyto(buf + i, (const char *)kbuf, kbufidx);
                     if (ret < 0) {
                         // Failed to copy to user.
                         this->linelock.release();
@@ -737,7 +737,7 @@ namespace NDev {
                 }
 
                 if (kbufidx > 0) {
-                    size_t ret = NMem::UserCopy::copyto(buf + i, (const char *)kbuf, kbufidx);
+                    ssize_t ret = NMem::UserCopy::copyto(buf + i, (const char *)kbuf, kbufidx);
                     if (ret < 0) {
                         // Failed to copy to user.
                         this->inlock.release();

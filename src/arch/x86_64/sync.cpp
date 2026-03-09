@@ -1,6 +1,7 @@
 #include <arch/x86_64/cpu.hpp>
 #include <arch/x86_64/smp.hpp>
 #include <arch/x86_64/sync.hpp>
+#include <arch/x86_64/vmm.hpp>
 #include <lib/assert.hpp>
 #include <mm/slab.hpp>
 
@@ -64,7 +65,28 @@ namespace NArch {
         } else {
             asm volatile("cli");
         }
-        this->lock.acquire(); // Raw acquire internal lock.
+        while (true) { // Exponential backoff that services pending shootdowns while waiting (*hopefully* this can avoid tlb shootdown deadlocks).
+            if (this->lock.trylock()) {
+                break;
+            }
+
+            size_t backoff = BACKOFFMIN;
+            do {
+                // Service any pending TLB shootdown at the start of each backoff cycle.
+                if (CPU::get() && SMP::initialised) {
+                    VMM::servicelocalpending();
+                }
+
+                for (size_t i = 0; i < backoff; i++) {
+                    asm volatile("pause");
+                }
+
+                backoff = (backoff << 1) | 1;
+                if (backoff > BACKOFFMAX) {
+                    backoff = BACKOFFMAX;
+                }
+            } while (this->lock.islocked());
+        }
     }
 
     bool IRQSpinlock::trylock(void) {
@@ -107,6 +129,11 @@ namespace NArch {
             if (depth > 0) {
                 depth--;
                 CPU::get()->irqstackdepth = depth;
+
+                if (depth == 0 && SMP::initialised) {
+                    VMM::servicelocalpending(); // Interrupts will be disabled, or we're just done doing work, so we should now service pending (if any).
+                }
+
                 CPU::get()->setint(CPU::get()->irqstatestack[depth]);
             }
         } else {

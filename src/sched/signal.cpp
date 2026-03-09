@@ -64,6 +64,7 @@ namespace NSched {
 
     // Returns true if proc->lock was released internally (caller must NOT release again).
     static bool deliversignal(Thread *thread, uint8_t sig, struct NArch::CPU::context *ctx, enum callertype caller) {
+        (void)caller;
         if (sig <= 0 || sig >= NSIG) {
             return false; // Invalid signal number.
         }
@@ -370,8 +371,8 @@ namespace NSched {
             first->lock.acquire();
             second->lock.acquire();
 
-            if (current->euid != 0 && current->euid != target->uid && current->euid != target->suid) {
-                // We're only allowed to kill processes if we're root, or EUID of the processes' real or saved UID.
+            // POSIX: real or effective UID of sender must match real or saved UID of receiver.
+            if (current->euid != 0 && current->uid != 0 && current->euid != target->uid && current->euid != target->suid && current->uid != target->uid && current->uid != target->suid) {
                 second->lock.release();
                 first->lock.release();
                 SYSCALL_RET(-EPERM);
@@ -394,7 +395,7 @@ namespace NSched {
             pg->ref();
 
             int uid = current->euid;
-            int gid = current->egid;
+            int ruid = current->uid;
             current->lock.release();
 
             {
@@ -404,7 +405,8 @@ namespace NSched {
                 while (it.valid()) {
                     Process *proc = *it.get();
                     proc->lock.acquire();
-                    if (uid != 0 && uid != proc->uid && uid != proc->suid) {
+                    // POSIX: real or effective UID of sender must match real or saved UID of receiver.
+                    if (uid != 0 && ruid != 0 && uid != proc->uid && uid != proc->suid && ruid != proc->uid && ruid != proc->suid) {
                         proc->lock.release();
                         it.next();
                         continue;
@@ -423,6 +425,7 @@ namespace NSched {
 
             current->lock.acquire();
             int uid = current->euid;
+            int ruid = current->uid;
             current->lock.release();
 
             int signalled = 0;
@@ -443,9 +446,9 @@ namespace NSched {
                     continue;
                 }
 
-                // Check permissions: root can signal anyone, otherwise check UIDs.
+                // POSIX: real or effective UID of sender must match real or saved UID of receiver.
                 proc->lock.acquire();
-                bool hasperm = (uid == 0 || uid == proc->uid || uid == proc->suid);
+                bool hasperm = (uid == 0 || ruid == 0 || uid == proc->uid || uid == proc->suid || ruid == proc->uid || ruid == proc->suid);
                 proc->lock.release();
 
                 if (!hasperm) {
@@ -486,7 +489,7 @@ namespace NSched {
             Process *current = NArch::CPU::get()->currthread->process;
             current->lock.acquire();
             int uid = current->euid;
-            int gid = current->egid;
+            int ruid = current->uid;
             current->lock.release();
 
             {
@@ -496,7 +499,10 @@ namespace NSched {
                 while (it.valid()) {
                     Process *proc = *it.get();
                     proc->lock.acquire();
-                    if (uid != 0 && uid != proc->uid && uid != proc->suid) {
+                    // POSIX: real or effective UID of sender must match real or saved UID of receiver.
+                    if (uid != 0 && ruid != 0 &&
+                        uid != proc->uid && uid != proc->suid &&
+                        ruid != proc->uid && ruid != proc->suid) {
                         proc->lock.release();
                         it.next();
                         continue;
@@ -585,7 +591,6 @@ namespace NSched {
         SYSCALL_LOG("sys_sigprocmask(%d, %p, %p).\n", how, set, oldset);
 
         Thread *thread = NArch::CPU::get()->currthread;
-        Process *proc = thread->process;
 
         // Copy newset from userspace before acquiring lock.
         uint64_t newset = 0;

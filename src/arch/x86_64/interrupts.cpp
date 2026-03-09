@@ -469,20 +469,9 @@ namespace NArch {
 
                     meta->unref(); // Unref old page, free if needed.
 
-                    // Disable migration before enabling interrupts for the TLB
-                    NSched::Thread *currthread = NArch::CPU::get()->currthread;
-                    bool oldmigrate = __atomic_load_n(&currthread->migratedisabled, memory_order_acquire);
-                    currthread->disablemigrate();
-                    NArch::CPU::get()->ininterrupt = false;
-                    asm volatile("" ::: "memory");
-                    bool oldint = NArch::CPU::get()->setint(true);
-
+                    // Create a shootdown request. Other CPUs will handle it when they are able.
                     VMM::doshootdown(VMM::SHOOTDOWN_SINGLE, addr, addr + PAGESIZE);
 
-                    NArch::CPU::get()->setint(oldint);
-                    if (!oldmigrate) {
-                        currthread->enablemigrate();
-                    }
                     return;
                 } else {
                     space->lock.release();

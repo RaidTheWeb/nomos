@@ -87,6 +87,7 @@ namespace NSched {
     }
 
     void setthreadstate(Thread *thread, Thread::state newstate, const char *loc) {
+        (void)loc;
 #ifdef TSTATE_DEBUG
         Thread::state oldstate = (Thread::state)__atomic_load_n(&thread->tstate, memory_order_acquire);
         __atomic_store_n(&thread->laststate, oldstate, memory_order_release);
@@ -537,8 +538,6 @@ namespace NSched {
         cpu->ininterrupt = false;
         cpu->preemptdisabled = false;
 
-        asm volatile("cli");
-
         cpu->pendingmigrate = prevformigration; // Mark as pending, defer to safe context.
 
         __atomic_store_n(&cpu->inschedule, false, memory_order_release);
@@ -549,6 +548,7 @@ namespace NSched {
 
     // Scheduler interrupt handler.
     void schedule(struct Interrupts::isr *isr, struct CPU::context *ctx) {
+        (void)isr;
         struct CPU::cpulocal *cpu = CPU::get();
 
         // Prevent nested scheduler invocation.

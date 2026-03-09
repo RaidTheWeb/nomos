@@ -54,6 +54,7 @@ namespace NDev {
     int NVMEDriver::mmap(uint64_t dev, void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
         (void)dev;
         (void)addr;
+        (void)count;
         (void)offset;
         (void)flags;
         (void)fdflags;

@@ -35,11 +35,11 @@ namespace NMem {
                 return NULL;
             }
             for (size_t i = 0; i < pagesneeded; i++) {
-                pages[i] = NArch::PMM::alloc(NArch::PAGESIZE);
+                pages[i] = NArch::PMM::alloc(NArch::PAGESIZE, flags);
                 if (!pages[i]) {
                     // Failed, free previous pages.
                     for (size_t j = 0; j < i; j++) {
-                        NArch::PMM::free(pages[j], NArch::PAGESIZE);
+                        NArch::PMM::free(pages[j], NArch::PAGESIZE, flags);
                     }
                     delete[] pages;
                     return NULL;
@@ -85,7 +85,7 @@ namespace NMem {
                 // Freeing is easy as we just unmap and free each page individually.
                 for (size_t i = 0; i < pagesneeded; i++) {
                     uintptr_t virtaddr = (uintptr_t)ptr + (i * NArch::PAGESIZE);
-                    uintptr_t physaddr = NArch::VMM::virt2phys(&NArch::VMM::kspace, virtaddr);
+                    uintptr_t physaddr = NArch::VMM::_virt2phys(&NArch::VMM::kspace, virtaddr);
                     if (physaddr) {
                         NArch::VMM::_unmappage(&NArch::VMM::kspace, virtaddr, false);
                         NArch::PMM::free((void *)physaddr, NArch::PAGESIZE);

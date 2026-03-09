@@ -68,17 +68,17 @@ namespace NSys {
             size_t execpathsize = 0;
 
             while (argv[argc]) { // Read until NULL is reached in argv.
-                argvsize += NLib::strlen(argv[argc++]) + 1;
+                argvsize += NLib::strnlen(argv[argc++], 4096) + 1;
             }
 
             if (envp) {
                 while (envp[envc]) { // Read until NULL is reached in envp.
-                    envpsize += NLib::strlen(envp[envc++]) + 1;
+                    envpsize += NLib::strnlen(envp[envc++], 4096) + 1;
                 }
             }
 
             if (execpath) {
-                execpathsize = NLib::strlen(execpath) + 1;
+                execpathsize = NLib::strnlen(execpath, 4096) + 1;
             }
 
             struct auxv auxv[] = {
@@ -90,11 +90,11 @@ namespace NSys {
                 { auxvtype::RAND, 0 }, // Placeholder, will be set to point to random data on stack.
                 { auxvtype::EXECFN, 0 }, // Placeholder, will set below.
                 { auxvtype::ENTRY, entry },
-                { auxvtype::SECURE, secure ? 1 : 0 },
-                { auxvtype::UID, info->uid },
-                { auxvtype::EUID, info->euid },
-                { auxvtype::GID, info->gid },
-                { auxvtype::EGID, info->egid },
+                { auxvtype::SECURE, (uint64_t)(secure ? 1 : 0) },
+                { auxvtype::UID, (uint64_t)info->uid },
+                { auxvtype::EUID, (uint64_t)info->euid },
+                { auxvtype::GID, (uint64_t)info->gid },
+                { auxvtype::EGID, (uint64_t)info->egid },
                 { 0, 0 } // NULL entry terminator, MUST BE LAST.
             };
             size_t auxvsize = sizeof(auxv);
@@ -134,7 +134,7 @@ namespace NSys {
             stackptr += 16;
 
             for (size_t i = 0; i < argc; i++) {
-                size_t len = NLib::strlen(argv[i]) + 1;
+                size_t len = NLib::strnlen(argv[i], 4096) + 1;
                 NLib::memcpy((void *)stackptr, argv[i], len); // Copy argv element into stack.
                 uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
                 ((uint64_t *)argvptrs)[i] = calc; // Point the associated argv pointer to the stack location of the element.
@@ -163,7 +163,7 @@ namespace NSys {
 
             if (envp) {
                 for (size_t i = 0; i < envc; i++) {
-                    size_t len = NLib::strlen(envp[i]) + 1;
+                    size_t len = NLib::strnlen(envp[i], 4096) + 1;
                     NLib::memcpy((void *)stackptr, envp[i], len); // Copy envp element into stack.
 
                     uintptr_t calc = virttop - (stacktop - stackptr); // Calculate our offset from the hhdm offset stack top, and subtract that from the virtual mapped stack top. Ultimately, we want the pointer to refer to the virtual memory version of this.
@@ -186,7 +186,7 @@ namespace NSys {
                 return NULL;
             }
 
-            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != sizeof(struct pheader) * hdr->phcount) {
+            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != (ssize_t)(sizeof(struct pheader) * hdr->phcount)) {
                 delete[] phdrs;
                 return NULL;
             }
@@ -242,7 +242,7 @@ namespace NSys {
                 return false;
             }
 
-            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != sizeof(struct pheader) * hdr->phcount) {
+            if (node->read(phdrs, sizeof(struct pheader) * hdr->phcount, hdr->phoff, 0) != (ssize_t)(sizeof(struct pheader) * hdr->phcount)) {
                 delete[] phdrs;
                 return false;
             }

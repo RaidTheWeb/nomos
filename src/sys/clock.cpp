@@ -369,7 +369,7 @@ namespace NSys {
             }
 
             // Validate timespec.
-            if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || kreq.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
+            if (kreq.tv_sec < 0 || kreq.tv_nsec < 0 || (uint64_t)kreq.tv_nsec >= NSys::Clock::NSEC_PER_SEC) {
                 SYSCALL_RET(-EINVAL);
             }
 

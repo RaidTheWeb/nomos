@@ -213,7 +213,7 @@ namespace NSched {
 
             // Resolve interpreter.
             NFS::VFS::INode *interpnode;
-            ssize_t r = NFS::VFS::vfs->resolve(interp, &interpnode, NULL, true, root);
+            ssize_t r = NFS::VFS::vfs->resolve(interp, &interpnode, cwd, true, root);
             delete[] interp;
 
             if (r < 0) {
@@ -364,7 +364,7 @@ namespace NSched {
         size_t idx = 0;
 
         // argv[0] = interpreter path.
-        size_t interplen = NLib::strlen(shebang->interpreter);
+        size_t interplen = NLib::strnlen(shebang->interpreter, sizeof(shebang->interpreter));
         newargv[idx] = new char[interplen + 1];
         if (!newargv[idx]) {
             delete[] newargv;
@@ -375,7 +375,7 @@ namespace NSched {
 
         // argv[1] = shebang argument (optional).
         if (shebang->hasarg) {
-            size_t arglen = NLib::strlen(shebang->arg);
+            size_t arglen = NLib::strnlen(shebang->arg, sizeof(shebang->arg));
             newargv[idx] = new char[arglen + 1];
             if (!newargv[idx]) {
                 freeargsenvs(newargv, idx);
@@ -386,7 +386,7 @@ namespace NSched {
         }
 
         // Script path.
-        size_t pathlen = NLib::strlen(origparams->path);
+        size_t pathlen = NLib::strnlen(origparams->path, 4096);
         newargv[idx] = new char[pathlen + 1];
         if (!newargv[idx]) {
             freeargsenvs(newargv, idx);
@@ -397,7 +397,7 @@ namespace NSched {
 
         // Original argv[1...].
         for (size_t i = 1; i < origparams->argc; i++) {
-            size_t len = NLib::strlen(origparams->argv[i]);
+            size_t len = NLib::strnlen(origparams->argv[i], 4096);
             newargv[idx] = new char[len + 1];
             if (!newargv[idx]) {
                 freeargsenvs(newargv, idx);

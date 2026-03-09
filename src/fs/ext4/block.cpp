@@ -54,7 +54,7 @@ namespace NFS {
 
                             // Update block bitmap checksum in group descriptor if checksums are enabled.
                             if (this->haschecksums) {
-                                uint32_t bitmapchecksum = this->blockbitmapchecksum(group, bitmap);
+                                uint32_t bitmapchecksum = this->blockbitmapchecksum(bitmap);
                                 gd->blockbitmapcsumlo = bitmapchecksum & 0xFFFF;
                                 gd->blockbitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
                             }
@@ -182,7 +182,7 @@ namespace NFS {
 
                 // Update block bitmap checksum in group descriptor if checksums are enabled.
                 if (this->haschecksums) {
-                    uint32_t bitmapchecksum = this->blockbitmapchecksum(group, bitmap);
+                    uint32_t bitmapchecksum = this->blockbitmapchecksum(bitmap);
                     gd->blockbitmapcsumlo = bitmapchecksum & 0xFFFF;
                     gd->blockbitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
                 }
@@ -260,7 +260,7 @@ namespace NFS {
 
             // Update block bitmap checksum in group descriptor if checksums are enabled.
             if (this->haschecksums) {
-                uint32_t bitmapchecksum = this->blockbitmapchecksum(group, bitmap);
+                uint32_t bitmapchecksum = this->blockbitmapchecksum(bitmap);
                 gd->blockbitmapcsumlo = bitmapchecksum & 0xFFFF;
                 gd->blockbitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
             }

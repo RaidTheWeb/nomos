@@ -80,36 +80,6 @@ namespace NFS {
             }
         }
 
-        uint32_t Ext4FileSystem::countfreeblocks(uint32_t group, const void *bitmap) {
-            uint32_t count = 0;
-            const uint8_t *bmp = (const uint8_t *)bitmap;
-            uint32_t blockspergroup = this->sb.blockspergroup;
-
-            for (uint32_t i = 0; i < blockspergroup; i++) {
-                uint32_t byte = i / 8;
-                uint8_t bit = i % 8;
-                if (!(bmp[byte] & (1 << bit))) {
-                    count++;
-                }
-            }
-            return count;
-        }
-
-        uint32_t Ext4FileSystem::countfreeinodes(uint32_t group, const void *bitmap) {
-            uint32_t count = 0;
-            const uint8_t *bmp = (const uint8_t *)bitmap;
-            uint32_t inodespergroup = this->sb.inodespergroup;
-
-            for (uint32_t i = 0; i < inodespergroup; i++) {
-                uint32_t byte = i / 8;
-                uint8_t bit = i % 8;
-                if (!(bmp[byte] & (1 << bit))) {
-                    count++;
-                }
-            }
-            return count;
-        }
-
         int Ext4FileSystem::writeinode(uint32_t ino, struct inode *diskino) {
             if (ino == 0) {
                 return -EINVAL;
@@ -259,7 +229,7 @@ namespace NFS {
 
                             // Update inode bitmap checksum in group descriptor if checksums are enabled.
                             if (this->haschecksums) {
-                                uint32_t bitmapchecksum = this->inodebitmapchecksum(group, bitmap);
+                                uint32_t bitmapchecksum = this->inodebitmapchecksum(bitmap);
                                 gd->inodebitmapcsumlo = bitmapchecksum & 0xFFFF;
                                 gd->inodebitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
                             }
@@ -345,7 +315,7 @@ namespace NFS {
 
             // Update inode bitmap checksum in group descriptor if checksums are enabled.
             if (this->haschecksums) {
-                uint32_t bitmapchecksum = this->inodebitmapchecksum(group, bitmap);
+                uint32_t bitmapchecksum = this->inodebitmapchecksum(bitmap);
                 gd->inodebitmapcsumlo = bitmapchecksum & 0xFFFF;
                 gd->inodebitmapcsumhi = (bitmapchecksum >> 16) & 0xFFFF;
             }
@@ -497,13 +467,13 @@ namespace NFS {
             return crc;
         }
 
-        uint32_t Ext4FileSystem::blockbitmapchecksum(uint32_t group, const void *bitmap) {
+        uint32_t Ext4FileSystem::blockbitmapchecksum(const void *bitmap) {
             // Block bitmap checksum uses seed as initial CRC, then bitmap data.
             uint32_t crc = NLib::crc32c(this->csumseed, bitmap, this->blksize);
             return crc;
         }
 
-        uint32_t Ext4FileSystem::inodebitmapchecksum(uint32_t group, const void *bitmap) {
+        uint32_t Ext4FileSystem::inodebitmapchecksum(const void *bitmap) {
             // Inode bitmap checksum uses seed as initial CRC, then bitmap data.
             // Size is inodes_per_group / 8.
             size_t sz = this->sb.inodespergroup / 8;
@@ -648,7 +618,10 @@ namespace NFS {
                 // Free all associated blocks.
                 if (ext4node->diskino.flags & EXT4_EXTENTSFL) {
                     // Free extent-based blocks recursively.
-                    this->freeextentblocks(ext4node->diskino.block, 0);
+                    // Copy block data to aligned local to avoid address-of-packed-member.
+                    uint32_t blockdata[EXT4_NBLOCKS];
+                    NLib::memcpy(blockdata, ext4node->diskino.block, sizeof(blockdata));
+                    this->freeextentblocks(blockdata, 0);
                 } else {
                     // Free indirect-based blocks.
                     this->freeindirectblocks(&ext4node->diskino);
@@ -706,7 +679,10 @@ namespace NFS {
                 if (res == 0) {
                     // Free all associated blocks.
                     if (ext4target->diskino.flags & EXT4_EXTENTSFL) {
-                        this->freeextentblocks(ext4target->diskino.block, 0);
+                        // Copy block data to aligned local to avoid address-of-packed-member.
+                        uint32_t blockdata[EXT4_NBLOCKS];
+                        NLib::memcpy(blockdata, ext4target->diskino.block, sizeof(blockdata));
+                        this->freeextentblocks(blockdata, 0);
                     } else {
                         this->freeindirectblocks(&ext4target->diskino);
                     }

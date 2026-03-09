@@ -510,7 +510,7 @@ namespace NFS {
             uint32_t blksize = this->ext4fs->blksize;
             uint8_t *blkbuf = new uint8_t[blksize];
             uint64_t diroff = 0;
-            size_t namelen = NLib::strlen(name);
+            size_t namelen = NLib::strnlen(name, 255);
 
             while (diroff < dirsize) { // Iterate over directory entries.
                 uint64_t logicalblk = diroff / blksize;
@@ -1620,7 +1620,7 @@ namespace NFS {
 
             Ext4Node *child = (Ext4Node *)node;
             const char *name = child->getname();
-            size_t namelen = NLib::strlen(name);
+            size_t namelen = NLib::strnlen(name, 255);
 
             if (namelen > 255) { // Maximum ext4 direntry name.
                 return false;
@@ -1806,7 +1806,7 @@ namespace NFS {
                 return false;
             }
 
-            size_t namelen = NLib::strlen(name);
+            size_t namelen = NLib::strnlen(name, 255);
             uint64_t dirsize = ((uint64_t)this->diskino.sizethi << 32) | this->diskino.sizelo;
             uint32_t blksize = this->ext4fs->blksize;
             uint8_t *blkbuf = new uint8_t[blksize];

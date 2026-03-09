@@ -283,7 +283,7 @@ namespace NFS {
                     size_t len = this->absolute ? 1 : 0; // Leading slash if absolute.
                     this->components.forcmp([](const char **c, void *udata) {
                         size_t *lenptr = (size_t *)udata;
-                        *lenptr += NLib::strlen(*c) + 1; // Component + slash.
+                        *lenptr += NLib::strnlen(*c, 255) + 1; // Component + slash.
                     }, (void *)&len);
                     // Account for null terminator, and the trailing slash becoming null.
                     return len > 0 ? len : 1;
@@ -305,7 +305,8 @@ namespace NFS {
                     this->components.forcmp([](const char **c, void *udata) {
                         const char *comp = *c;
                         char **p = (char **)udata;
-                        for (size_t i = 0; i < NLib::strlen(comp); i++) {
+                        size_t complen = NLib::strnlen(comp, 255);
+                        for (size_t i = 0; i < complen; i++) {
                             *(*p) = (char)comp[i]; // Set part.
                             (*p)++; // Increment pointer.
                         }
@@ -419,6 +420,7 @@ namespace NFS {
                 }
                 virtual int mmap(void *addr, size_t count, size_t offset, uint64_t flags, int fdflags) {
                     (void)addr;
+                    (void)count;
                     (void)offset;
                     (void)flags;
                     (void)fdflags;
@@ -689,7 +691,7 @@ namespace NFS {
 
         // Call this function at the bottom of filesystem implementation files to register them.
 #define REGFS(fsname, factoryfn, fsinfo) \
-    extern "C" __attribute__((section(".filesystems"), used)) struct NFS::VFS::fsregentry fsname##_entry = { \
+    __attribute__((section(".filesystems"), used)) struct NFS::VFS::fsregentry fsname##_entry = { \
         .magic = NFS::VFS::FS_MAGIC, \
         .factory = factoryfn, \
         .info = fsinfo \
